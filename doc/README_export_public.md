@@ -145,6 +145,11 @@ http://<host>:<port>/export/status?export_id=<id>&access-key=<ak>
 | `eval` | `session_analysis/` | 质检（合并 + analyze，出报告） |
 | `reconstruct` | `session_reconstruct/` | hermes 聚合去重 + 回填 reasoning，仅 new-api |
 | `full_reformat` | `session_analysis_full/` | 全量导出：session 全部 trace 文件合并，**仅允许单个 mtime 目录** |
+| `jiuwen_reformat` | `session_analysis_jiuwen/` | 九问导出：`reasoning_content` 回填重构 |
+
+白名单 = `settings/export_modes.yaml` 里 `public: true` 的模式，随配置变化（不再硬编码在
+路由里）；`model` 等未知参数不影响白名单。`_default_mode()` 兜底值 = 配置里首个
+`pipeline: copy` 的模式（即 `export`）。
 
 - `full_reformat` 与内部 `/api/export/run` 一致：只允许单个 mtime 目录。若该 key 落到多个
   mtime 目录 → 400 `全量导出(full_reformat)仅支持单个 mtime 目录，该 key 落到 N 个目录`（不静默取第一个）。
@@ -252,7 +257,7 @@ http://<host>:8084/export/submit?key=<K>&model=&export_name=preview-0827&access-
 | `access-key` 错误 | 403 | `{"detail":"Invalid access-key"}` |
 | `key` 解析不到 | 404 | `{"detail":"Key not found"}` |
 | 该 key 无会话数据 | 404 | `{"detail":"No session data found for this key"}` |
-| `mode` 非法（如 `bogus`） | 400 | `{"detail":"Invalid mode 'bogus' (allowed: export, reformat, eval, reconstruct, full_reformat)"}` |
+| `mode` 非法（如 `bogus`） | 400 | `{"detail":"Invalid mode 'bogus' (allowed: export, reformat, reconstruct, full_reformat, jiuwen_reformat, eval)"}` |
 | `full_reformat` 且 key 落多目录 | 400 | `{"detail":"全量导出(full_reformat)仅支持单个 mtime 目录，该 key 落到 13 个目录"}` |
 | URL 含未编码中文 | 400 | `Invalid HTTP request received` |
 

@@ -1,0 +1,93 @@
+# 导出模式注册表 —— 单一真相源
+#
+# 网页（utils/export_routes.py）与离线 CLI（tools/offline_reformat_export.py）
+# 共用本文件。新增一个导出模式 = 在这里加一段 + 写好 processor，网页下拉、
+# 列表筛选、徽章文案、OBS 子前缀、本地落盘目录、mode 白名单全部自动跟上，
+# 不需要再逐处改代码（那正是 jiuwen_reformat 只能在 CLI 上跑的原因）。
+#
+# 字段说明：
+#   label        网页下拉/筛选里的展示文案
+#   mode_label   日志、任务列表徽章用的短文案
+#   step         逐目录进度日志里的措辞（可省，默认取 mode_label）
+#   obs_sub      OBS 子前缀。**对外契约**：下游按此路径取数，改了会断链
+#   local_dir    temp_path 下的本地目录名（相对 temp_path）。
+#                ⚠ reformat / eval 的 logs_session_analysis 是**外部契约**：
+#                src/thinking_reflection/service.py:755 直接拼
+#                Path("logs_session_analysis")/"external"/<slug>，且 datasets_all
+#                过滤要求路径含 "analysis"。改这个目录名会断掉反思链路。
+#   pipeline     产物管线：copy=原始三元组复制 / reformat=合并落盘 / eval=合并+质检
+#                （copy 与 eval 决定收尾走哪条分支：上传方式 + 是否跑 evaluate_sessions）
+#   processor    处理器 "模块路径:函数名"；pipeline=copy 时留空
+#   analyze      三态。true/false → 调用时传 analyze=该值；不写 → 调用时不传该形参
+#                （reconstruct / full_reformat / jiuwen_reformat 都没有这个形参）
+#   formats      允许的叶子格式；不写 = 全部支持
+#   max_mtimes   单次任务允许的 mtime 目录数上限；不写 = 不限
+#   public       是否暴露给公开入口 /export/submit（access-key 鉴权）
+#
+# modes 的顺序就是网页下拉的顺序。
+
+# 导出产物的本地根目录。留空则回退到 env_dir.parent.parent（即项目根）。
+temp_path: /root/llm-proxy-main
+
+modes:
+
+  export:
+    label: "导出原始文件（三元组，不分析）"
+    mode_label: "导出"
+    obs_sub: "session"
+    local_dir: "logs_session"
+    pipeline: "copy"
+    public: true
+
+  reformat:
+    label: "合并导出（三元组合并成单 JSON，不质检）"
+    mode_label: "合并导出"
+    obs_sub: "session_analysis"
+    local_dir: "logs_session_analysis"
+    pipeline: "reformat"
+    processor: "utils.eval.reformat:reformat_and_analyze"
+    analyze: false
+    public: true
+
+  reconstruct:
+    label: "重构导出（hermes 聚合去重+回填 reasoning，仅 new-api）"
+    mode_label: "重构导出"
+    step: "hermes 重构"
+    obs_sub: "session_reconstruct"
+    local_dir: "logs_session_reconstruct"
+    pipeline: "reformat"
+    processor: "utils.eval.reconstruct:reconstruct_and_export"
+    formats: ["newapi"]
+    public: true
+
+  full_reformat:
+    label: "全量导出（session 全部 trace 文件合并，仅单目录，不质检）"
+    mode_label: "全量导出"
+    step: "全量合并"
+    obs_sub: "session_analysis_full"
+    local_dir: "logs_session_analysis_full"
+    pipeline: "reformat"
+    processor: "utils.eval.reformat_full:full_reformat_export"
+    max_mtimes: 1
+    public: true
+
+  jiuwen_reformat:
+    label: "九问导出（reasoning_content 回填重构）"
+    mode_label: "九问导出"
+    step: "九问重构"
+    obs_sub: "session_analysis_jiuwen"
+    local_dir: "logs_session_analysis_jiuwen"
+    pipeline: "reformat"
+    processor: "utils.eval.reformat_jiuwen:jiuwen_reformat_export"
+    public: true
+
+  eval:
+    label: "质检模式（reformat+分析，出报告）"
+    mode_label: "质检"
+    step: "reformat+analyze"
+    obs_sub: "session_analysis"
+    local_dir: "logs_session_analysis"
+    pipeline: "eval"
+    processor: "utils.eval.reformat:reformat_and_analyze"
+    analyze: true
+    public: true

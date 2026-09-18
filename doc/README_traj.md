@@ -168,7 +168,7 @@ offline_reformat_export.py → hermes_traj → _process_one_hermes
 整合已完成，`--mode reconstruct` 是平行于 reformat 的第二条导出路径。**Web 端与离线端都支持**：
 
 - **离线**：`tools/offline_reformat_export.py --mode reconstruct`（下方全链路图）
-- **Web**：`utils/export_routes.py` 的 `export_run` mode 白名单已含 `reconstruct`（export / eval / reformat / reconstruct 四选一，前端 `export.html` 导出方式下拉）；`_run_task` 按 mode 注入 processor（reconstruct → `reconstruct_and_export`，无 `analyze` 参数）；`_run_task_inner` 按 mode 定 local_base / obs_sub，重构走 `logs_session_reconstruct/` + OBS `session_reconstruct/`；reconstruct 模式下非 new-api 目录在 `detect_format` 处提前跳过（warning，不生成 session_index）
+- **Web**：`utils/export_routes.py` 的 `export_run` 用 `settings/export_modes.yaml` 的模式清单校验 mode（网页下拉、公开 `/export/submit` 白名单、离线 CLI 全部由它驱动）；`_run_task` 用 `resolve_processor` 按配置注入 processor（reconstruct → `reconstruct_and_export`，因配置无 `analyze` 字段故不传该形参）；`_run_task_inner` 的 local_base / obs_sub 全部取自配置（重构走 `logs_session_reconstruct/` + OBS `session_reconstruct/`）；reconstruct 配置了 `formats: ["newapi"]`，非 new-api 目录在 `detect_format` 处提前跳过（warning，不生成 session_index）
 
 完整链路：
 

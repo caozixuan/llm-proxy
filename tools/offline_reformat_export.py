@@ -69,6 +69,9 @@ if str(_PROJ_ROOT) not in sys.path:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("offline_reformat")
 
+# 导出模式注册表（与 Web 共用同一份 settings/export_modes.yaml）
+from utils.export_modes import get_config as get_export_modes
+
 
 # ---------------------------------------------------------------------------
 # 自动探测 SERVICE_LOG_DIR / ENV_DIR（与运行中的服务对齐）
@@ -122,6 +125,24 @@ def _autodetect_env_dir(env_key_hint: str = "") -> str:
     return best
 
 
+def _mode_choices() -> tuple:
+    """CLI 可选模式 = 配置里 pipeline="reformat" 的模式。
+
+    排除 pipeline="copy"（原始三元组复制）与 pipeline="eval"（需跑 evaluate_sessions
+    出质检报告，本脚本的收尾链路没有这一段，暴露出来只会静默少出报告）。
+    """
+    try:
+        ids = tuple(m.id for m in get_export_modes().all() if m.pipeline == "reformat")
+        return ids or ("reformat",)
+    except Exception:
+        return ("reformat", "reconstruct", "full_reformat", "jiuwen_reformat")
+
+
+def _default_cli_mode() -> str:
+    """CLI 默认模式：配置里 pipeline=reformat 的首个模式。"""
+    return _mode_choices()[0]
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -132,11 +153,15 @@ def main() -> int:
     ap.add_argument("--env-dir", default="",
                     help="ENV_DIR，形如 logs_all/env-99oR。默认从 app-meta 自动探测")
     ap.add_argument("--threshold", type=int, default=5, help="qualified 阈值（同 Web，默认 5）")
-    ap.add_argument("--mode", default="reformat",
-                    choices=["reformat", "reconstruct", "full_reformat"],
-                    help="导出方式: reformat=合并导出（默认，只导 latest_file）; "
+    ap.add_argument("--mode", default=_default_cli_mode(),
+                    choices=list(_mode_choices()),
+                    help="导出方式，取值来自 settings/export_modes.yaml 中 "
+                         "pipeline=reformat 的模式："
+                         "reformat=合并导出（默认，只导 latest_file）; "
                          "reconstruct=Hermes 轨迹重构（仅 new-api 合并文件）; "
-                         "full_reformat=全量合并导出（导 trace_list 的全部文件，无质检）")
+                         "full_reformat=全量合并导出（导 trace_list 的全部文件，无质检）; "
+                         "jiuwen_reformat=九问轨迹重构（reasoning_content 回填）。"
+                         "新增模式只需改 YAML，无需改本脚本")
     ap.add_argument("--key", action="append", default=[],
                     help="只导指定 key（可多次）；支持完整 api_key / key-XXXX slot / 后4位；缺省=所有 key")
     ap.add_argument("--mtime", action="append", default=[],
@@ -185,18 +210,19 @@ def main() -> int:
     from utils.export_sync import export_session_index, sync_session_index, _load_session_index
     from utils.obs_utils import run_upload_cmd, load_obs_base, load_sync_config
 
-    # 处理器按 mode 切换：reformat=合并导出（对齐 Web），reconstruct=Hermes 轨迹重构。
-    # 两者共享同一「session 迭代并行」框架（_run_one_export），只是每 session 的处理不同。
+    # 处理器与落盘目录全部由 settings/export_modes.yaml 决定：新增模式只改 YAML。
+    # 各模式共享同一「session 迭代并行」框架（_run_one_export），只是每 session
+    # 的处理不同（合并 latest_file / 聚合多个 trace / 全量合并 / reason 回填）。
     mode = args.mode
-    if mode == "reconstruct":
-        from utils.eval.reconstruct import reconstruct_and_export as _processor
-        _mode_label = "重构导出"
-    elif mode == "full_reformat":
-        from utils.eval.reformat_full import full_reformat_export as _processor
-        _mode_label = "全量合并导出"
-    else:
-        from utils.eval.reformat import reformat_and_analyze as _processor
-        _mode_label = "合并导出"
+    _mcfg = get_export_modes().get(mode)
+    if _mcfg is None:
+        logger.error("未知导出模式 %r（未在 settings/export_modes.yaml 注册）", mode)
+        return 2
+    _processor = get_export_modes().resolve_processor(mode)
+    if _processor is None:
+        logger.error("模式 %r 未配置可用处理器（检查 settings/export_modes.yaml 的 processor）", mode)
+        return 2
+    _mode_label = _mcfg.mode_label
 
     # --- 复刻 export_routes 里的 mtime 解析辅助（多 root 前缀感知） ---
     def _all_roots():
@@ -320,7 +346,7 @@ def main() -> int:
             api_key=api_key, mtime_dirs=mt_keys,
             env_dir_p=env_dir_p, env_key_name=env_key_name,
             obs_prefix=obs_prefix, workers=workers, upload_script=upload_script,
-            mode=mode, _mode_label=_mode_label, processor=_processor,
+            mode=mode, _mcfg=_mcfg, _mode_label=_mode_label, processor=_processor,
             _key_slot=_key_slot, _resolve_mt=_resolve_mt, _log_dir_key=_log_dir_key,
             create_record=create_record, update_status=update_status,
             append_log=append_log, get_record=get_record,
@@ -339,7 +365,7 @@ def main() -> int:
 
 def _run_one_export(*, api_key, mtime_dirs, env_dir_p, env_key_name,
                       obs_prefix, workers, upload_script,
-                      mode, _mode_label, processor,
+                      mode, _mcfg, _mode_label, processor,
                       _key_slot, _resolve_mt, _log_dir_key,
                       create_record, update_status, append_log, get_record,
                       export_session_index, _load_session_index,
@@ -370,21 +396,14 @@ def _run_one_export(*, api_key, mtime_dirs, env_dir_p, env_key_name,
     try:
         update_status(record_id, "running")
 
-        # local_base / obs_dst 规则完全对齐 _run_task_inner：
-        # reformat → session_analysis；reconstruct → session_reconstruct；
-        # full_reformat → session_analysis_full（三条平行路径，互不混放）
-        if mode == "reconstruct":
-            local_base = (env_dir_p.parent.parent / "logs_session_reconstruct" /
-                          env_key_name / slot / f"ex-{now_tag}").resolve()
-            obs_sub = "session_reconstruct"
-        elif mode == "full_reformat":
-            local_base = (env_dir_p.parent.parent / "logs_session_analysis_full" /
-                          env_key_name / slot / f"ex-{now_tag}").resolve()
-            obs_sub = "session_analysis_full"
-        else:
-            local_base = (env_dir_p.parent.parent / "logs_session_analysis" /
-                          env_key_name / slot / f"ex-{now_tag}").resolve()
-            obs_sub = "session_analysis"
+        # local_base / obs_dst 规则完全对齐 _run_task_inner，且与 Web 同读一份配置：
+        # temp_path 留空时回退 env_dir_p.parent.parent（项目根）。
+        _temp_root = get_export_modes().temp_path
+        if not str(_temp_root).strip() or str(_temp_root) == ".":
+            _temp_root = env_dir_p.parent.parent
+        local_base = (_temp_root / _mcfg.local_dir /
+                      env_key_name / slot / f"ex-{now_tag}").resolve()
+        obs_sub = _mcfg.obs_sub
         obs_dst = f"{obs_prefix}/{obs_sub}/{env_key_name}/{slot}/ex-{now_tag}/" if obs_prefix else ""
         local_base.mkdir(parents=True, exist_ok=True)
         update_status(record_id, "running", obs_dst=obs_dst, local_copy_dir=str(local_base))
@@ -418,14 +437,15 @@ def _run_one_export(*, api_key, mtime_dirs, env_dir_p, env_key_name,
                     warnings.append(f"{mt}: 索引未构建/不完整，已跳过（检查异常: {_pe}）")
                     continue
 
-                # reconstruct 只认 new-api 合并文件：native 三元组叶子没有合并文件，
-                # hermes 聚合器读不到顶层 req，跳过（warning 非致命，与索引未构建同语义）。
-                if mode == "reconstruct":
+                # 格式守卫来自配置：reconstruct 只认 new-api 合并文件（native 三元组叶子
+                # 没有合并文件，hermes 聚合器读不到顶层 req），跳过（warning 非致命，
+                # 与索引未构建同语义）。
+                if _mcfg.formats is not None:
                     from utils.log_scan import detect_format as _df_fmt
                     fmt = _df_fmt(mt_src)
-                    if fmt != "newapi":
-                        _log(f"[{mt}] 目录格式 {fmt}，重构导出仅支持 new-api 合并文件，跳过")
-                        warnings.append(f"{mt}: 非 new-api 格式（{fmt}），已跳过")
+                    if not _mcfg.supports_format(fmt):
+                        _log(f"[{mt}] 目录格式 {fmt}，{_mode_label}仅支持 {'/'.join(_mcfg.formats)} 合并文件，跳过")
+                        warnings.append(f"{mt}: 非 {'/'.join(_mcfg.formats)} 格式（{fmt}），已跳过")
                         continue
 
                 _log(f"[{mt}] 生成 session_index...")
@@ -450,8 +470,11 @@ def _run_one_export(*, api_key, mtime_dirs, env_dir_p, env_key_name,
                     progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
                     log_dir=_log_dir_key(mt_src),
                 )
-                if mode == "reformat":
-                    processor_kwargs["analyze"] = False  # 与 Web reformat-only 一致
+                # analyze 三态：None = 处理器签名里没有这个形参（reconstruct /
+                # full_reformat / jiuwen_reformat），不传。reformat 配置里是 false
+                # （与 Web reformat-only 一致）；eval 是 true。
+                if _mcfg.analyze is not None:
+                    processor_kwargs["analyze"] = _mcfg.analyze
                 ra_result = processor(**processor_kwargs)
                 all_results.extend(ra_result["results"])
                 all_entries.extend(session_entries)

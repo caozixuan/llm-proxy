@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from utils.export_modes import get_config as get_export_modes
 from utils.export_store import (
     append_log,
     cancel_interrupted,
@@ -439,28 +440,48 @@ def _run_upload_only(record_id, local_copy_dir, obs_dst):
         update_status(record_id, "failed", error_message=str(e))
 
 
+def _default_mode() -> str:
+    """注册表里 pipeline=copy 的首个模式（即「导出原始文件」），作为 mode 兜底默认值。"""
+    cfg = get_export_modes()
+    for m in cfg.all():
+        if m.pipeline == "copy":
+            return m.id
+    return cfg.ids()[0] if cfg.ids() else "export"
+
+
+def _eval_mode() -> str:
+    """注册表里 pipeline=eval 的模式 id（「从导出记录发起质检」用它）。"""
+    for m in get_export_modes().all():
+        if m.pipeline == "eval":
+            return m.id
+    return "eval"
+
+
 def _run_task(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force=False):
-    from utils.eval.reformat import reformat_and_analyze
-    from utils.eval.reconstruct import reconstruct_and_export
     from utils.eval.eval import evaluate_sessions
     from utils.obs_sync import _run_upload_cmd
 
     _log = lambda msg: append_log(record_id, msg)
     try:
-        # reconstruct 与 reformat/eval 同框架但 processor 不同：前者逐 session 聚合多个
-        # trace 文件（去重 + 保留分支 + 回填 reasoning），后者只处理 latest_file。
-        # full_reformat：把每个 session 的 trace_list 全部文件合并落盘（无 analyze），
-        # 处理器签名与 reconstruct 同（不带 analyze 形参）。
-        if mode == "reconstruct":
-            _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force,
-                            reconstruct_and_export, evaluate_sessions, _run_upload_cmd, _log)
-        elif mode == "full_reformat":
-            from utils.eval.reformat_full import full_reformat_export
-            _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force,
-                            full_reformat_export, evaluate_sessions, _run_upload_cmd, _log)
+        # 处理器由 settings/export_modes.yaml 的 processor 字段解析（importlib）。
+        # 各模式处理粒度不同：reformat/eval 只处理 latest_file；reconstruct 逐 session
+        # 聚合多个 trace 文件（去重 + 保留分支 + 回填 reasoning）；full_reformat /
+        # jiuwen_reformat 逐 session 合并 trace_list 全部文件。差异体现在 processor
+        # 与它的 analyze 形参有无上，这里只负责注入，不再硬编码 mode 分支。
+        mcfg = get_export_modes().get(mode)
+        if mcfg is None:
+            raise RuntimeError(f"未知导出模式 '{mode}'（未在 settings/export_modes.yaml 中注册）")
+        # pipeline="copy"（原始三元组复制）没有 processor——它走 export_session_index /
+        # sync_session_index 那套，不加载任何 reformat 处理器。只有合并/质检类模式
+        # 才要求 processor 必须解析成功。
+        if mcfg.pipeline == "copy":
+            processor = None
         else:
-            _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force,
-                            reformat_and_analyze, evaluate_sessions, _run_upload_cmd, _log)
+            processor = get_export_modes().resolve_processor(mode)
+            if processor is None:
+                raise RuntimeError(f"导出模式 '{mode}' 未配置可用处理器（检查 settings/export_modes.yaml）")
+        _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force,
+                        processor, evaluate_sessions, _run_upload_cmd, _log)
     except Exception as exc:
         logger.exception("_run_task crashed (record=%s)", record_id)
         try:
@@ -493,14 +514,15 @@ def _run_task_from_record(record_id: int, params: dict) -> None:
         env_key_name = env_dir.name
     _run_task(record_id, env_dir, env_key_name,
               params.get("obs_prefix", ""), params.get("now_tag", ""),
-              params.get("mode", "export"), force=bool(params.get("force", False)))
+              params.get("mode") or _default_mode(), force=bool(params.get("force", False)))
 
 
 def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force,
                     processor, evaluate_sessions, _run_upload_cmd, _log):
-    """逐 mtime 目录并行导出。processor 按 mode 注入：
-    reformat/eval → reformat_and_analyze（analyze 按 mode 开/关）；
-    reconstruct → reconstruct_and_export（无 analyze 参数，逐 session 聚合多个 trace）。"""
+    """逐 mtime 目录并行导出。processor 与 analyze 形参由 settings/export_modes.yaml
+    的 processor / analyze 字段决定：reformat/eval 用 reformat_and_analyze（analyze
+    显式传 true/false）；reconstruct 用 reconstruct_and_export（无 analyze 形参，
+    逐 session 聚合多个 trace）。"""
     rec = get_record(record_id)
     update_status(record_id, "running")
 
@@ -537,31 +559,23 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
     api_key = rec.get("api_key", "")
     slot = rec.get("key_slot", "all")
 
-    if mode == "export":
-        local_base = _env_dir.parent.parent / "logs_session" / _env_key_name / slot / f"ex-{now_tag}"
-        obs_sub = "session"
-    elif mode == "reconstruct":
-        # hermes 重构聚合：每 session 落多个聚合文件 + _manifest.jsonl，
-        # 走 session_reconstruct/（平行于 session_analysis/，互不混放）
-        local_base = (_env_dir.parent.parent / "logs_session_reconstruct" / _env_key_name / slot / f"ex-{now_tag}").resolve()
-        obs_sub = "session_reconstruct"
-    elif mode == "full_reformat":
-        # 全量导出：每 session 的 trace_list 全部文件合并落盘，
-        # 走 session_analysis_full/（平行于 session_analysis/，互不混放）
-        local_base = (_env_dir.parent.parent / "logs_session_analysis_full" / _env_key_name / slot / f"ex-{now_tag}").resolve()
-        obs_sub = "session_analysis_full"
-    else:
-        # eval 与 reformat 都产出合并后的 session JSON，落 session_analysis 目录
-        local_base = (_env_dir.parent.parent / "logs_session_analysis" / _env_key_name / slot / f"ex-{now_tag}").resolve()
-        obs_sub = "session_analysis"
+    # 本地落盘根 + OBS 子前缀 + 落盘子目录名，全部来自 settings/export_modes.yaml。
+    # temp_path 留空时回退到 env_dir.parent.parent（项目根），与旧行为一致。
+    _mcfg = get_export_modes().get(mode)
+    if _mcfg is None:
+        raise RuntimeError(f"未知导出模式 '{mode}'（未在 settings/export_modes.yaml 中注册）")
+    _temp_root = get_export_modes().temp_path
+    if not str(_temp_root).strip() or str(_temp_root) == ".":
+        _temp_root = _env_dir.parent.parent
+    local_base = (_temp_root / _mcfg.local_dir / _env_key_name / slot / f"ex-{now_tag}").resolve()
+    obs_sub = _mcfg.obs_sub
 
     obs_dst = f"{obs_prefix}/{obs_sub}/{_env_key_name}/{slot}/ex-{now_tag}/" if obs_prefix else ""
     local_base.mkdir(parents=True, exist_ok=True)
 
     update_status(record_id, "running", obs_dst=obs_dst, local_copy_dir=str(local_base))
 
-    _mode_label = {"eval": "质检", "reformat": "合并导出", "reconstruct": "重构导出",
-                   "full_reformat": "全量导出"}.get(mode, "导出")
+    _mode_label = _mcfg.mode_label
     _log(f"开始{_mode_label}: key_slot={slot}, mtime_dirs={mtime_dirs}")
     _log(f"本地目录: {local_base}")
     if obs_dst:
@@ -593,9 +607,9 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
             try:
                 from utils.log_scan import detect_format as _df
                 _fmt = _df(mt_src)
-                if mode == "reconstruct" and _fmt != "newapi":
-                    _log(f"[{mt}] 目录格式 {_fmt}，重构导出仅支持 new-api 合并文件，跳过")
-                    res["warnings"].append(f"{mt}: 非 new-api 格式（{_fmt}），已跳过")
+                if not _mcfg.supports_format(_fmt):
+                    _log(f"[{mt}] 目录格式 {_fmt}，{_mcfg.mode_label}仅支持 {'/'.join(_mcfg.formats)} 合并文件，跳过")
+                    res["warnings"].append(f"{mt}: 非 {'/'.join(_mcfg.formats)} 格式（{_fmt}），已跳过")
                     res["skip"] = True
                     return res
                 if _fmt == "newapi":
@@ -618,7 +632,7 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
             _log(f"[{mt}] session_index: {exp_result.get('total_sessions', 0)} sessions"
                  + (" (已是最新，跳过)" if exp_result.get("skipped") else ""))
 
-            if mode == "export":
+            if _mcfg.pipeline == "copy":
                 _log(f"[{mt}] 开始复制文件" + (f" (按 key 过滤: ...{api_key[-8:]})" if api_key else " (全量)"))
                 # 只复制到共享 local_base，不在此上传；收尾统一上传一次（见下方 finalize）。
                 # 避免多目录并行时每目录都整目录上传 → 重复上传 + 写入中上传的竞态。
@@ -643,12 +657,10 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                     return res
                 if api_key:
                     _log(f"[{mt}] 共 {total_before} sessions, 按 key 过滤后 {len(session_entries)}")
-                if mode in ("reconstruct", "full_reformat"):
-                    # 处理器签名无 analyze 形参：reconstruct 逐 session 聚合多 trace，
-                    # full_reformat 逐 session 全量落盘。格式守卫（reconstruct 限 new-api）
-                    # 已在上方 detect_format 处提前拦截；full_reformat 两种格式都支持。
-                    _step = "hermes 重构" if mode == "reconstruct" else "全量合并"
-                    _log(f"[{mt}] 进入 {_step}: {len(session_entries)} sessions, workers={workers}...")
+                # analyze 三态：None = 处理器签名里没有这个形参（reconstruct /
+                # full_reformat / jiuwen_reformat），调用时不传。有值则传入。
+                if _mcfg.analyze is None:
+                    _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
                     ra_result = processor(
                         src_dir=mt_src, out_dir=str(local_base),
                         session_entries=session_entries, api_key=api_key, workers=workers,
@@ -657,23 +669,19 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                         should_cancel=_should_cancel,
                     )
                 else:
-                    _do_analyze = (mode == "eval")
-                    _step = "reformat+analyze" if _do_analyze else "reformat"
-                    _log(f"[{mt}] 进入 {_step}: {len(session_entries)} sessions, workers={workers}...")
+                    _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
                     ra_result = processor(
                         src_dir=mt_src, out_dir=str(local_base),
                         session_entries=session_entries, api_key=api_key, workers=workers,
                         progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
                         log_dir=_log_dir_key_for(_env_dir, mt_src),
-                        analyze=_do_analyze,
+                        analyze=_mcfg.analyze,
                         should_cancel=_should_cancel,
                     )
                 res["results"] = ra_result["results"]
                 res["entries"] = session_entries
                 _n_err = len(ra_result.get('errors', []))
-                _done_word = {"eval": "质检", "reconstruct": "重构",
-                              "full_reformat": "全量导出"}.get(mode, "导出")
-                _log(f"[{mt}] {_done_word}完成：成功 {ra_result['total_files']} 个 session"
+                _log(f"[{mt}] {_mcfg.mode_label}完成：成功 {ra_result['total_files']} 个 session"
                      + (f"，失败 {_n_err}" if _n_err else ""))
         except Exception as e:
             _log(f"[{mt}] 错误: {e}")
@@ -715,7 +723,7 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
         warnings.extend(res["warnings"])
         total_uploaded += res["uploaded"]
         total_skipped += res["skipped"]
-        if mode == "export":
+        if _mcfg.pipeline == "copy":
             total_sessions += res["new_sessions"]
         else:
             all_results.extend(res["results"])
@@ -732,7 +740,7 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
 
     eval_report_path = ""
     analysis_json_stored = ""
-    if mode == "export":
+    if _mcfg.pipeline == "copy":
         # 收尾统一上传：所有 mtime 目录已把三元组文件复制到共享 local_base，
         # 这里对整个 local_base 上传一次。obsutil 用 -u 增量，已存在的对象自动跳过，
         # 所以「重试上传」再跑一遍时只补上次失败的文件。
@@ -750,10 +758,10 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                 _log("未配置 OBS 目标，仅本地复制完成")
         else:
             _log("无新 session 需要导出")
-    elif mode in ("reformat", "reconstruct", "full_reformat"):
-        # reformat-only / reconstruct / full_reformat：合并/聚合后的 session JSON 已由
-        # worker 落在 local_base/<session>/，这里补一份 session_index.jsonl 清单后整目录
-        # 上传，不跑 evaluate/质检。
+    elif _mcfg.pipeline == "reformat":
+        # 合并/聚合后的 session JSON 已由 worker 落在 local_base/<session>/，这里补一份
+        # session_index.jsonl 清单后整目录上传，不跑 evaluate/质检。
+        # reformat / reconstruct / full_reformat / jiuwen_reformat 都走这条分支。
         if all_results:
             idx_path = local_base / "session_index.jsonl"
             with open(idx_path, "w", encoding="utf-8") as f:
@@ -774,7 +782,7 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                 _log("仅本地复制，未上传 OBS（提交时 OBS 前缀为空）；如需上传可对本记录「重试上传」")
         else:
             _log("无 session 数据")
-    elif mode == "eval":
+    elif _mcfg.pipeline == "eval":
         if all_results:
             idx_path = local_base / "session_index.jsonl"
             with open(idx_path, "w", encoding="utf-8") as f:
@@ -822,11 +830,12 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
         elif all_results:
             _log("仅本地复制，未上传 OBS（提交时 OBS 前缀为空）；如需上传可对本记录「重试上传」")
 
-    _done_label = {"eval": "质检", "reformat": "合并导出", "reconstruct": "重构导出"}.get(mode, "导出")
+    _done_label = _mcfg.mode_label
 
     # 判定失败只看「真错误」(errors)：上传失败、异常等。
     # warnings（如 new-api 索引未构建被跳过）不影响已成功部分的产出，不判失败。
-    no_output = (mode in ("eval", "reformat", "reconstruct", "full_reformat") and not all_results)
+    # pipeline=copy 的产出在 res["new_sessions"]，不产 results，故不参与 no_output 判定。
+    no_output = (_mcfg.pipeline != "copy" and not all_results)
     warn_suffix = f"（{len(warnings)} 个目录跳过：{'; '.join(warnings)}）" if warnings else ""
 
     if errors or no_output:
@@ -964,6 +973,9 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             "interval": sync_cfg.get("interval", 600),
             "upload_script": sync_cfg.get("upload_script", ""),
             "mtimes": mtimes,
+            # 导出模式清单（settings/export_modes.yaml）。前端下拉/筛选/徽章全部由它渲染，
+            # 新增模式不必改模板。顺序即 YAML 中的顺序。
+            "modes": get_export_modes().to_public_list(),
         })
 
     @app.get("/api/export/backfill-status")
@@ -1135,19 +1147,23 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             dir_workers = 0
         # 默认立即入队执行；start=False 时只建草稿（draft）记录，由前端手动「启动」。
         start = body.get("start", True)
-        # mode 优先显式取值（export / eval / reformat / reconstruct / full_reformat）；兼容旧的 auto_eval 布尔
+        # mode 取值来自 settings/export_modes.yaml 注册表；非法/缺失回退默认。
+        # 兼容旧的 auto_eval 布尔（true → 默认质检模式）。
+        _mc = get_export_modes()
         mode = body.get("mode")
-        if mode not in ("export", "eval", "reformat", "reconstruct", "full_reformat"):
-            mode = "eval" if body.get("auto_eval", False) else "export"
+        if mode not in _mc.ids():
+            _fallback_mode = "eval" if body.get("auto_eval", False) else _default_mode()
+            mode = _fallback_mode
         # 用户自定义的名字（可选），建任务时存进 manage_name，列表里显示。
         export_name = (body.get("export_name") or body.get("name") or "").strip()
 
         if not mtime_dirs:
             return JSONResponse({"detail": "mtime_dirs is required"}, status_code=400)
-        # full_reformat（全量导出）单目录即产出海量文件，限定一次只导一个 mtime，
-        # 避免多目录放大资源占用/误操作。
-        if mode == "full_reformat" and len(mtime_dirs) != 1:
-            return JSONResponse({"detail": "全量导出仅支持单个 mtime 目录"}, status_code=400)
+        # max_mtimes=1 的模式（全量导出）单目录即产出海量文件，限定一次只导一个 mtime，
+        # 避免多目录放大资源占用/误操作。上限来自配置，不再硬编码模式名。
+        _max_mt = get_export_modes().get(mode).max_mtimes
+        if _max_mt and len(mtime_dirs) != _max_mt:
+            return JSONResponse({"detail": f"{get_export_modes().get(mode).mode_label}仅支持单个 mtime 目录"}, status_code=400)
         for mt in mtime_dirs:
             if _resolve_mt(mt) is None:
                 return JSONResponse({"detail": f"目录不存在: {mt}"}, status_code=400)
@@ -1206,7 +1222,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         if rec["status"] != "draft":
             return JSONResponse({"detail": "只能启动草稿任务"}, status_code=400)
 
-        mode = rec.get("mode") or "export"
+        mode = rec.get("mode") or _default_mode()
         obs_prefix = (rec.get("obs_dst", "") or "").strip().rstrip("/")
         force = False
         now_tag = datetime.now().strftime("%y%m%d%H%M%S")
@@ -1235,29 +1251,44 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         if rec["status"] != "success":
             return JSONResponse({"detail": "导出未完成，无法质检"}, status_code=400)
 
-        obs_prefix = rec.get("obs_dst", "").split("/session/")[0] if rec.get("obs_dst") else ""
+        # obs_prefix 复原：obs_dst 形如 <prefix>/<obs_sub>/<env_key>/<slot>/ex-<tag>/，
+        # 按已注册的 obs_sub 长度降序匹配，避免 session_analysis 抢在
+        # session_analysis_full 前面把前缀切错。
+        _eval_sub = _public_obs_sub(_eval_mode())
+        obs_prefix = ""
+        if rec.get("obs_dst"):
+            _d = rec["obs_dst"]
+            _segs = sorted({m.obs_sub for m in get_export_modes().all() if m.obs_sub} |
+                           ({_eval_sub} if _eval_sub else set()), key=len, reverse=True)
+            for _s in _segs:
+                if f"/{_s}/" in _d:
+                    obs_prefix = _d.split(f"/{_s}/")[0]
+                    break
+            else:
+                obs_prefix = _d.rstrip("/").rsplit("/", 1)[0]
         now_tag = datetime.now().strftime("%y%m%d%H%M%S")
 
         new_record_id = create_record(
             api_key=rec["api_key"], key_slot=rec["key_slot"],
             mtime_dirs=rec["mtime_dirs"],
-            mode="eval",
+            mode=_eval_mode(),
             source_export_id=src_record_id,
             key_name=rec.get("key_name", ""),
         )
 
-        persist_params(new_record_id, mode="eval", obs_prefix=obs_prefix, force=False,
+        persist_params(new_record_id, mode=_eval_mode(), obs_prefix=obs_prefix, force=False,
                        now_tag=now_tag, env_dir=str(env_dir), env_key_name=env_key_name)
-        _enqueue_task(new_record_id, lambda rid=new_record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag: _run_task(rid, ed, ek, op, nt, "eval"))
+        _enqueue_task(new_record_id, lambda rid=new_record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag: _run_task(rid, ed, ek, op, nt, _eval_mode()))
 
-        return JSONResponse({"record_id": new_record_id, "status": "queued", "mode": "eval"})
+        return JSONResponse({"record_id": new_record_id, "status": "queued", "mode": _eval_mode()})
 
     @app.post("/api/export/retry")
     async def export_retry(request: Request):
         """重试失败/已取消（含用户终止）的任务：用原记录参数新建一条记录重跑。
 
         原失败记录保留作历史（同 export_eval 的"从原记录重建"模式）。沿用原
-        mode（export/reformat/eval）、api_key、mtime_dirs；obs_prefix 从原
+        mode（export/reformat/eval/reconstruct/full_reformat/jiuwen_reformat）、api_key、
+        mtime_dirs；obs_prefix 从原
         obs_dst 复原，保证与原任务一致。
         """
         denied = _require_key_api(request)
@@ -1274,15 +1305,17 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         if rec["status"] not in ("failed", "cancelled"):
             return JSONResponse({"detail": "只能重试失败/已取消的任务"}, status_code=400)
 
-        mode = rec.get("mode") or "export"
-        # obs_prefix 复原：obs_dst 形如 <prefix>/session/... 、<prefix>/session_analysis/...
-        # 、<prefix>/session_analysis_full/... 或 <prefix>/session_reconstruct/...
-        # （见 _run_task_inner 的 obs_sub）。session_analysis_full 是 session_analysis 的
-        # 父串，必须排在 session_analysis 之前匹配，否则被误切；reconstruct 同理放最前。
+        mode = rec.get("mode") or _default_mode()
+        # obs_prefix 复原：obs_dst 形如 <prefix>/<obs_sub>/<env_key>/<slot>/ex-<tag>/，
+        # obs_sub 取自配置。按 obs_sub 长度降序匹配，避免 session_analysis 抢在
+        # session_analysis_full 前面把前缀切错。
         obs_dst = rec.get("obs_dst", "") or ""
         obs_prefix = ""
         if obs_dst:
-            for _seg in ("/session_reconstruct/", "/session_analysis_full/", "/session_analysis/", "/session/"):
+            _subs = sorted({m.obs_sub for m in get_export_modes().all() if m.obs_sub},
+                           key=len, reverse=True)
+            for _sub in _subs:
+                _seg = f"/{_sub}/"
                 if _seg in obs_dst:
                     obs_prefix = obs_dst.split(_seg)[0]
                     break
@@ -1332,11 +1365,9 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             if not obs_base:
                 return JSONResponse(
                     {"detail": "无 OBS 目标路径，且未配置 obs_base，无法上传"}, status_code=400)
-            mode = rec.get("mode") or "export"
-            obs_sub = {"reconstruct": "session_reconstruct",
-                       "full_reformat": "session_analysis_full",
-                       "reformat": "session_analysis",
-                       "eval": "session_analysis"}.get(mode, "session")
+            mode = rec.get("mode") or _default_mode()
+            _mcfg_ur = get_export_modes().get(mode)
+            obs_sub = _mcfg_ur.obs_sub if _mcfg_ur else "session"
             # env_key / slot / ex-tag 从 local_copy_dir 末三段解析：
             #   .../<obs_sub 对应本地目录>/<env_key>/<slot>/ex-<tag>
             lparts = Path(local_copy_dir).parts
@@ -1642,19 +1673,18 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             return JSONResponse({"detail": "Key not unique (ambiguous suffix)"}, status_code=404), None
         return None, resolved
 
-    # 公开 submit 里各 mode 落到 OBS 的子目录，与 _run_task_inner 的 obs_sub 分支一致
-    _PUBLIC_MODE_OBS_SUB = {
-        "export": "session",
-        "reformat": "session_analysis",
-        "eval": "session_analysis",
-        "reconstruct": "session_reconstruct",
-        "full_reformat": "session_analysis_full",
-    }
-    _PUBLIC_MODES = tuple(_PUBLIC_MODE_OBS_SUB.keys())
+    # 公开 submit 可用的 mode 及各自落到 OBS 的子目录，取自配置里的 public: true。
+    # 与 _run_task_inner 的 obs_sub 同源（都读 export_modes.yaml），不会漂移。
+    def _public_modes() -> tuple:
+        return get_export_modes().public_ids()
+
+    def _public_obs_sub(mode: str) -> str:
+        mcfg = get_export_modes().get(mode)
+        return mcfg.obs_sub if mcfg else ""
 
     @app.get("/export/submit")
     def public_export_submit(key: str = "", model: str = "", export_name: str = "",
-                             mode: str = "export",
+                             mode: str = "",
                              access_key: str = Query(default="", alias="access-key")):
         """按给定 key 正式导出：创建真实导出任务（export_records），显示名用 export_name。
 
@@ -1662,17 +1692,20 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         model 参数仅为兼容 URL 语义保留——导出任务按现有 mtime_dirs 全量执行，
         不做按 model 的会话过滤（与既有「导出」页行为一致）。
 
-        mode 指定导出类型（export/reformat/eval/reconstruct/full_reformat），默认 export
-        即现有行为。full_reformat（全量导出）与内部 /api/export/run 一致：只允许单个
-        mtime 目录，多目录时拒绝（提示，不静默取第一个）。
+        mode 指定导出类型，可选值 = settings/export_modes.yaml 中 public: true 的模式
+        （当前 export/reformat/eval/reconstruct/full_reformat/jiuwen_reformat），默认
+        export（即原始三元组复制）。max_mtimes=1 的模式（全量导出）与内部
+        /api/export/run 一致：只允许单个 mtime 目录，多目录时拒绝（不静默取第一个）。
         """
         err, api_key = _check_public_export(key, access_key)
         if err:
             return err
 
-        if mode not in _PUBLIC_MODES:
+        if not mode:
+            mode = _default_mode()
+        if mode not in _public_modes():
             return JSONResponse(
-                {"detail": f"Invalid mode '{mode}' (allowed: {', '.join(_PUBLIC_MODES)})"},
+                {"detail": f"Invalid mode '{mode}' (allowed: {', '.join(_public_modes())})"},
                 status_code=400,
             )
 
@@ -1686,16 +1719,17 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         if not mtime_dirs:
             return JSONResponse({"detail": "No session data found for this key"}, status_code=404)
 
-        if mode == "full_reformat" and len(mtime_dirs) != 1:
+        _pub_max_mt = get_export_modes().get(mode).max_mtimes
+        if _pub_max_mt and len(mtime_dirs) != _pub_max_mt:
             return JSONResponse(
-                {"detail": f"全量导出(full_reformat)仅支持单个 mtime 目录，该 key 落到 {len(mtime_dirs)} 个目录"},
+                {"detail": f"{get_export_modes().get(mode).mode_label}({mode})仅支持单个 mtime 目录，该 key 落到 {len(mtime_dirs)} 个目录"},
                 status_code=400,
             )
 
         slot = _key_slot(api_key)
         obs_prefix = load_obs_base()
         now_tag = datetime.now().strftime("%y%m%d%H%M%S")
-        obs_sub = _PUBLIC_MODE_OBS_SUB[mode]
+        obs_sub = _public_obs_sub(mode)
 
         record_id = create_record(
             api_key=api_key, key_slot=slot,

@@ -220,11 +220,8 @@
             </select>
             <select class="input input-sm" v-model="modeFilter" style="max-width:150px">
                 <option value="">全部方式</option>
-                <option value="export">原始导出</option>
-                <option value="reformat">合并导出</option>
-                <option value="reconstruct">重构导出</option>
-                <option value="full_reformat">全量导出</option>
-                <option value="eval">质检</option>
+                <!-- 方式清单来自 settings/export_modes.yaml（/api/export/config 的 modes） -->
+                <option v-for="m in modes" :key="m.id" :value="m.id">{{ m.mode_label }}</option>
             </select>
             <small class="text-muted" v-if="hasTaskFilters">匹配 {{ filteredTotal }} / {{ tasks.length }}</small>
         </div>
@@ -257,7 +254,7 @@
                     </td>
                     <td>
                         <span class="badge badge-info" v-if="t.mode === 'eval'">{{ modeLabel(t.mode) }}</span>
-                        <span class="badge badge-warning" v-else-if="t.mode === 'reformat' || t.mode === 'reconstruct' || t.mode === 'full_reformat'">{{ modeLabel(t.mode) }}</span>
+                        <span class="badge badge-warning" v-else-if="isReformatMode(t.mode)">{{ modeLabel(t.mode) }}</span>
                         <span class="badge" v-else>{{ modeLabel(t.mode) }}</span>
                     </td>
                     <td style="white-space:nowrap;">
@@ -427,17 +424,14 @@
                     <input type="text" class="input input-sm" v-model="obsPrefix" placeholder="obs://bucket/path（可选，留空仅本地复制）">
                 </div>
                 <div v-if="obsPrefix" class="obs-preview">
-                    目标: {{ obsPrefix.replace(/\/+$/, '') }}/{{ exportMode === 'export' ? 'session' : (exportMode === 'reconstruct' ? 'session_reconstruct' : (exportMode === 'full_reformat' ? 'session_analysis_full' : 'session_analysis')) }}/{{ config.env_key }}/{{ modalKey.key_slot }}/ex-{{ nowTag }}/
+                    目标: {{ obsPrefix.replace(/\/+$/, '') }}/{{ obsSubFor(exportMode) }}/{{ config.env_key }}/{{ modalKey.key_slot }}/ex-{{ nowTag }}/
                 </div>
                 <div class="mb-3 mt-2">
                     <div class="mb-2">
                         <label class="form-label small mb-1">导出方式</label>
                         <select class="input input-sm" v-model="exportMode" @change="onModeChange">
-                            <option value="export">导出原始文件（三元组，不分析）</option>
-                            <option value="reformat">合并导出（三元组合并成单 JSON，不质检）</option>
-                            <option value="reconstruct">重构导出（hermes 聚合去重+回填 reasoning，仅 new-api）</option>
-                            <option value="full_reformat">全量导出（session 全部 trace 文件合并，仅单目录，不质检）</option>
-                            <option value="eval">质检模式（reformat+分析，出报告）</option>
+                            <!-- 方式清单来自 settings/export_modes.yaml（/api/export/config 的 modes） -->
+                            <option v-for="m in modes" :key="m.id" :value="m.id">{{ m.label }}</option>
                         </select>
                     </div>
                     <div class="mb-2">
@@ -458,8 +452,8 @@
                     </div>
                     <div class="mb-3 mt-3">
                         <label class="form-label small">选择 mtime 目录（节点）</label>
-                        <div class="text-muted" style="font-size:.76rem;margin-bottom:4px;" v-if="exportMode === 'full_reformat'">
-                            全量导出仅可选择 <b>一个</b> mtime 目录。
+                        <div class="text-muted" style="font-size:.76rem;margin-bottom:4px;" v-if="maxMtimesFor(exportMode)">
+                            {{ modeLabel(exportMode) }}仅可选择 <b>一个</b> mtime 目录。
                         </div>
                         <div v-for="mt in modalMtimes" :key="mt" class="mtime-check">
                             <input type="checkbox" :value="mt" v-model="selectedMtimes" :id="'mt-'+mt" @change="onMtimeToggle(mt)">
@@ -479,10 +473,10 @@
                     <button class="btn btn-outline btn-sm" @click="modalKey = null">← 返回选择 Key</button>
                     <div class="d-flex gap-2">
                         <button class="btn btn-outline btn-sm" @click="closeModal">取消</button>
-                        <button class="btn btn-primary btn-sm" style="background:var(--success);border-color:var(--success);" @click="saveDraft(false)" :disabled="exporting || !selectedMtimes.length || (exportMode === 'full_reformat' && selectedMtimes.length !== 1)">
+                        <button class="btn btn-primary btn-sm" style="background:var(--success);border-color:var(--success);" @click="saveDraft(false)" :disabled="exporting || !selectedMtimes.length || (maxMtimesFor(exportMode) && selectedMtimes.length !== maxMtimesFor(exportMode))">
                             {{ exporting ? '保存中…' : '保存草稿' }}
                         </button>
-                        <button class="btn btn-primary btn-sm" @click="saveDraft(true)" :disabled="exporting || !selectedMtimes.length || (exportMode === 'full_reformat' && selectedMtimes.length !== 1)"
+                        <button class="btn btn-primary btn-sm" @click="saveDraft(true)" :disabled="exporting || !selectedMtimes.length || (maxMtimesFor(exportMode) && selectedMtimes.length !== maxMtimesFor(exportMode))"
                                 title="保存草稿后立即入队执行">
                             {{ exporting ? '执行中…' : '保存并启动' }}
                         </button>
@@ -571,7 +565,9 @@
 new Vue({
     el: '#app',
     data: {
-        config: { port: '', env_key: '', env_dir: '', obs_base: '', workers: 0, interval: 0, mtimes: [], roots: [] },
+        config: { port: '', env_key: '', env_dir: '', obs_base: '', workers: 0, interval: 0, mtimes: [], roots: [], modes: [] },
+        // 导出方式清单，来自 settings/export_modes.yaml（后端 /api/export/config 下发）
+        modes: [],
         hasMultiRoot: false,
         obsPrefix: '',
         taskName: '',
@@ -851,6 +847,7 @@ new Vue({
                 return r.json();
             }).then(function(d) {
                 this.config = d;
+                this.modes = d.modes || [];
                 this.hasMultiRoot = !!(d.roots && d.roots.length > 1);
                 if (d.obs_base && !this.obsPrefix) this.obsPrefix = d.obs_base;
             }.bind(this)).catch(function() {});
@@ -1024,17 +1021,49 @@ new Vue({
             }[s] || s;
         },
         modeLabel: function(mode) {
-            return {eval: '质检', reformat: '合并导出', reconstruct: '重构导出', full_reformat: '全量导出'}[mode] || '导出';
+            var m = this._modeOf(mode);
+            return m ? m.mode_label : mode;
+        },
+        _modeOf: function(mode) {
+            for (var i = 0; i < this.modes.length; i++) {
+                if (this.modes[i].id === mode) return this.modes[i];
+            }
+            return null;
+        },
+        // 该模式是否产合并文件（徽章着色用）；pipeline 由后端在 modes 里给出
+        isReformatMode: function(mode) {
+            var m = this._modeOf(mode);
+            return !!(m && m.reformat);
+        },
+        // 该模式落到 OBS 的子目录（预览用），后端随 modes 下发
+        obsSubFor: function(mode) {
+            var m = this._modeOf(mode);
+            return m ? m.obs_sub : '';
+        },
+        // 该模式限制的 mtime 目录数上限（无限制返回 0）
+        maxMtimesFor: function(mode) {
+            var m = this._modeOf(mode);
+            return (m && m.max_mtimes) ? m.max_mtimes : 0;
+        },
+        // 新建任务的默认方式：配置里第一个产合并文件的模式（即 reformat），
+        // 一个都没有时退回第一个模式。
+        _defaultExportMode: function() {
+            for (var i = 0; i < this.modes.length; i++) {
+                if (this.modes[i].reformat) return this.modes[i].id;
+            }
+            return this.modes.length ? this.modes[0].id : 'export';
         },
         // 切换导出方式：全量导出仅允许单个 mtime，已多选则裁剪为第一个
         onModeChange: function() {
-            if (this.exportMode === 'full_reformat' && this.selectedMtimes.length > 1) {
-                this.selectedMtimes = this.selectedMtimes.slice(0, 1);
+            var cap = this.maxMtimesFor(this.exportMode);
+            if (cap && this.selectedMtimes.length > cap) {
+                this.selectedMtimes = this.selectedMtimes.slice(0, cap);
             }
         },
         // 勾选 mtime：全量导出模式下语义变单选，只保留最后一次勾选
         onMtimeToggle: function(mt) {
-            if (this.exportMode === 'full_reformat' && this.selectedMtimes.length > 1) {
+            var cap = this.maxMtimesFor(this.exportMode);
+            if (cap && this.selectedMtimes.length > cap) {
                 this.selectedMtimes = [mt];
             }
         },
@@ -1044,7 +1073,8 @@ new Vue({
             this.showModal = true;
             this.modalKey = null;
             this.forceExport = false;
-            this.exportMode = 'reformat';
+            // 默认方式：配置里第一个产合并文件的模式（无则第一个）
+            this.exportMode = this._defaultExportMode();
             this.taskWorkers = 8;
             this.taskDirWorkers = 8;
             this.taskName = '';
@@ -1075,8 +1105,9 @@ new Vue({
         // 保存任务：start=false 只存草稿；start=true 存后立即入队执行
         saveDraft: function(start) {
             if (!this.selectedMtimes.length) return;
-            if (this.exportMode === 'full_reformat' && this.selectedMtimes.length !== 1) {
-                alert('全量导出仅支持单个 mtime 目录');
+            var cap = this.maxMtimesFor(this.exportMode);
+            if (cap && this.selectedMtimes.length !== cap) {
+                alert(this.modeLabel(this.exportMode) + '仅支持单个 mtime 目录');
                 return;
             }
             this.exporting = true;
