@@ -108,6 +108,9 @@
 .modal-box { background: var(--card); border-radius: var(--radius-lg); padding: 24px; width: 520px; max-height: 80vh; overflow-y: auto; box-shadow: var(--shadow-lg); }
 .mtime-check { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: .88rem; }
 .mtime-check input[type=checkbox] { width: 16px; height: 16px; }
+/* mtime 目录数可达数十个（跨 root 时更多），限高滚动，避免把底部按钮顶出视口 */
+.mtime-list { max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 10px; }
+.mtime-toolbar { display: flex; align-items: center; gap: 6px; }
 .obs-preview { font-size: .8rem; color: var(--muted-foreground); background: var(--muted); padding: 8px 12px; border-radius: var(--radius); margin-top: 8px; word-break: break-all; font-family: var(--font-mono); }
 
 .no-data { text-align: center; color: var(--muted-foreground); padding: 40px 0; }
@@ -451,17 +454,33 @@
                         <label class="form-check-label small" for="force-check">强制重新导出（忽略缓存）</label>
                     </div>
                     <div class="mb-3 mt-3">
-                        <label class="form-label small">选择 mtime 目录（节点）</label>
+                        <div class="d-flex justify-content-between align-items-center mb-1" style="gap:8px;">
+                            <label class="form-label small mb-0">选择 mtime 目录（节点）</label>
+                            <div class="mtime-toolbar" v-if="modalMtimes.length">
+                                <small class="text-muted" style="white-space:nowrap;">已选 {{ selectedMtimes.length }}/{{ modalMtimes.length }}</small>
+                                <!-- 单目录模式（full_reformat）下"全选"没有意义：onMtimeToggle 会把
+                                     多选裁回单选，所以这里只留"全不选"，避免按钮点了没反应 -->
+                                <button type="button" class="btn btn-outline btn-xs"
+                                        v-if="!maxMtimesFor(exportMode)"
+                                        @click="selectAllMtimes"
+                                        :disabled="selectedMtimes.length === modalMtimes.length">全选</button>
+                                <button type="button" class="btn btn-outline btn-xs"
+                                        @click="selectNoMtimes"
+                                        :disabled="!selectedMtimes.length">全不选</button>
+                            </div>
+                        </div>
                         <div class="text-muted" style="font-size:.76rem;margin-bottom:4px;" v-if="maxMtimesFor(exportMode)">
                             {{ modeLabel(exportMode) }}仅可选择 <b>一个</b> mtime 目录。
                         </div>
-                        <div v-for="mt in modalMtimes" :key="mt" class="mtime-check">
-                            <input type="checkbox" :value="mt" v-model="selectedMtimes" :id="'mt-'+mt" @change="onMtimeToggle(mt)">
-                            <label :for="'mt-'+mt">{{ mt }}
-                                <small class="text-muted" v-if="modalKey.mtime_distribution && modalKey.mtime_distribution[mt]">
-                                    ({{ modalKey.mtime_distribution[mt].total }} sessions)
-                                </small>
-                            </label>
+                        <div class="mtime-list">
+                            <div v-for="mt in modalMtimes" :key="mt" class="mtime-check">
+                                <input type="checkbox" :value="mt" v-model="selectedMtimes" :id="'mt-'+mt" @change="onMtimeToggle(mt)">
+                                <label :for="'mt-'+mt">{{ mt }}
+                                    <small class="text-muted" v-if="modalKey.mtime_distribution && modalKey.mtime_distribution[mt]">
+                                        ({{ modalKey.mtime_distribution[mt].total }} sessions)
+                                    </small>
+                                </label>
+                            </div>
                         </div>
                         <div class="text-muted" style="font-size:.76rem; margin-top:6px;" v-if="hasMultiRoot">
                             带 <code>目录名/</code> 前缀的为其它日志路径（如 new-api）。导出时会自动补齐会话数据；
@@ -473,10 +492,10 @@
                     <button class="btn btn-outline btn-sm" @click="modalKey = null">← 返回选择 Key</button>
                     <div class="d-flex gap-2">
                         <button class="btn btn-outline btn-sm" @click="closeModal">取消</button>
-                        <button class="btn btn-primary btn-sm" style="background:var(--success);border-color:var(--success);" @click="saveDraft(false)" :disabled="exporting || !selectedMtimes.length || (maxMtimesFor(exportMode) && selectedMtimes.length !== maxMtimesFor(exportMode))">
+                        <button class="btn btn-primary btn-sm" style="background:var(--success);border-color:var(--success);" @click="saveDraft(false)" :disabled="!canSaveTask">
                             {{ exporting ? '保存中…' : '保存草稿' }}
                         </button>
-                        <button class="btn btn-primary btn-sm" @click="saveDraft(true)" :disabled="exporting || !selectedMtimes.length || (maxMtimesFor(exportMode) && selectedMtimes.length !== maxMtimesFor(exportMode))"
+                        <button class="btn btn-primary btn-sm" @click="saveDraft(true)" :disabled="!canSaveTask"
                                 title="保存草稿后立即入队执行">
                             {{ exporting ? '执行中…' : '保存并启动' }}
                         </button>
@@ -742,6 +761,18 @@ new Vue({
                 var logDirOk = !ld || (k.mtime_distribution && k.mtime_distribution[ld]);
                 return textOk && modelOk && kwOk && logDirOk;
             });
+        },
+        // 新建任务第二步「保存草稿 / 保存并启动」是否可点。
+        // 必须返回真正的布尔：Vue 2 的布尔属性判定是 `null == v || v === false`
+        // （Gr 在 vue.min.js 里），数字 0 既不是 null 也不全等于 false，会被当作
+        // truthy 渲染成 disabled="disabled"。maxMtimesFor() 无限制时返回 0，
+        // 写成 `maxMtimesFor(m) && ...` 在 5 个不限额模式上就会让按钮永久置灰。
+        canSaveTask: function() {
+            if (this.exporting) return false;
+            if (!this.selectedMtimes.length) return false;
+            var cap = this.maxMtimesFor(this.exportMode);
+            if (cap && this.selectedMtimes.length !== cap) return false;
+            return true;
         },
         leafOkCount: function() {
             var out = {};
@@ -1066,6 +1097,16 @@ new Vue({
             if (cap && this.selectedMtimes.length > cap) {
                 this.selectedMtimes = [mt];
             }
+        },
+        // 全选 mtime 目录。限额模式（cap=1）下"全选"会立刻被裁成 1 个，
+        // 与"最后勾选的那个"语义冲突，所以按钮在限额模式下不渲染；
+        // 这里仍做一次裁剪兜底，防止切模式后残留的调用路径。
+        selectAllMtimes: function() {
+            var cap = this.maxMtimesFor(this.exportMode);
+            this.selectedMtimes = cap ? this.modalMtimes.slice(0, cap) : this.modalMtimes.slice();
+        },
+        selectNoMtimes: function() {
+            this.selectedMtimes = [];
         },
 
         // ---- 新建任务 ----
