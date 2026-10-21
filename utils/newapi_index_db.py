@@ -72,6 +72,11 @@ def _reap_pool_async(pool: "ProcessPoolExecutor") -> None:
 _INDEX_NAME = "index.jsonl"
 _DB_NAME = "index.db"
 
+# traces 批量查询的 IN 分批大小。SQLite 的 SQLITE_MAX_VARIABLE_NUMBER 在 3.32+ 是 32767、
+# 更早版本仅 999；整叶导出（单叶常 3-10w session）会超限抛 "too many SQL variables"，
+# 故按远低于下限的固定批大小切分。
+_TRACES_IN_CHUNK = 500
+
 # enrich 失败重试上限：合并文件「尚未落盘」是活跃叶子的常态瞬态失败，
 # 保持 q1_hash=NULL 让后续构建重扫重试；累计到此上限仍失败才标死（q1_hash=''）永久跳过。
 _MAX_ENRICH_ATTEMPTS = 3
@@ -825,11 +830,17 @@ def get_traces_batch(leaf_dir: str, session_keys: List[str]) -> Dict[str, List[D
         return {k: [] for k in session_keys}
     conn = _connect(leaf_dir)
     try:
-        ph = ",".join("?" * len(session_keys))
-        rows = conn.execute(
-            f"SELECT * FROM traces WHERE session_key IN ({ph}) ORDER BY ts ASC, id ASC",
-            session_keys,
-        ).fetchall()
+        rows = []
+        # 按固定批大小切分：单条 SQL 的变量数受 SQLITE_MAX_VARIABLE_NUMBER 限制
+        # （3.32+ 为 32767，更早为 999），整叶导出动辄 3-10w session，
+        # 一次性拼 IN 会抛 "too many SQL variables"。分批后语义不变。
+        for i in range(0, len(session_keys), _TRACES_IN_CHUNK):
+            chunk = session_keys[i:i + _TRACES_IN_CHUNK]
+            ph = ",".join("?" * len(chunk))
+            rows.extend(conn.execute(
+                f"SELECT * FROM traces WHERE session_key IN ({ph}) ORDER BY ts ASC, id ASC",
+                chunk,
+            ).fetchall())
         result: Dict[str, List[Dict[str, Any]]] = {k: [] for k in session_keys}
         for row in rows:
             t: Dict[str, Any] = {

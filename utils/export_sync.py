@@ -46,25 +46,34 @@ def _read_session_cache(logs_dir: str) -> List[dict]:
     """优先从 DB 读取，降级到读 .session_cache.jsonl 文件。
 
     new-api 叶子的 session 数据在叶子内 index.db（非 per-port session_cache.db），故先取它。
+
+    读取失败**不吞异常**：曾因 `except: return []` 把「读取报错」伪装成「没有数据」，
+    上层据此判成「无 session 数据」，真实原因（如 too many SQL variables）被掩盖。
+    现在记完整堆栈后上抛，由 _process_mtime 收进 errors，导出记录显示真实失败原因。
     """
     if _is_newapi(logs_dir):
+        import utils.newapi_index_db as nidb
         try:
-            import utils.newapi_index_db as nidb
             return nidb.export_sessions(logs_dir)
         except Exception:
-            return []
+            logger.exception("读取 new-api 叶子 index.db 失败: %s", logs_dir)
+            raise
 
+    db_err: Optional[Exception] = None
     try:
         import utils.session_store as _ss
         count = _ss.get_session_count_by_root(logs_dir)
         if count > 0:
             return _ss.export_sessions(logs_dir)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        db_err = e
+        logger.exception("读取 session_cache.db 失败，尝试降级读文件: %s", logs_dir)
 
     # 降级：直接读文件
     cache_path = Path(logs_dir) / SESSION_CACHE_NAME
     if not cache_path.is_file():
+        if db_err is not None:
+            raise db_err
         return []
     sessions = []
     with open(cache_path, "r", encoding="utf-8") as f:

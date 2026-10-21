@@ -20,6 +20,10 @@ _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
 _db_path: str = ""
 
+# traces 批量查询的 IN 分批大小。SQLITE_MAX_VARIABLE_NUMBER 在 3.32+ 为 32767、
+# 更早版本仅 999；全量导出时 session_keys 可能上十万，故按低于下限的固定批切分。
+_TRACES_IN_CHUNK = 500
+
 
 def init_db(db_dir: str = "data") -> None:
     global _conn, _db_path
@@ -416,11 +420,17 @@ def get_traces_batch(session_keys: List[str]) -> Dict[str, List[Dict[str, Any]]]
     if not session_keys:
         return {}
     conn = _get_conn()
-    placeholders = ",".join("?" * len(session_keys))
-    rows = conn.execute(
-        f"SELECT * FROM traces WHERE session_key IN ({placeholders}) ORDER BY ts ASC, id ASC",
-        session_keys,
-    ).fetchall()
+    # 按固定批大小切分：单条 SQL 的变量数受 SQLITE_MAX_VARIABLE_NUMBER 限制
+    # （3.32+ 为 32767，更早为 999），全量导出时 session_keys 可能上十万，
+    # 一次性拼 IN 会抛 "too many SQL variables"。
+    rows = []
+    for i in range(0, len(session_keys), _TRACES_IN_CHUNK):
+        chunk = session_keys[i:i + _TRACES_IN_CHUNK]
+        placeholders = ",".join("?" * len(chunk))
+        rows.extend(conn.execute(
+            f"SELECT * FROM traces WHERE session_key IN ({placeholders}) ORDER BY ts ASC, id ASC",
+            chunk,
+        ).fetchall())
     result: Dict[str, List[Dict[str, Any]]] = {k: [] for k in session_keys}
     for row in rows:
         result[row["session_key"]].append(_row_to_trace(row))
