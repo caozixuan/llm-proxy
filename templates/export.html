@@ -243,6 +243,8 @@
                     <th>导出方式</th>
                     <th>状态</th>
                     <th>导出时间</th>
+                    <th>完成时间</th>
+                    <th>耗时</th>
                     <th>OBS 路径</th>
                     <th>Session 数</th>
                     <th>节点分布</th>
@@ -276,15 +278,17 @@
                         </div>
                     </td>
                     <td style="white-space:nowrap;">
-                        <span>{{ t.created_at }}</span>
-                        <div style="font-size:.72rem;color:var(--muted-foreground);margin-top:2px;">
-                            <template v-if="t.status === 'running' && t.started_at">
-                                开始 {{ t.started_at }}<template v-if="elapsedLabel(t)">（已用 {{ elapsedLabel(t) }}）</template>
-                            </template>
-                            <template v-else-if="t.status === 'success' && t.finished_at">
-                                完成 {{ t.finished_at }}<template v-if="elapsedLabel(t)">（耗时 {{ elapsedLabel(t) }}）</template>
-                            </template>
-                        </div>
+                        <span>{{ t.started_at || t.created_at }}</span>
+                        <div v-if="!t.started_at && t.created_at" style="font-size:.72rem;color:var(--muted-foreground);margin-top:2px;">（创建，尚未开始）</div>
+                    </td>
+                    <td style="white-space:nowrap;">
+                        <span v-if="t.finished_at">{{ t.finished_at }}</span>
+                        <span v-else class="text-muted" style="font-size:.76rem;">—</span>
+                    </td>
+                    <td style="white-space:nowrap;">
+                        <span v-if="elapsedLabel(t)">{{ elapsedLabel(t) }}</span>
+                        <span v-else class="text-muted" style="font-size:.76rem;">—</span>
+                        <div v-if="t.status === 'running'" style="font-size:.72rem;color:var(--info);margin-top:2px;">进行中</div>
                     </td>
                     <td>
                         <div v-if="t.obs_dst" class="obs-path" @click="openDrawer(t.obs_dst)" :title="t.obs_dst">{{ t.obs_dst }}</div>
@@ -297,43 +301,10 @@
                         </div>
                     </td>
                     <td>
-                        <a v-if="leafExpanded[t.id]" @click="toggleLeaves(t)" style="font-size:.8rem;color:var(--primary);font-weight:600;">收起 ▲</a>
-                        <a v-else @click="toggleLeaves(t)" style="font-size:.8rem;color:var(--primary);font-weight:600;">节点分布 ▾</a>
-                        <div v-if="leafExpanded[t.id]">
-                            <div v-if="leafLoading[t.id]" class="text-muted" style="font-size:.76rem;margin-top:6px;">加载中…</div>
-                            <template v-else-if="leafData[t.id]">
-                                <div class="leaf-summary" v-if="leafData[t.id].leaves && leafData[t.id].leaves.length">
-                                    共 <span style="font-weight:600;">{{ leafData[t.id].leaves.length }}</span> 个节点
-                                    <template v-if="leafOkCount[t.id]"> · <span class="ok">正常 {{ leafOkCount[t.id] }}</span></template>
-                                    <template v-if="leafErrCount[t.id]"> · <span class="err">异常 {{ leafErrCount[t.id] }}</span></template>
-                                    <a @click="reloadLeaves(t)" style="margin-left:8px;font-size:.74rem;color:var(--primary);cursor:pointer;" title="忽略缓存，重新扫描节点">↻ 刷新</a>
-                                </div>
-                                <div v-if="leafData[t.id].leaves && leafData[t.id].leaves.length" class="leaf-wrap">
-                                    <div v-for="l in leafData[t.id].leaves" :key="l.dir_key" class="leaf-card"
-                                         :class="{'ok': leafStateOk(l), 'err': leafStateErr(l)}"
-                                         :title="l.dir_key + (l.error ? '\n' + l.error : '')">
-                                        <div class="mono">{{ leafDay(l.dir_key) }}</div>
-                                        <div class="sub">节点 <span :class="leafStateOk(l) ? 'msg-ok' : ''">{{ leafStateLabel(l) }}</span></div>
-                                        <div class="sub">session {{ l.sessions }}</div>
-                                        <div v-if="leafStateErr(l)" class="sub" style="color:var(--destructive);">异常</div>
-                                    </div>
-                                </div>
-                                <div v-else class="text-muted" style="font-size:.76rem;margin-top:6px;">无节点数据</div>
-                            </template>
-                        </div>
+                        <a @click="openLeaves(t)" style="font-size:.8rem;color:var(--primary);font-weight:600;">节点分布</a>
                     </td>
                     <td>
-                        <a v-if="detailExpanded[t.id]" @click="toggleDetail(t)" style="font-size:.8rem;color:var(--primary);font-weight:600;">收起 ▲</a>
-                        <a v-else @click="toggleDetail(t)" style="font-size:.8rem;color:var(--primary);font-weight:600;">详情 ▾</a>
-                        <div v-if="detailExpanded[t.id]" style="margin-top:6px;">
-                            <div v-if="detailLoading[t.id]" class="text-muted" style="font-size:.76rem;">加载中…</div>
-                            <table v-else-if="detailData[t.id]" class="detail-table">
-                                <tr v-for="row in detailRows(detailData[t.id])" :key="row.k">
-                                    <td class="dk">{{ row.k }}</td>
-                                    <td class="dv">{{ row.v }}</td>
-                                </tr>
-                            </table>
-                        </div>
+                        <a @click="openDetail(t)" style="font-size:.8rem;color:var(--primary);font-weight:600;">详情</a>
                     </td>
                     <td>
                         <div class="task-ops">
@@ -341,6 +312,7 @@
                                 <span class="op" @click.stop="opsOpen = opsOpen === t.id ? null : t.id">更多 ▾</span>
                                 <div v-if="opsOpen === t.id" class="ops-menu" @click.stop>
                                     <span class="op" @click="opsOpen = null; openLogDrawer(t.id)">日志</span>
+                                    <span class="op" @click="opsOpen = null; duplicateTask(t)" title="按原任务的参数打开新建任务弹窗，可改完再保存/启动">复制</span>
                                     <span v-if="t.status === 'draft'" class="op op-ok" @click="opsOpen = null; startTask(t)">启动</span>
                                     <span v-if="t.status === 'running' || t.status === 'queued' || t.status === 'pending'" class="op op-danger" @click="opsOpen = null; cancelTask(t)">终止</span>
                                     <span v-if="t.status === 'failed' || t.status === 'cancelled'" class="op" @click="opsOpen = null; retryTask(t)">重试</span>
@@ -359,6 +331,58 @@
                 </tr>
             </tbody>
         </table>
+
+        <!-- 节点分布弹窗：点一次看一条记录的叶子明细，不再在表格里撑高行 -->
+        <div v-if="leafModal" class="modal-backdrop-custom" @click.self="closeLeaves">
+            <div class="modal-box" style="width:min(760px,94vw);">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <h5 class="mb-0">节点分布 #{{ leafModal }}</h5>
+                    <button class="btn btn-outline btn-sm" @click="closeLeaves">关闭</button>
+                </div>
+                <div v-if="leafLoading[leafModal]" class="text-muted small py-3 text-center">加载中…</div>
+                <template v-else-if="leafData[leafModal]">
+                    <div class="leaf-summary" v-if="leafData[leafModal].leaves && leafData[leafModal].leaves.length">
+                        共 <span style="font-weight:600;">{{ leafData[leafModal].leaves.length }}</span> 个节点
+                        <template v-if="leafOkCount[leafModal]"> · <span class="ok">正常 {{ leafOkCount[leafModal] }}</span></template>
+                        <template v-if="leafErrCount[leafModal]"> · <span class="err">异常 {{ leafErrCount[leafModal] }}</span></template>
+                        <a @click="reloadLeaves({id: leafModal})" style="margin-left:8px;font-size:.74rem;color:var(--primary);cursor:pointer;" title="忽略缓存，重新扫描节点">↻ 刷新</a>
+                    </div>
+                    <div v-if="leafData[leafModal].leaves && leafData[leafModal].leaves.length" class="leaf-wrap">
+                        <div v-for="l in leafData[leafModal].leaves" :key="l.dir_key" class="leaf-card"
+                             :class="{'ok': leafStateOk(l), 'err': leafStateErr(l)}"
+                             :title="l.dir_key + (l.error ? '\n' + l.error : '')">
+                            <div class="mono">{{ leafDay(l.dir_key) }}</div>
+                            <div class="sub">节点 <span :class="leafStateOk(l) ? 'msg-ok' : ''">{{ leafStateLabel(l) }}</span></div>
+                            <div class="sub">session {{ l.sessions }}</div>
+                            <div v-if="leafStateErr(l)" class="sub" style="color:var(--destructive);">异常</div>
+                        </div>
+                    </div>
+                    <div v-else class="text-muted small py-3 text-center">无节点数据</div>
+                    <div v-if="leafData[leafModal].warnings && leafData[leafModal].warnings.length"
+                         style="margin-top:10px;font-size:.76rem;color:var(--warning);">
+                        <div v-for="(w, i) in leafData[leafModal].warnings" :key="i">· {{ w }}</div>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- 详情弹窗：export_records 里表格未直接展示的字段 -->
+        <div v-if="detailModal" class="modal-backdrop-custom" @click.self="closeDetail">
+            <div class="modal-box" style="width:min(720px,94vw);">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <h5 class="mb-0">详情 #{{ detailModal }}</h5>
+                    <button class="btn btn-outline btn-sm" @click="closeDetail">关闭</button>
+                </div>
+                <div v-if="detailLoading[detailModal]" class="text-muted small py-3 text-center">加载中…</div>
+                <table v-else-if="detailData[detailModal]" class="detail-table" style="width:100%;">
+                    <tr v-for="row in detailRows(detailData[detailModal])" :key="row.k">
+                        <td class="dk">{{ row.k }}</td>
+                        <td class="dv" style="word-break:break-all;">{{ row.v }}</td>
+                    </tr>
+                </table>
+                <div v-else class="text-muted small py-3 text-center">无数据</div>
+            </div>
+        </div>
 
         <!-- 分页控件：每页 20 条 -->
         <div class="task-pager" v-if="filteredTotal > pageSize">
@@ -635,11 +659,9 @@ new Vue({
         mModelKw: '',
         mLogDirFilter: '',
 
-        leafExpanded: {},
         leafLoading: {},
         leafData: {},
 
-        detailExpanded: {},
         detailLoading: {},
         detailData: {},
 
@@ -663,6 +685,10 @@ new Vue({
         nameModal: false,
         nameTarget: null,
         nameInput: '',
+
+        // 节点分布 / 详情改用弹窗：只保留「当前打开的是哪条记录」
+        leafModal: null,      // 记录的 id，非空即打开
+        detailModal: null,    // 记录的 id，非空即打开
 
         pollTimer: null,
         pollRecordId: null,
@@ -948,7 +974,7 @@ new Vue({
                     self.tasks.forEach(function(t) { old[t.id] = t; });
                     flat.forEach(function(t) {
                         if (old[t.id]) {
-                            ['_importing', 'leafExpanded', 'leafLoading', 'leafData'].forEach(function(k2) {
+                            ['_importing', 'leafLoading', 'leafData'].forEach(function(k2) {
                                 if (old[t.id][k2] !== undefined) t[k2] = old[t.id][k2];
                             });
                         }
@@ -959,17 +985,13 @@ new Vue({
                 .catch(function() {});
         },
 
-        // ---- 节点分布（叶子详情样式） ----
-        toggleLeaves: function(t) {
-            var id = t.id;
-            if (this.leafExpanded[id]) {
-                this.$set(this.leafExpanded, id, false);
-                return;
-            }
-            this.$set(this.leafExpanded, id, true);
-            if (this.leafData[id]) return;  // 已加载（内存），直接展开
-            this._loadLeaves(id, false);
+        // ---- 节点分布（弹窗） ----
+        openLeaves: function(t) {
+            this.leafModal = t.id;
+            if (this.leafData[t.id]) return;   // 已加载，直接开
+            this._loadLeaves(t.id, false);
         },
+        closeLeaves: function() { this.leafModal = null; },
         // 强制刷新：忽略 DB 缓存，重新扫盘（传 refresh=1）
         reloadLeaves: function(t) {
             this._loadLeaves(t.id, true);
@@ -999,15 +1021,11 @@ new Vue({
             return seg || s;
         },
 
-        // ---- 详情（展开 export_records 其余字段） ----
-        toggleDetail: function(t) {
+        // ---- 详情（弹窗，展示 export_records 其余字段） ----
+        openDetail: function(t) {
             var id = t.id;
-            if (this.detailExpanded[id]) {
-                this.$set(this.detailExpanded, id, false);
-                return;
-            }
-            this.$set(this.detailExpanded, id, true);
-            if (this.detailData[id]) return;  // 已加载，直接展开
+            this.detailModal = id;
+            if (this.detailData[id]) return;   // 已加载，直接开
             this.$set(this.detailLoading, id, true);
             var self = this;
             fetch('/api/export/status/' + encodeURIComponent(id), {headers: this._h()})
@@ -1022,6 +1040,7 @@ new Vue({
                     self.$set(self.detailLoading, id, false);
                 });
         },
+        closeDetail: function() { this.detailModal = null; },
         detailRows: function(rec) {
             // 展示 export_records 里表格未直接呈现的字段（跳过已在列里/超大字段）
             var skip = { id: 1, progress_log: 1, analysis_json: 1, leaves_cache: 1 };
@@ -1407,6 +1426,64 @@ new Vue({
             }.bind(this)).catch(function(e) {
                 this.error = '请求失败: ' + e;
             }.bind(this));
+        },
+        // 复制：不直接排队，而是打开「新建任务」弹窗并预填原任务的参数，
+        // 让用户改完再选「保存草稿」或「保存并启动」——复制是一等公民
+        // （可换 mode / mtime / 并发），而不是一条不可编辑的重跑。
+        duplicateTask: function(r) {
+            this.openTaskModal();
+
+            var dirs = [];
+            try { dirs = JSON.parse(r.mtime_dirs || '[]'); } catch (e) { dirs = []; }
+
+            // 用记录本身构造 key 对象，不依赖 keys 列表是否已异步加载完；
+            // 已加载时换成真对象，能带出 mtime_distribution（勾选列表显示 session 数）。
+            var keyObj = {
+                key_slot: r.key_slot || 'all',
+                api_key: r.api_key || '',
+                key_name: r.key_name || '',
+                mtime_distribution: {},
+                total_sessions: r.total_sessions || 0,
+            };
+            if (this.keysLoaded) {
+                this.keys.forEach(function(k) {
+                    if (k.api_key === r.api_key) keyObj = k;
+                });
+            }
+            this.modalKey = keyObj;
+
+            // 目录列表 = 原任务的 mtime_dirs ∪ key 的全部目录（后者供加选），
+            // 但勾选状态严格按原任务还原，保证「复制」默认就是同一批目录。
+            var all = {};
+            dirs.forEach(function(d) { all[d] = 1; });
+            Object.keys(keyObj.mtime_distribution || {}).forEach(function(d) { all[d] = 1; });
+            this.modalMtimes = Object.keys(all).sort().reverse();
+            this.selectedMtimes = dirs;
+
+            // OBS 前缀：记录里存的是完整 obs_dst（<prefix>/<obs_sub>/<env>/<slot>/ex-<tag>/），
+            // 按 obs_sub 长度降序匹配切出前缀，逻辑与后端 retry 一致。
+            this.obsPrefix = this._obsPrefixFromDst(r.obs_dst);
+
+            this.exportMode = r.mode || this._defaultExportMode();
+            this.taskWorkers = r.workers || 0;
+            this.taskDirWorkers = r.dir_workers || 0;
+            this.taskName = r.manage_name ? (r.manage_name + '（副本）') : '';
+            this.forceExport = false;
+            this.nowTag = this._nowTag();
+        },
+        // 从完整 obs_dst 反推 obs 前缀（与后端 export_retry 的同名逻辑对应）
+        _obsPrefixFromDst: function(dst) {
+            if (!dst) return '';
+            var subs = (this.modes || [])
+                .map(function(m) { return m.obs_sub; })
+                .filter(function(s) { return !!s; })
+                .sort(function(a, b) { return b.length - a.length; });
+            for (var i = 0; i < subs.length; i++) {
+                var seg = '/' + subs[i] + '/';
+                var at = dst.indexOf(seg);
+                if (at >= 0) return dst.slice(0, at);
+            }
+            return dst.replace(/\/+$/, '').split('/').slice(0, -1).join('/');
         },
         retryUpload: function(r) {
             fetch('/api/export/upload_retry', {

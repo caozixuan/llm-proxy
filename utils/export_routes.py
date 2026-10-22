@@ -1540,6 +1540,69 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
 
         return JSONResponse({"record_id": new_record_id, "status": "queued", "mode": mode})
 
+    @app.post("/api/export/duplicate")
+    async def export_duplicate(request: Request):
+        """复制任务：按原记录的参数新建一条，立即排队执行。
+
+        与 retry 的区别：retry 只接受失败/已取消，且强制 force=False；复制接受
+        **任意状态**（含 success/running），用于「同样的条件再跑一遍」。新任务用新的
+        now_tag，因此落盘目录与 OBS 前缀都与原任务错开，不会覆盖原产物。
+        """
+        denied = _require_key_api(request)
+        if denied:
+            return denied
+        body = await request.json()
+        src_record_id = body.get("record_id")
+        if not src_record_id:
+            return JSONResponse({"detail": "record_id is required"}, status_code=400)
+
+        rec = get_record(src_record_id)
+        if not rec:
+            return JSONResponse({"detail": "Record not found"}, status_code=404)
+
+        mode = rec.get("mode") or _default_mode()
+        if get_export_modes().get(mode) is None:
+            return JSONResponse({"detail": f"未知导出模式 '{mode}'"}, status_code=400)
+
+        # obs_prefix 复原：与原任务保持一致（obs_dst 形如
+        # <prefix>/<obs_sub>/<env_key>/<slot>/ex-<tag>/）。按 obs_sub 长度降序匹配，
+        # 避免 session_analysis 抢在 session_analysis_full 前面把前缀切错。
+        obs_dst = rec.get("obs_dst", "") or ""
+        obs_prefix = ""
+        if obs_dst:
+            _subs = sorted({m.obs_sub for m in get_export_modes().all() if m.obs_sub},
+                           key=len, reverse=True)
+            for _sub in _subs:
+                _seg = f"/{_sub}/"
+                if _seg in obs_dst:
+                    obs_prefix = obs_dst.split(_seg)[0]
+                    break
+            else:
+                obs_prefix = obs_dst.rstrip("/").rsplit("/", 1)[0]
+
+        now_tag = _new_now_tag()
+        new_record_id = create_record(
+            api_key=rec.get("api_key", ""), key_slot=rec.get("key_slot", "all"),
+            mtime_dirs=rec.get("mtime_dirs", "[]"),
+            obs_dst="", local_copy_dir="",
+            mode=mode,
+            key_name=rec.get("key_name", ""),
+            workers=rec.get("workers") or 0,
+            dir_workers=rec.get("dir_workers") or 0,
+        )
+        if rec.get("manage_name"):
+            set_manage_name(new_record_id, f"{rec['manage_name']}（副本）")
+
+        persist_params(new_record_id, mode=mode, obs_prefix=obs_prefix, force=False,
+                       now_tag=now_tag, env_dir=str(env_dir), env_key_name=env_key_name,
+                       workers=rec.get("workers") or 0,
+                       dir_workers=rec.get("dir_workers") or 0)
+        _enqueue_task(new_record_id, lambda rid=new_record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode: _run_task(rid, ed, ek, op, nt, m))
+        logger.info("复制任务 record=%s -> %s (mode=%s)", src_record_id, new_record_id, mode)
+
+        return JSONResponse({"record_id": new_record_id, "status": "queued", "mode": mode,
+                             "source_record_id": src_record_id})
+
     @app.post("/api/export/upload_retry")
     async def export_upload_retry(request: Request):
         denied = _require_key_api(request)

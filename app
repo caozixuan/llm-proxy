@@ -302,7 +302,9 @@ def cmd_start(args: argparse.Namespace) -> int:
     print(f"[app] env -> {service_key}")
     print(f"[app] log -> {log_file}")
 
-    # 默认随 app 拉起导出 / 回填 worker（执行已剥离到独立进程）。--no-workers 可跳过。
+    # 拉起导出 / 回填 worker（执行已剥离到独立进程）。_worker_start 本身是幂等的：
+    # 已在跑的实例只做记录、不重启，所以平台重启时这里只是「补齐缺的」，
+    # 不会打断 worker 上正在跑的任务。
     if not getattr(args, "no_workers", False):
         _start_all_workers(args)
 
@@ -365,8 +367,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
         if pid_from_file:
             pid = pid_from_file
 
-    # 默认随 app 一并停掉导出 / 回填 worker。--no-workers 可跳过（仅停 app）。
-    if not getattr(args, "no_workers", False):
+    # 默认**不动**导出 / 回填 worker：它们是独立进程，拥有自己的 DB 连接与
+    # owner_worker + 心跳，平台重启期间 worker 继续跑（正在执行的任务由心跳续命，
+    # 别的 worker 启动时不会误判成孤儿）。--with-workers 可恢复「跟着一起停」的旧行为。
+    if getattr(args, "with_workers", False):
         _stop_all_workers(args)
 
     if not is_pid_running(pid):
@@ -1707,15 +1711,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stop = subparsers.add_parser("stop", help="Stop the running app")
     p_stop.add_argument("--env", dest="env_file", help="Env file to stop")
-    p_stop.add_argument("--no-workers", dest="no_workers", action="store_true",
-                        help="Do not stop export/backfill workers with the app")
+    p_stop.add_argument("--with-workers", dest="with_workers", action="store_true",
+                        help="同时停掉 export/backfill worker（默认不动：worker 是独立进程，可跨平台重启存活）")
     p_stop.set_defaults(func=cmd_stop)
 
     p_restart = subparsers.add_parser("restart", help="Restart the app")
     p_restart.add_argument("--env", dest="env_file", help="Env file to restart")
     p_restart.add_argument("--sync", action="store_true", help="Also start sync daemon after restart")
     p_restart.add_argument("--no-workers", dest="no_workers", action="store_true",
-                           help="Do not start/stop export/backfill workers with the app")
+                           help="重启后不补齐 export/backfill worker（默认会补齐缺失的实例）")
+    p_restart.add_argument("--with-workers", dest="with_workers", action="store_true",
+                           help="重启时连同 worker 一起停掉再拉起（默认不停，worker 跨重启存活）")
     p_restart.set_defaults(func=cmd_restart)
 
     p_logs = subparsers.add_parser("logs", help="Show log output")
