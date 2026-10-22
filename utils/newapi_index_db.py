@@ -741,6 +741,48 @@ def ensure_fresh(leaf_dir: str, workers: int = 8) -> Dict[str, Any]:
 
 # ── 状态 / 读 API（供视图）─────────────────────────────────────────────────
 
+# probe() 读取的 meta 键：变化即意味着叶子索引内容有更新。
+#   ingest_offset    已摄取到的 index.jsonl 字节偏移（新增数据必变）
+#   sessions_built_at sessions 表最近重建时间
+#   sessions_dirty   是否待重建
+_CHEAP_META_KEYS = ("ingest_offset", "sessions_built_at", "sessions_dirty")
+
+
+def probe(leaf_dir: str) -> Dict[str, Any]:
+    """轻量索引状态探测（每次 <0.1s）：只读 meta 三键 + sessions 是否非空。
+
+    与 status() 的区别：**不做全表 COUNT**。status() 里的
+    `SELECT COUNT(*) FROM requests` 在 20w 行的叶子上要 4–5s（走 NFS 更慢），
+    而归一导出只需要知道「有没有 session」和「内容有没有变」，两者都能用
+    meta 点查 + 一次 EXISTS 得到（实测 0.076s + 0.002s）。
+
+    返回 {exists, has_sessions, fingerprint, ingest_offset, sessions_built_at, sessions_dirty}。
+    fingerprint 为该叶子内容的变更判据，任一分量变化即视为需要重建索引。
+    """
+    if not _db_exists(leaf_dir):
+        return {"exists": False, "has_sessions": False, "fingerprint": None,
+                "ingest_offset": "", "sessions_built_at": "", "sessions_dirty": ""}
+    conn = _connect(leaf_dir)
+    try:
+        meta = {r[0]: r[1] for r in conn.execute(
+            "SELECT k, v FROM meta WHERE k IN (?, ?, ?)", _CHEAP_META_KEYS).fetchall()}
+        has_sessions = bool(conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM sessions)").fetchone()[0])
+    finally:
+        conn.close()
+    ingest = meta.get("ingest_offset", "")
+    built = meta.get("sessions_built_at", "")
+    dirty = meta.get("sessions_dirty", "")
+    return {
+        "exists": True,
+        "has_sessions": has_sessions,
+        "fingerprint": f"{ingest}|{built}|{dirty}",
+        "ingest_offset": ingest,
+        "sessions_built_at": built,
+        "sessions_dirty": dirty,
+    }
+
+
 def status(leaf_dir: str) -> Dict[str, Any]:
     """{built, ingested, pending, sessions, sessions_dirty}。built=有 sessions 且无待补。"""
     if not _db_exists(leaf_dir):
@@ -884,10 +926,15 @@ def get_known_keys(leaf_dir: str) -> List[str]:
         conn.close()
 
 
-def export_sessions(leaf_dir: str) -> List[Dict[str, Any]]:
+def export_sessions(leaf_dir: str, api_key: str = "") -> List[Dict[str, Any]]:
     """返回完整 session 列表（含 trace_list），行格式与 session_store.export_sessions 兼容，
-    供 export_sync.export_session_index 生成 session_index.jsonl。"""
-    sessions = list_sessions(leaf_dir)
+    供 export_sync.export_session_index 生成 session_index.jsonl。
+
+    api_key 非空时**下推**到 SQL：只取该 key 的 session 及其 traces，而不是先把整叶读进内存
+    再过滤。实测某叶 35,183 条 session 而目标 key 仅 15,552 条时：全量 26.9s，下推后
+    0.5s + traces 0.2s。导出基本都是按 key 的，这一项直接决定生成索引阶段的耗时。
+    """
+    sessions = list_sessions(leaf_dir, api_key=api_key)
     if not sessions:
         return []
     traces_by_key = get_traces_batch(leaf_dir, [s["session_key"] for s in sessions])

@@ -182,6 +182,9 @@ def _process_one_hermes(args: tuple) -> Optional[dict]:
     )
 
 
+from utils.eval.pool import describe as _describe_pool, make_task_executor
+
+
 def reconstruct_and_export(
     src_dir: str,
     out_dir: str,
@@ -191,6 +194,7 @@ def reconstruct_and_export(
     progress_cb: Optional[Callable[[str], None]] = None,
     log_dir: Optional[str] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    on_session_done: Optional[Callable[[], None]] = None,
 ) -> dict:
     """
     线程池并行: 对每个 session 的 trace_list 做 hermes 聚合重构。
@@ -246,9 +250,10 @@ def reconstruct_and_export(
                 "errors": errors, "results": results, "cancelled": False}
 
     _log(f"进入 hermes 重构: {n_tasks} sessions, workers={workers}...")
-    # 线程池并行（而非进程池）：纯 IO + 轻量聚合，理由同 reformat.py 注释
-    # （spawn 会重 import app.py 跑模块级启动、worker 挂死变孤儿堆积等历史顽疾）。
-    executor = ThreadPoolExecutor(max_workers=workers)
+    # 并行方式：进程池优先（GIL 决定线程池在这里只能吃一个核，见 utils/eval/pool.py），
+    # 线程池兜底 —— 低任务数 / 显式禁用 / 建池失败时都退回线程池，行为与改造前一致。
+    executor, _pool_kind = make_task_executor(workers, n_tasks, label="reconstruct")
+    _log(_describe_pool(_pool_kind))
     cancelled = False
     try:
         futures = [executor.submit(_process_one_hermes, t) for t in tasks]
@@ -268,6 +273,12 @@ def reconstruct_and_export(
                     errors.append("处理失败")
             except Exception as e:  # noqa: BLE001
                 errors.append(str(e))
+            finally:
+                if on_session_done is not None:
+                    try:
+                        on_session_done()
+                    except Exception:  # noqa: BLE001  进度回调失败不影响导出
+                        pass
     finally:
         # cancel_futures=True：丢弃线程池里尚未开始的任务（已在跑的自然收尾）。
         executor.shutdown(wait=True, cancel_futures=True)

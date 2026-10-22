@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from utils.eval.eval import analyze_best_data, fmt_quality
+from utils.eval.pool import describe as _describe_pool, make_task_executor
 from utils.message_common import parse_response
 
 logger = logging.getLogger(__name__)
@@ -365,6 +366,7 @@ def reformat_and_analyze(
     log_dir: Optional[str] = None,
     analyze: bool = True,
     should_cancel: Optional[Callable[[], bool]] = None,
+    on_session_done: Optional[Callable[[], None]] = None,
 ) -> dict:
     """
     线程池并行: 对每个 session 的 latest_file 做 reformat (+ 可选 analyze_best_data)。
@@ -441,15 +443,20 @@ def reformat_and_analyze(
     if n_tasks == 0:
         return {"total_sessions": total, "total_files": len(results), "errors": errors, "results": results, "cancelled": False}
 
-    # 线程池并行（而非进程池）：每个任务只做「读三元组 JSON → 合并落盘 →（可选）纯本地
-    # 质检」，是 IO 密集 + 轻量 CPU，线程足矣。用线程避免了进程池的两大历史顽疾：
+    # 并行方式：进程池优先，线程池兜底（低任务数 / 显式禁用 / 建池失败）。
+    #
+    # 原注释认为这里是「IO 密集 + 轻量 CPU，线程足矣」，实测不成立：合并落盘前后
+    # 要对每个文件做多次 json.loads / json.dumps，而纯 Python 的 JSON 编解码不释放
+    # GIL，线程池开再多线程也只吃一个核（详见 utils/eval/pool.py 的实测数据）。
+    # 改用 forkserver 进程池，既拿到多核，又避开 spawn 的两个历史顽疾：
     #   1) spawn 子进程会重新 import app.py，跑一遍模块级启动（init_db/leader 选举/
     #      load_index…），刷屏 "leader_lock: another worker is leader" 且浪费初始化；
-    #   2) worker 挂死变孤儿（PPID=1）堆积吃内存，需要 pid 快照 + SIGKILL 兜底回收。
-    # 线程共享本进程解释器，无以上问题，收尾直接 shutdown 即可，无需看门狗/强杀。
+    #   2) worker 挂死变孤儿（PPID=1）堆积吃内存 —— forkserver 的子进程随池关闭，
+    #      无需 pid 快照 + SIGKILL 看门狗。
     # 逐 session 进度不再打点（曾按 5% 一档，仍会在多 mtime 时刷屏日志抽屉）；
     # 每个 mtime 的起止由上层 export_routes 记录，本函数只在全部完成时汇总一条。
-    executor = ThreadPoolExecutor(max_workers=workers)
+    executor, _pool_kind = make_task_executor(workers, n_tasks, label="reformat")
+    _log(_describe_pool(_pool_kind))
     cancelled = False
     try:
         futures = [executor.submit(_process_one, t) for t in tasks]
@@ -470,6 +477,12 @@ def reformat_and_analyze(
                     errors.append("处理失败")
             except Exception as e:
                 errors.append(str(e))
+            finally:
+                if on_session_done is not None:
+                    try:
+                        on_session_done()
+                    except Exception:  # noqa: BLE001  进度回调失败不影响导出
+                        pass
             # 逐 session 不打点：进度/完成汇总统一由上层 export_routes 每 mtime 输出一条，
             # 避免这里再刷屏或与上层日志重复。
     finally:

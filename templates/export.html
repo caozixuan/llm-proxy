@@ -75,6 +75,11 @@
 .task-status-failed { background: color-mix(in srgb, var(--destructive) 15%, transparent); color: var(--destructive); }
 .task-status-cancelled { background: color-mix(in srgb, var(--warning) 15%, transparent); color: var(--warning); }
 .task-status-draft { background: color-mix(in srgb, var(--muted-foreground) 14%, transparent); color: var(--muted-foreground); }
+/* 任务进度条：只在 running 且有 progress_total 时出现 */
+.task-progress { margin-top: 4px; width: 150px; }
+.task-progress-bar { height: 4px; border-radius: 999px; background: color-mix(in srgb, var(--info) 15%, transparent); overflow: hidden; }
+.task-progress-bar > i { display: block; height: 100%; background: var(--info); border-radius: 999px; transition: width .4s ease; }
+.task-progress-text { font-size: .7rem; color: var(--muted-foreground); margin-top: 2px; white-space: nowrap; }
 
 /* node distribution (叶子详情 style) */
 .leaf-wrap { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -262,12 +267,23 @@
                     </td>
                     <td style="white-space:nowrap;">
                         <span :class="'task-status task-status-' + t.status">{{ statusText(t.status, t.mode) }}</span>
+                        <!-- 进度条：只对运行中的任务显示；数据来自 progress_done/total 两列 -->
+                        <div v-if="t.status === 'running' && t.progress_total > 0" class="task-progress">
+                            <div class="task-progress-bar"><i :style="{width: progressPct(t) + '%'}"></i></div>
+                            <div class="task-progress-text">
+                                <template v-if="t.progress_phase">{{ t.progress_phase }} · </template>{{ t.progress_done }} / {{ t.progress_total }}（{{ progressPct(t) }}%）
+                            </div>
+                        </div>
                     </td>
                     <td style="white-space:nowrap;">
                         <span>{{ t.created_at }}</span>
                         <div style="font-size:.72rem;color:var(--muted-foreground);margin-top:2px;">
-                            <template v-if="t.status === 'running' && t.started_at">开始 {{ t.started_at }}</template>
-                            <template v-else-if="t.status === 'success' && t.finished_at">完成 {{ t.finished_at }}</template>
+                            <template v-if="t.status === 'running' && t.started_at">
+                                开始 {{ t.started_at }}<template v-if="elapsedLabel(t)">（已用 {{ elapsedLabel(t) }}）</template>
+                            </template>
+                            <template v-else-if="t.status === 'success' && t.finished_at">
+                                完成 {{ t.finished_at }}<template v-if="elapsedLabel(t)">（耗时 {{ elapsedLabel(t) }}）</template>
+                            </template>
                         </div>
                     </td>
                     <td>
@@ -1054,6 +1070,43 @@ new Vue({
         modeLabel: function(mode) {
             var m = this._modeOf(mode);
             return m ? m.mode_label : mode;
+        },
+        // 进度条百分比：封顶 99，避免「差最后一条却显示 100%」的观感。
+        // 分母为 0（刚建任务、还没进处理器）时不显示，模板用 progress_total > 0 挡住。
+        progressPct: function(t) {
+            var total = Number(t && t.progress_total) || 0;
+            var done = Number(t && t.progress_done) || 0;
+            if (total <= 0) return 0;
+            return Math.min(99, Math.round(100 * done / total));
+        },
+        // 耗时文案：running 用「现在 - started_at」，success 用「finished_at - started_at」。
+        // 这两组时间戳都是本地时间 'YYYY-MM-DD HH:MM:SS'，手工解析避免 Safari 的
+        // new Date('2026-10-21 17:11:00') 解析失败。算不出就返回空串（模板不显示）。
+        elapsedLabel: function(t) {
+            if (!t || !t.started_at) return '';
+            var a = this._parseTs(t.started_at);
+            if (a === null) return '';
+            var endTs;
+            if (t.status === 'running') {
+                endTs = Date.now();
+            } else if (t.finished_at) {
+                endTs = this._parseTs(t.finished_at);
+            } else {
+                return '';
+            }
+            if (endTs === null) return '';
+            var sec = Math.max(0, Math.round((endTs - a) / 1000));
+            if (sec < 60) return sec + 's';
+            var m = Math.floor(sec / 60), s = sec % 60;
+            if (m < 60) return m + 'm' + (s ? s + 's' : '');
+            var h = Math.floor(m / 60);
+            return h + 'h' + (m % 60) + 'm';
+        },
+        _parseTs: function(str) {
+            if (!str) return null;
+            var m = String(str).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+            if (!m) return null;
+            return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]).getTime();
         },
         _modeOf: function(mode) {
             for (var i = 0; i < this.modes.length; i++) {

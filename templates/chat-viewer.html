@@ -1394,7 +1394,7 @@ function updateLoadStatus() {
     }
 }
 
-// 流式收集进行中的进度文案：叶子 x/y + 已收集 N 条；done 时切回 updateLoadStatus。
+// 流式收集进行中的进度文案：叶子 x/y + 已收集 N 条 + 已用时长；done 时切回 updateLoadStatus。
 function _updateStreamProgress(data) {
     const el = document.getElementById('loadStatus');
     if (!el) return;
@@ -1403,6 +1403,7 @@ function _updateStreamProgress(data) {
         const collected = (data.total !== undefined && data.total !== null) ? data.total : aggChains.length;
         let msg = `加载中… 已收集 ${collected} 条`;
         if (lt > 0) msg += `（目录 ${ld}/${lt}）`;
+        if (data.elapsed_s != null) msg += ` · 已用 ${data.elapsed_s.toFixed(1)}s`;
         el.textContent = msg;
     } else {
         updateLoadStatus();

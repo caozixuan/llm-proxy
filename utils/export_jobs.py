@@ -27,6 +27,30 @@ ENQUEUE_STATES = ("queued", "pending", "running")
 CLAIMABLE_STATES = ("queued",)
 TERMINAL_STATES = ("success", "failed", "cancelled")
 
+
+def make_now_tag() -> str:
+    """生成任务产物目录用的 now_tag（`ex-<tag>`）。
+
+    格式：`YYMMDDHHMMSS`(12) + 3 位毫秒 + 6 位随机十六进制，共 21 字符，例如
+    `261021211103713ddd3f6`。前 12 位与旧格式一致且可读（本地时间前缀），
+    后面 9 位提供秒内唯一性。
+
+    为什么必须加：旧实现是秒级 `%y%m%d%H%M%S`，同 key 同一秒内提交的两个任务会
+    落到同一个 `ex-<tag>` 目录 —— 本地互相覆盖、OBS 同前缀互相覆盖。
+
+    影响面（已 grep 全仓确认）：`ex-<tag>` 在各处只作为**不透明路径段**拼接 ——
+    `_run_task_inner` 拼 local_base / obs_dst，`export_upload_retry` 从
+    local_copy_dir 末尾三段原样取回，前端 export.html 仅做预览展示。没有任何地方
+    按长度切、按正则匹配或把 tag 解析回 datetime。因此加长安全。
+
+    放在 export_jobs（而非 export_routes）是为了让 tools/offline_reformat_export.py
+    也能复用，而不必 import 整个 web 路由模块。
+    """
+    import secrets
+    from datetime import datetime as _dt
+    d = _dt.now()
+    return d.strftime("%y%m%d%H%M%S") + f"{d.microsecond // 1000:03d}" + secrets.token_hex(3)
+
 # kind 区分 worker 该调哪个执行器：
 #   "export"        -> _run_task(...)         （导出 / eval / retry，走完整流程）
 #   "upload_retry"  -> _run_upload_only(...)  （仅重传已在本地的产物，参数取自记录）

@@ -1354,16 +1354,55 @@ def cmd_key(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 class WorkerSpec:
-    def __init__(self, name: str, module: str, state_key: str):
+    def __init__(self, name: str, module: str, state_key: str, instances_env: str = ""):
         self.name = name              # 展示用 & pid/log 文件名前缀，如 "export"
         self.module = module          # python -m 目标，如 "utils.export_worker"
         self.state_key = state_key    # .cli_state.yaml 里的服务表键，如 "export_services"
         self.pid_name = f"{name}_worker.pid"
         self.log_name = f"{name}_worker.log"
+        # 决定默认起几个实例的环境变量名（空 = 固定 1 个）。
+        # 并发靠多进程而非单进程多线程：导出链路前半段是纯 Python，不释放 GIL，
+        # 同进程内开多线程做 json.dumps 只有 0.98x 加速（实测）。
+        self.instances_env = instances_env
+
+
+def _worker_instance_pid_name(spec: WorkerSpec, idx: int) -> str:
+    """第 idx 个实例的 pid 文件名。idx=0 沿用原文件名，兼容既有部署。"""
+    if idx == 0:
+        return spec.pid_name
+    stem = spec.pid_name[:-len(".pid")]
+    return f"{stem}.{idx}.pid"
+
+
+def _worker_instance_log_name(spec: WorkerSpec, idx: int) -> str:
+    """第 idx 个实例的日志文件名。所有实例共用一个日志更容易排查，故不拆。"""
+    return spec.log_name
+
+
+def _worker_instance_count(spec: WorkerSpec, args: argparse.Namespace,
+                           env_values: dict | None = None) -> int:
+    """本次要确保多少个实例在跑。
+
+    优先级：--instances 显式指定 > env 配置（如 EXPORT_CONCURRENCY）> 1。
+
+    注意必须优先从 env_values 里取：app 进程自己并没有把 .env 加载进 os.environ，
+    只有 worker 子进程才通过 child_env 拿到这些值。只查 os.getenv 会永远读到空。
+    """
+    explicit = getattr(args, "instances", None)
+    if explicit is not None:
+        return max(1, int(explicit))
+    if not spec.instances_env:
+        return 1
+    raw = (env_values or {}).get(spec.instances_env) or os.getenv(spec.instances_env, "1")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
 
 
 _WORKER_SPECS = {
-    "export": WorkerSpec("export", "utils.export_worker", "export_services"),
+    "export": WorkerSpec("export", "utils.export_worker", "export_services",
+                         instances_env="EXPORT_CONCURRENCY"),
     "backfill": WorkerSpec("backfill", "src.backfill.worker", "backfill_services"),
 }
 
@@ -1383,14 +1422,10 @@ def _worker_start(spec: WorkerSpec, args: argparse.Namespace) -> int:
     state["source_env"] = get_selected_env(args, state)
     svc_dir, service_key, service_slug, env_path, env_values = _worker_svc_dir(state)
     svc_dir.mkdir(parents=True, exist_ok=True)
-    pid_file = svc_dir / spec.pid_name
     log_file = svc_dir / spec.log_name
 
-    pid = read_pid(pid_file)
-    if is_pid_running(pid):
-        print(f"[{spec.name}] already running: pid={pid} env={service_key}")
-        print(f"[{spec.name}] log -> {log_file}")
-        return 0
+    # 目标实例数：--instances > spec.instances_env（如 EXPORT_CONCURRENCY）> 1
+    want = _worker_instance_count(spec, args, env_values)
 
     # child_env 与 app 完全一致，保证 worker 的 get_service_log_dir() 落到同一 svc_dir，
     # 命中同一 DB / 同一槽位锁目录（跨进程互斥的前提）。
@@ -1399,32 +1434,56 @@ def _worker_start(spec: WorkerSpec, args: argparse.Namespace) -> int:
     child_env["ENV_FILE"] = str(env_path)
     child_env["LOG_TASK_TAG"] = service_slug
 
-    with log_file.open("ab") as log_fp:
-        proc = subprocess.Popen(
-            [sys.executable, "-m", spec.module],
-            cwd=str(BASE_DIR),
-            env=child_env,
-            stdout=log_fp,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-
-    pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
-    time.sleep(1)
-    if not is_pid_running(proc.pid):
-        eprint(f"[{spec.name}] failed to start, check log: {log_file}")
-        return 1
-
     svcs = state.setdefault(spec.state_key, {})
-    svcs[service_key] = {
-        "pid": proc.pid,
-        "pid_file": os.path.relpath(pid_file, BASE_DIR),
-        "log_file": os.path.relpath(log_file, BASE_DIR),
-        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
+    svc = svcs.setdefault(service_key, {})
+    instances = svc.setdefault("instances", {})
+
+    started, already = [], []
+    for idx in range(want):
+        pid_name = _worker_instance_pid_name(spec, idx)
+        pid_file = svc_dir / pid_name
+        pid = read_pid(pid_file)
+        if is_pid_running(pid):
+            already.append((idx, pid))
+            instances[str(idx)] = {"pid": pid, "pid_file": os.path.relpath(pid_file, BASE_DIR)}
+            continue
+
+        with log_file.open("ab") as log_fp:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", spec.module],
+                cwd=str(BASE_DIR),
+                env=child_env,
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        pid_file.write_text(f"{proc.pid}\n", encoding="utf-8")
+        time.sleep(1)
+        if not is_pid_running(proc.pid):
+            eprint(f"[{spec.name}#{idx}] failed to start, check log: {log_file}")
+            continue
+        instances[str(idx)] = {"pid": proc.pid, "pid_file": os.path.relpath(pid_file, BASE_DIR)}
+        started.append((idx, proc.pid))
+
+    # 实例数调小（例如 EXPORT_CONCURRENCY 3→1）时，多余实例留着占槽位，需手动 stop。
+    extra = [k for k in instances if int(k) >= want]
+    if extra:
+        print(f"[{spec.name}] 注意：仍有 {len(extra)} 个多余实例（索引 {', '.join(sorted(extra))}）"
+              f"不在本次目标数 {want} 内，如需停止请手动处理对应 pid 文件")
+
+    # 兼容旧字段：pid/pid_file 指向第 0 个实例
+    if "0" in instances:
+        svc["pid"] = instances["0"]["pid"]
+        svc["pid_file"] = instances["0"]["pid_file"]
+    svc["log_file"] = os.path.relpath(log_file, BASE_DIR)
+    svc["started_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_state(state)
-    print(f"[{spec.name}] started: pid={proc.pid} env={service_key}")
-    print(f"[{spec.name}] log -> {log_file}")
+
+    for idx, pid in started:
+        print(f"[{spec.name}#{idx}] started: pid={pid} env={service_key}")
+    for idx, pid in already:
+        print(f"[{spec.name}#{idx}] already running: pid={pid} env={service_key}")
+    print(f"[{spec.name}] {len(instances)} 个实例 pid 记录完毕，log -> {log_file}")
     return 0
 
 
@@ -1434,41 +1493,54 @@ def _worker_stop(spec: WorkerSpec, args: argparse.Namespace) -> int:
     env_path = resolve_env_path(state["source_env"])
     service_key = get_service_key(env_path)
     svc = (state.get(spec.state_key) or {}).get(service_key, {})
+    instances = svc.get("instances") or {}
 
-    pid_file_rel = svc.get("pid_file")
-    pid = svc.get("pid")
-    if pid_file_rel:
-        pid_from_file = read_pid(BASE_DIR / pid_file_rel)
-        if pid_from_file:
-            pid = pid_from_file
+    # 收集所有实例的 pid：有新格式的 instances，也兼容只有 pid/pid_file 的旧记录。
+    targets = {}
+    for idx, inst in instances.items():
+        pf = inst.get("pid_file")
+        pid = read_pid(BASE_DIR / pf) if pf else None
+        targets[idx] = (pid or inst.get("pid"), pf)
+    if not targets and (svc.get("pid_file") or svc.get("pid")):
+        pf = svc.get("pid_file")
+        pid = read_pid(BASE_DIR / pf) if pf else None
+        targets["0"] = (pid or svc.get("pid"), pf)
 
-    if not is_pid_running(pid):
+    alive = {k: v for k, v in targets.items() if is_pid_running(v[0])}
+    if not alive:
         print(f"[{spec.name}] not running: env={service_key}")
-        if pid_file_rel:
-            (BASE_DIR / pid_file_rel).unlink(missing_ok=True)
+        for _k, (_p, pf) in targets.items():
+            if pf:
+                (BASE_DIR / pf).unlink(missing_ok=True)
         if svc:
             svc["pid"] = None
+            svc["instances"] = {}
             save_state(state)
         return 0
 
-    print(f"[{spec.name}] stopping pid={pid} env={service_key} "
-          f"(waiting for current task to reach a checkpoint...)")
+    print(f"[{spec.name}] stopping {len(alive)} 个实例 ({', '.join('#' + k for k in sorted(alive))}) "
+          f"env={service_key} (waiting for current task to reach a checkpoint...)")
     # 按进程组发 SIGTERM：worker 在 _interruptible_sleep 分片醒来，正在跑的任务在
-    # 目录/叶子检查点自然收尾。等待 ≤120s 后强杀。
-    _signal_service(pid, signal.SIGTERM)
+    # 目录/叶子检查点自然收尾。先全部发信号，再统一等待，避免串行等待叠加。
+    for _k, (pid, _pf) in alive.items():
+        _signal_service(pid, signal.SIGTERM)
     for _ in range(240):
-        time.sleep(0.5)
-        if not is_pid_running(pid):
+        if not any(is_pid_running(pid) for pid, _pf in alive.values()):
             break
-    if is_pid_running(pid):
-        print(f"[{spec.name}] force kill pid={pid}")
-        _signal_service(pid, signal.SIGKILL)
-        time.sleep(0.2)
+        time.sleep(0.5)
+    for k, (pid, _pf) in alive.items():
+        if is_pid_running(pid):
+            print(f"[{spec.name}#{k}] force kill pid={pid}")
+            _signal_service(pid, signal.SIGKILL)
+    time.sleep(0.2)
 
-    if pid_file_rel:
-        (BASE_DIR / pid_file_rel).unlink(missing_ok=True)
+    for _k, (_p, pf) in targets.items():
+        if pf:
+            (BASE_DIR / pf).unlink(missing_ok=True)
     if svc:
         svc["pid"] = None
+        svc["pid_file"] = None
+        svc["instances"] = {}
         svc["stopped_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         save_state(state)
     print(f"[{spec.name}] stopped")
@@ -1509,6 +1581,23 @@ def _print_worker_services(spec: WorkerSpec, state: dict) -> int:
         print(f"[{spec.name}] no recorded {spec.name} workers")
         return 0
     for key, svc in svcs.items():
+        marker = "*" if key == state.get("source_env") else " "
+        instances = svc.get("instances") or {}
+        if instances:
+            running_n = 0
+            for idx in sorted(instances, key=int):
+                inst = instances[idx]
+                pf = inst.get("pid_file")
+                pid = (read_pid(BASE_DIR / pf) if pf else None) or inst.get("pid")
+                ok = is_pid_running(pid)
+                running_n += 1 if ok else 0
+                print(f"{marker} {key}#{idx}: {'running' if ok else 'stopped'} pid={pid or '-'}")
+            print(f"{marker} {key}: {running_n}/{len(instances)} 个实例在跑 "
+                  f"started={svc.get('started_at', '-')}")
+            if running_n == 0:
+                print(f"    (start with: ./app {spec.name} start)")
+            continue
+
         pid = svc.get("pid")
         pid_file_rel = svc.get("pid_file")
         if pid_file_rel:
@@ -1516,7 +1605,6 @@ def _print_worker_services(spec: WorkerSpec, state: dict) -> int:
             if pid_from_file:
                 pid = pid_from_file
         running = is_pid_running(pid)
-        marker = "*" if key == state.get("source_env") else " "
         print(f"{marker} {key}: {'running' if running else 'stopped'} "
               f"pid={pid or '-'} started={svc.get('started_at', '-')}")
         if not running:
@@ -1585,6 +1673,8 @@ def _add_worker_subparser(subparsers, name: str, dest: str, cmd_func) -> None:
 
     ps = sub.add_parser("start", help=f"Start {name} worker daemon")
     ps.add_argument("--env", dest="env_file", help="Env file to use")
+    ps.add_argument("--instances", type=int, default=None,
+                    help="要确保在跑的实例数（默认取环境变量，如 EXPORT_CONCURRENCY；否则 1）")
     ps.set_defaults(func=cmd_func)
 
     pt = sub.add_parser("stop", help=f"Stop {name} worker daemon")

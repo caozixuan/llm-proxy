@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from utils.eval.pool import describe as _describe_pool, make_task_executor
 from utils.eval.reformat import _load_merged, _resolve_triplet
 from utils.session_store import _fmt_ts
 
@@ -169,8 +170,11 @@ def full_reformat_export(
     errors: List[str] = []
     total_files = 0
 
-    # 线程池（IO 密集）：与 reformat 同款理由，避免进程池重跑模块级启动 / 孤儿堆积。
-    executor = ThreadPoolExecutor(max_workers=workers)
+    # 并行方式：进程池优先，线程池兜底（低任务数 / 显式禁用 / 建池失败）。
+    # 全量导出要把单个 mtime 下所有 trace 合并落盘，JSON 编解码不释放 GIL，
+    # 线程池只能吃一个核（实测见 utils/eval/pool.py）。
+    executor, _pool_kind = make_task_executor(workers, len(tasks), label="full_reformat")
+    _log(_describe_pool(_pool_kind))
     cancelled = False
     try:
         futures = [executor.submit(_process_session, t) for t in tasks]
@@ -190,6 +194,12 @@ def full_reformat_export(
                     errors.append("处理失败")
             except Exception as e:
                 errors.append(str(e))
+            finally:
+                if on_session_done is not None:
+                    try:
+                        on_session_done()
+                    except Exception:  # noqa: BLE001  进度回调失败不影响导出
+                        pass
     finally:
         # cancel_futures=True：丢弃线程池里尚未开始的任务（已在跑的自然收尾）。
         executor.shutdown(wait=True, cancel_futures=True)

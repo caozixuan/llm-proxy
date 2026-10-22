@@ -30,6 +30,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 
 # 允许 `python utils/export_worker.py` 直接运行（把项目根加入 import 路径）
@@ -99,14 +100,39 @@ def _init_env(svc_dir: str) -> None:
     # init_logdir_db(SERVICE_LOG_DIR)，svc_dir 与之同源。
     logdir_store.init_db(svc_dir)
     export_routes.init_export_lock_dir(svc_dir)
-    # 重启即清空上一轮遗留 running/queued/pending（draft 保留）。原为 app 启动时执行，
-    # 剥离后归 worker：app 重启不再误杀 worker 正在跑的任务。
+    # 登记本 worker 的归属标识（hostname:pid:rand）。claim 时写进 owner_worker，
+    # 心跳刷新 owner_heartbeat —— 启动清理据此只清理「所属 worker 已死」的遗留，
+    # 不再误杀其他存活 worker 正在跑的任务（见 export_store.cancel_interrupted）。
+    wid = export_store.set_worker_id()
+    logger.info("worker_id=%s", wid)
+    # 重启即清理上一轮遗留的孤儿任务（只清 owner 已死的 running/pending；
+    # queued 保留）。原为 app 启动时执行，剥离后归 worker：app 重启不再误杀
+    # worker 正在跑的任务；多 worker 并存时彼此不误杀。
     try:
         n = export_store.cancel_interrupted()
         if n:
-            logger.info("启动清理：取消 %d 条遗留导出记录（队列重置）", n)
+            logger.info("启动清理：取消 %d 条遗留导出记录（所属 worker 已退出）", n)
     except Exception:
         logger.exception("启动清理 cancel_interrupted 失败")
+
+
+def _start_heartbeat(interval: float = 30.0) -> threading.Thread:
+    """后台心跳：每 interval 秒把本 worker 名下在途记录的心跳续上。
+
+    长任务（大叶导出可跑几十分钟）期间必须有新鲜心跳，否则别的 worker 启动时
+    会把这条 running 记录判成「owner 已死」的遗留而取消。守护线程随主进程退出。
+    """
+    def _loop():
+        while not _shutdown_requested:
+            try:
+                export_store.heartbeat_owner()
+            except Exception:
+                logger.debug("心跳失败（忽略）", exc_info=True)
+            time.sleep(interval)
+
+    t = threading.Thread(target=_loop, daemon=True, name="export-heartbeat")
+    t.start()
+    return t
 
 
 def _run_one(rec: dict) -> None:
@@ -130,16 +156,16 @@ def _run_one(rec: dict) -> None:
     export_routes._run_task_from_record(record_id, params)
 
 
-def _drain(once: bool) -> None:
-    """主循环：抢槽 → 领取 queued 记录 → 执行 → 释放槽。空闲时分片轮询。
+def _drain_once_slot(once: bool, slot_name: str) -> None:
+    """单个执行位的主循环：抢槽 → 领取 queued 记录 → 执行 → 释放槽。
 
-    槽位文件锁保证全局并发 ≤ EXPORT_CONCURRENCY（默认 1，全局串行）。先抢槽再领取，
-    使多 worker / 多槽场景下每个执行位都对应一个真实的空槽。
+    槽位文件锁保证全局并发 ≤ EXPORT_CONCURRENCY。先抢槽再领取，使每个执行位都对应
+    一个真实的空槽；抢不到说明全局已满，等别的执行位（本进程或其他 worker 进程）跑完。
     """
     while not _shutdown_requested:
         lock_fp = export_routes._acquire_slot()
         if lock_fp is None:
-            # 槽满（其他 worker/槽在跑）→ 稍后再试
+            # 槽满（其他执行位/worker 在跑）→ 稍后再试
             _interruptible_sleep(1.0)
             continue
         try:
@@ -152,7 +178,8 @@ def _drain(once: bool) -> None:
                     return
                 _interruptible_sleep(1.0)
                 continue
-            logger.info("领取导出任务 record=%s mode=%s", rec["id"], rec.get("mode"))
+            logger.info("领取导出任务 record=%s mode=%s slot=%s",
+                        rec["id"], rec.get("mode"), slot_name)
             try:
                 _run_one(rec)
             except Exception:
@@ -164,6 +191,17 @@ def _drain(once: bool) -> None:
                     logger.exception("回写 failed 也失败 record=%s", rec.get("id"))
         finally:
             export_routes._release_slot(lock_fp)
+
+
+def _drain(once: bool) -> None:
+    """本进程执行位的主循环。
+
+    并发靠多进程实现（见 _executor_parallelism）：本进程只跑一个执行位，起 N 个
+    worker 进程就是 N 并发。每个执行位开工前都要先占到全局槽位
+    （export_queue.slot{i}.lock），所以即使进程数配得比 EXPORT_CONCURRENCY 多，
+    真正同时执行的也不会超过槽位数。
+    """
+    _drain_once_slot(once, f"pid{os.getpid()}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -182,6 +220,7 @@ def main() -> int:
     svc_dir = get_service_log_dir()
     logger.info("export_worker 启动 SERVICE_LOG_DIR=%s once=%s", svc_dir, args.once)
     _init_env(svc_dir)
+    _start_heartbeat()
 
     try:
         _drain(once=args.once)

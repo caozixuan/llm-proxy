@@ -382,7 +382,8 @@ def _run_one_export(*, api_key, mtime_dirs, env_dir_p, env_key_name,
     """
     _api_key = "" if api_key == "(empty)" else api_key
     slot = _key_slot(_api_key)
-    now_tag = datetime.now().strftime("%y%m%d%H%M%S")
+    from utils.export_jobs import make_now_tag
+    now_tag = make_now_tag()
 
     # 建记录（与 Web 的 /api/export/run 一致：reformat / reconstruct）
     record_id = create_record(

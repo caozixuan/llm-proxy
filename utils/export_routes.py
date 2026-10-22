@@ -10,6 +10,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ from fastapi.templating import Jinja2Templates
 from utils.export_modes import get_config as get_export_modes
 from utils.export_store import (
     append_log,
+    update_progress,
     cancel_interrupted,
     create_record,
     delete_record,
@@ -46,6 +48,7 @@ from utils.stats_index import (
     get_last_refresh_ts, start_stats_warmer,
 )
 from utils.logs_config import get_stats_roots
+from utils.timing import StageTimer
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,15 @@ _cancelled_ids: set = set()
 # 全局并发上限：同一时刻最多几个导出任务在真正执行（跨 worker）。
 # 用 EXPORT_CONCURRENCY 配置，默认 1（同一时刻只跑一个导出/质检，其余自动排队）。
 _EXPORT_CONCURRENCY = max(1, int(os.getenv("EXPORT_CONCURRENCY", "1")))
+
+# 单任务内的默认并发：workers = 每个 mtime 目录的并行度，dir_workers = 同时处理几个目录。
+#
+# 两者相乘就是「同时在跑的评估单元数」。评估器改成进程池后（见 utils/eval/pool.py），
+# 这个乘积直接等于同时存在的子进程数 —— 8×20=160 个进程 × 约 40–60MB RSS，且全部在
+# 同一 NFS 上争用，得不偿失。实测 32 个并行单元已能打满单机吞吐，故默认收到 4×8。
+# 两者都可由任务记录里的 workers / dir_workers 覆盖。
+_DEFAULT_WORKERS = max(1, int(os.getenv("EXPORT_WORKERS", "8")))
+_DEFAULT_DIR_WORKERS = max(1, int(os.getenv("EXPORT_DIR_WORKERS", "4")))
 
 # N 个槽位锁文件，任务执行前非阻塞抢占任一空槽，抢到才执行 → 全局并发严格 ≤ N。
 #
@@ -402,6 +414,104 @@ def _resolve_mt_for(env_dir, mt: str) -> Optional[str]:
     return str(cand) if cand.is_dir() else None
 
 
+class _ProgressReporter:
+    """把「已完成 / 总数」节流写进 export_records，供前端画进度条。
+
+    为什么要节流：处理器每完成一个 session 都会回调一次，一个任务动辄几万次。
+    每次都 UPDATE 会在 SQLite 上打出成吨无意义的写；这里限制到最多每 interval 秒
+    一次，且进度百分比没有变化时直接跳过（大任务初期的抖动也被吞掉）。
+
+    多目录并行时各线程共用同一个 reporter：进度按「全局累计」合并上报，
+    而不是各目录各报各的（否则进度条会来回跳）。
+    """
+
+    def __init__(self, record_id: int, total: int = 0, phase: str = "",
+                 interval: float = 1.0):
+        self.record_id = record_id
+        self.total = int(total or 0)
+        self.phase = phase
+        self.interval = float(interval)
+        self._done = 0
+        self._last_ts = 0.0
+        self._last_pct = -1
+        self._lock = threading.Lock()
+
+    def set_phase(self, phase: str, total: Optional[int] = None) -> None:
+        """切换阶段（如 索引 → 重构 → 上传），并按需重置分母。"""
+        with self._lock:
+            self.phase = phase
+            if total is not None:
+                self.total = int(total or 0)
+            self._done = 0
+            self._last_pct = -1
+        self._flush(force=True)
+
+    def set_progress(self, done: int, total: int, phase: str = "") -> None:
+        """直接设定绝对值（多目录并行时由调用方持有全局计数）。
+
+        与 advance() 的区别：advance 是本 reporter 内部累加，适合单目录；
+        多目录并行时每个目录各推进一格，全局计数由调用方维护，这里只负责落库。
+        """
+        with self._lock:
+            self._done = int(done)
+            self.total = int(total)
+            if phase:
+                self.phase = phase
+            now = time.monotonic()
+            if now - self._last_ts < self.interval:
+                return
+            pct = self._pct_locked()
+            if pct == self._last_pct:
+                return
+            self._last_ts = now
+            self._last_pct = pct
+            done_v, total_v, phase_v = self._done, self.total, self.phase
+        try:
+            update_progress(self.record_id, phase=phase_v, done=done_v, total=total_v)
+        except Exception:  # noqa: BLE001
+            logger.debug("update_progress 失败（忽略）", exc_info=True)
+
+    def advance(self, n: int = 1) -> None:
+        """完成 n 个单元。超过 interval 才真正落库。"""
+        with self._lock:
+            self._done += n
+            now = time.monotonic()
+            if now - self._last_ts < self.interval:
+                return
+            pct = self._pct_locked()
+            if pct == self._last_pct:
+                return
+            self._last_ts = now
+            self._last_pct = pct
+            done, total, phase = self._done, self.total, self.phase
+        try:
+            update_progress(self.record_id, phase=phase, done=done, total=total)
+        except Exception:  # noqa: BLE001  进度条失败绝不能影响导出本身
+            logger.debug("update_progress 失败（忽略）", exc_info=True)
+
+    def _pct_locked(self) -> int:
+        if self.total <= 0:
+            return -1
+        return min(99, int(100 * self._done / self.total))
+
+    def _flush(self, force: bool = False) -> None:
+        with self._lock:
+            done, total, phase = self._done, self.total, self.phase
+            self._last_ts = time.monotonic()
+            self._last_pct = self._pct_locked()
+        try:
+            update_progress(self.record_id, phase=phase, done=done, total=total)
+        except Exception:  # noqa: BLE001
+            logger.debug("update_progress 失败（忽略）", exc_info=True)
+
+    def finish(self) -> None:
+        """任务收尾：把进度补到满，避免留下 97% 这种尾巴。"""
+        with self._lock:
+            if self.total > 0:
+                self._done = self.total
+        self._flush(force=True)
+
+
 def _log_dir_key_for(env_dir, mt_src: str) -> str:
     """把叶子目录绝对路径解析为相对 root 的 dir_key（如 "260728/26072813"）。"""
     from utils.log_scan import dir_key_for
@@ -438,6 +548,17 @@ def _run_upload_only(record_id, local_copy_dir, obs_dst):
     except Exception as e:
         logger.exception("_run_upload_only crashed (record=%s)", record_id)
         update_status(record_id, "failed", error_message=str(e))
+
+
+def _new_now_tag() -> str:
+    """生成产物目录/OBS 前缀用的时间戳，精确到毫秒。
+
+    原先是 %y%m%d%H%M%S（秒级）。同一秒内向同一 key 发起两个任务时，两者会算出
+    同一个 ex-<tag>，落到同一个 local_base 与同一个 OBS 前缀上互相覆盖 —— 单 worker
+    串行时几乎撞不到，但多 worker 并发（EXPORT_CONCURRENCY>1）或批量提交时会撞。
+    保留原有可读格式，追加 3 位毫秒，长度从 12 位变 15 位。
+    """
+    return datetime.now().strftime("%y%m%d%H%M%S%f")[:-3]
 
 
 def _default_mode() -> str:
@@ -548,11 +669,21 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
     sync_cfg = _load_sync_config()
     # workers：优先用任务记录里显式配置的并发数（新建任务时可选）；
     # 记录未设（0/缺失，含旧任务）时回退全局 sync 配置默认。
+    #
+    # 配置键读 export_workers（settings/obs_base.yaml 里语义分离后的新键），
+    # 老键 workers 仅作兼容回退 —— 它以前同时被当成评估并行度/复制线程数/上传默认。
     _rec_workers = rec.get("workers") or 0
-    workers = _rec_workers if _rec_workers > 0 else sync_cfg.get("workers", 8)
-    # dir_workers：多个 mtime 目录并行处理的并发数（每目录内部仍各用 workers 线程）。
-    # 0/缺失（含旧任务）= 默认 8；总线程 ≈ dir_workers × workers。
-    dir_workers = int(rec.get("dir_workers") or 0) or 8
+    workers = (_rec_workers if _rec_workers > 0
+               else sync_cfg.get("export_workers") or sync_cfg.get("workers") or _DEFAULT_WORKERS)
+    # dir_workers：多个 mtime 目录并行处理的并发数（每目录内部仍各用 workers 并行单元）。
+    # 0/缺失（含旧任务）= 默认值。
+    #
+    # 总并行单元 ≈ dir_workers × workers。评估器改成进程池后，这个乘积直接等于同时存在的
+    # 子进程数：旧的 8×20 = 160 个进程、每个约 40–60MB RSS，且全在同一 NFS 上争用。
+    # 实测 32 个并行单元已能打满单机吞吐，再高只是放大内存与 IO 争用，故默认 4×8 = 32。
+    dir_workers = (int(rec.get("dir_workers") or 0)
+                   or int(sync_cfg.get("export_dir_workers") or 0)
+                   or _DEFAULT_DIR_WORKERS)
     upload_script = sync_cfg.get("upload_script") or None
 
     mtime_dirs = json.loads(rec.get("mtime_dirs", "[]"))
@@ -589,6 +720,18 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
     all_results = []
     all_entries = []
 
+    # 分段耗时（墙钟）：多目录并行时各段按线程累加，因此分项之和可能大于总耗时。
+    # 结果只写 progress_log，不落新 DB 列（避免 worker/app 版本错配）。
+    _tm = StageTimer()
+
+    # 进度条：多目录并行时各目录各推进会话计数，故全局计数放在共享容器里，
+    # 由 _progress_lock 保护；分母随每个目录进入处理器时累加（事先不知道总数）。
+    _progress_reporter = _ProgressReporter(record_id)
+    _progress_lock = threading.Lock()
+    _progress_done = [0]
+    _progress_total = [0]
+    _progress_phase = [""]
+
     def _process_mtime(mt):
         """处理单个 mtime 目录，返回一份独立结果 dict（供外层串行合并，避免并发写共享量）。
         每目录各自读/写自己的 session_index.jsonl 与 .sync_state，互不干扰。"""
@@ -606,7 +749,8 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
             # doc/REAMDE_traj.md §3.2），在生成 session_index 前就跳过，省一次构建。
             try:
                 from utils.log_scan import detect_format as _df
-                _fmt = _df(mt_src)
+                with _tm.stage("格式检测"):
+                    _fmt = _df(mt_src)
                 if not _mcfg.supports_format(_fmt):
                     _log(f"[{mt}] 目录格式 {_fmt}，{_mcfg.mode_label}仅支持 {'/'.join(_mcfg.formats)} 合并文件，跳过")
                     res["warnings"].append(f"{mt}: 非 {'/'.join(_mcfg.formats)} 格式（{_fmt}），已跳过")
@@ -614,7 +758,9 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                     return res
                 if _fmt == "newapi":
                     import utils.newapi_index_db as _nidb
-                    if _nidb.needs_build(mt_src):
+                    with _tm.stage("格式检测"):
+                        _needs = _nidb.needs_build(mt_src)
+                    if _needs:
                         _log(f"[{mt}] 索引未构建/不完整，跳过；请先在数据管理界面手动构建索引后再导出")
                         res["warnings"].append(f"{mt}: 索引未构建/不完整，已跳过（请先在数据管理界面手动构建索引）")
                         res["skip"] = True
@@ -628,7 +774,11 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                 res["skip"] = True
                 return res
             _log(f"[{mt}] 生成 session_index...")
-            exp_result = export_session_index(mt_src, force=force)
+            with _tm.stage("生成 session_index"):
+                # 带 api_key：只下推查询该 key 的 session，且不写叶子共享的
+                # session_index.jsonl（详见 export_session_index 的说明）。
+                exp_result = export_session_index(mt_src, force=force, with_sessions=True,
+                                                  api_key=api_key)
             _log(f"[{mt}] session_index: {exp_result.get('total_sessions', 0)} sessions"
                  + (" (已是最新，跳过)" if exp_result.get("skipped") else ""))
 
@@ -636,21 +786,29 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                 _log(f"[{mt}] 开始复制文件" + (f" (按 key 过滤: ...{api_key[-8:]})" if api_key else " (全量)"))
                 # 只复制到共享 local_base，不在此上传；收尾统一上传一次（见下方 finalize）。
                 # 避免多目录并行时每目录都整目录上传 → 重复上传 + 写入中上传的竞态。
-                sync_result = sync_session_index(
-                    mt_src, obs_dst=obs_dst, key=api_key or None,
-                    local_copy_dir=str(local_base), force=force, workers=workers,
-                    upload=False,
-                )
+                with _tm.stage("复制文件"):
+                    sync_result = sync_session_index(
+                        mt_src, obs_dst=obs_dst, key=api_key or None,
+                        local_copy_dir=str(local_base), force=force, workers=workers,
+                        upload=False,
+                        # 刚生成的索引已在内存里，直接传下去，省掉对同一文件的再次解析。
+                        sessions=exp_result.get("sessions"),
+                    )
                 matched = sync_result.get("matched_sessions", 0)
                 res["new_sessions"] = sync_result.get("new_sessions", 0)
                 res["uploaded"] = sync_result.get("uploaded", 0)
                 res["skipped"] = sync_result.get("skipped", 0)
                 _log(f"[{mt}] 匹配 {matched} sessions, 新导出 {res['new_sessions']}, 跳过 {res['skipped']}, 复制文件 {res['uploaded']}")
             else:
-                session_entries = _load_session_index(mt_src)
-                total_before = len(session_entries)
-                if api_key:
-                    session_entries = [s for s in session_entries if s.get("api_key") == api_key]
+                # 索引刚重建时 exp_result 已带着这批 session，直接复用；
+                # 只有「跳过重建」时才需要从 session_index.jsonl 里再解析一次。
+                with _tm.stage("读取 session_index"):
+                    session_entries = exp_result.get("sessions")
+                    if session_entries is None:
+                        session_entries = _load_session_index(mt_src)
+                    total_before = len(session_entries)
+                    if api_key:
+                        session_entries = [s for s in session_entries if s.get("api_key") == api_key]
                 if not session_entries:
                     _log(f"[{mt}] 共 {total_before} sessions, 按 key 过滤后 0, 跳过")
                     res["skip"] = True
@@ -659,25 +817,47 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                     _log(f"[{mt}] 共 {total_before} sessions, 按 key 过滤后 {len(session_entries)}")
                 # analyze 三态：None = 处理器签名里没有这个形参（reconstruct /
                 # full_reformat / jiuwen_reformat），调用时不传。有值则传入。
-                if _mcfg.analyze is None:
-                    _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
-                    ra_result = processor(
-                        src_dir=mt_src, out_dir=str(local_base),
-                        session_entries=session_entries, api_key=api_key, workers=workers,
-                        progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
-                        log_dir=_log_dir_key_for(_env_dir, mt_src),
-                        should_cancel=_should_cancel,
-                    )
-                else:
-                    _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
-                    ra_result = processor(
-                        src_dir=mt_src, out_dir=str(local_base),
-                        session_entries=session_entries, api_key=api_key, workers=workers,
-                        progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
-                        log_dir=_log_dir_key_for(_env_dir, mt_src),
-                        analyze=_mcfg.analyze,
-                        should_cancel=_should_cancel,
-                    )
+                #
+                # 进度上报：本目录的 session 数只占全局的一部分，报表按「全局已完成 /
+                # 全局总数」算，所以先把本目录的分母加进 _progress_total，再让回调
+                # 每完成一个 session 推进一格。
+                _n_dir = len(session_entries)
+                with _progress_lock:
+                    _progress_total[0] += _n_dir
+                    _progress_phase[0] = _mcfg.step or "重构合并"
+                    _progress_reporter.set_progress(_progress_done[0], _progress_total[0],
+                                                    _progress_phase[0])
+                def _on_done(_mt=mt):
+                    # 只维护全局计数，统一由 set_progress 落库：
+                    # 不再同时调 advance()，否则 reporter 内部还有一份自增计数，
+                    # 与全局计数各算各的，多目录交错时会互相覆盖、进度条来回跳。
+                    with _progress_lock:
+                        _progress_done[0] += 1
+                        done, total = _progress_done[0], _progress_total[0]
+                    _progress_reporter.set_progress(done, total)
+
+                with _tm.stage(_mcfg.step or "重构合并"):
+                    if _mcfg.analyze is None:
+                        _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
+                        ra_result = processor(
+                            src_dir=mt_src, out_dir=str(local_base),
+                            session_entries=session_entries, api_key=api_key, workers=workers,
+                            progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
+                            log_dir=_log_dir_key_for(_env_dir, mt_src),
+                            should_cancel=_should_cancel,
+                            on_session_done=_on_done,
+                        )
+                    else:
+                        _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
+                        ra_result = processor(
+                            src_dir=mt_src, out_dir=str(local_base),
+                            session_entries=session_entries, api_key=api_key, workers=workers,
+                            progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
+                            log_dir=_log_dir_key_for(_env_dir, mt_src),
+                            analyze=_mcfg.analyze,
+                            should_cancel=_should_cancel,
+                            on_session_done=_on_done,
+                        )
                 res["results"] = ra_result["results"]
                 res["entries"] = session_entries
                 _n_err = len(ra_result.get('errors', []))
@@ -697,23 +877,25 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
         return
 
     if dir_workers <= 1 or len(mtime_dirs) <= 1:
-        mt_results = [_process_mtime(mt) for mt in mtime_dirs]
+        with _tm.stage("逐目录处理"):
+            mt_results = [_process_mtime(mt) for mt in mtime_dirs]
     else:
         n_par = min(dir_workers, len(mtime_dirs))
         _log(f"多目录并行处理：{len(mtime_dirs)} 个目录，目录并发 {n_par}，每目录 workers={workers}")
         from concurrent.futures import ThreadPoolExecutor as _TPE
         mt_results = [None] * len(mtime_dirs)
-        with _TPE(max_workers=n_par) as _ex:
-            _fut = {_ex.submit(_process_mtime, mt): i for i, mt in enumerate(mtime_dirs)}
-            for f in _fut:
-                idx = _fut[f]
-                try:
-                    mt_results[idx] = f.result()
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("mtime worker crashed: %s", mtime_dirs[idx])
-                    mt_results[idx] = {"mt": mtime_dirs[idx], "errors": [f"{mtime_dirs[idx]}: {e}"],
-                                       "warnings": [], "skip": False, "new_sessions": 0,
-                                       "uploaded": 0, "skipped": 0, "results": [], "entries": []}
+        with _tm.stage("逐目录处理"):
+            with _TPE(max_workers=n_par) as _ex:
+                _fut = {_ex.submit(_process_mtime, mt): i for i, mt in enumerate(mtime_dirs)}
+                for f in _fut:
+                    idx = _fut[f]
+                    try:
+                        mt_results[idx] = f.result()
+                    except Exception as e:  # noqa: BLE001
+                        logger.exception("mtime worker crashed: %s", mtime_dirs[idx])
+                        mt_results[idx] = {"mt": mtime_dirs[idx], "errors": [f"{mtime_dirs[idx]}: {e}"],
+                                           "warnings": [], "skip": False, "new_sessions": 0,
+                                           "uploaded": 0, "skipped": 0, "results": [], "entries": []}
 
     # 串行合并各目录结果（保持 mtime_dirs 原顺序，结果稳定）
     for res in mt_results:
@@ -748,7 +930,8 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
             if obs_dst:
                 _log(f"复制完成，开始统一上传到 OBS: {obs_dst}")
                 obs_parent = obs_dst.rstrip("/").rsplit("/", 1)[0] + "/"
-                ok, msg = _run_upload_cmd(str(local_base), obs_parent, upload_script, log_cb=_log)
+                with _tm.stage("上传 OBS"):
+                    ok, msg = _run_upload_cmd(str(local_base), obs_parent, upload_script, log_cb=_log)
                 if ok:
                     _log("上传成功")
                 else:
@@ -764,13 +947,15 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
         # reformat / reconstruct / full_reformat / jiuwen_reformat 都走这条分支。
         if all_results:
             idx_path = local_base / "session_index.jsonl"
-            with open(idx_path, "w", encoding="utf-8") as f:
-                for entry in all_entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            with _tm.stage("写 session_index.jsonl"):
+                with open(idx_path, "w", encoding="utf-8") as f:
+                    for entry in all_entries:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             if obs_dst:
                 _log(f"同步到 OBS: {obs_dst}")
                 obs_parent = obs_dst.rstrip("/").rsplit("/", 1)[0] + "/"
-                ok, msg = _run_upload_cmd(str(local_base), obs_parent, upload_script, log_cb=_log)
+                with _tm.stage("上传 OBS"):
+                    ok, msg = _run_upload_cmd(str(local_base), obs_parent, upload_script, log_cb=_log)
                 if ok:
                     _log("上传成功")
                     # 整目录上传成功：记入本次合并的 session 数（否则 files_uploaded 恒为 0）
@@ -785,15 +970,17 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
     elif _mcfg.pipeline == "eval":
         if all_results:
             idx_path = local_base / "session_index.jsonl"
-            with open(idx_path, "w", encoding="utf-8") as f:
-                for entry in all_entries:
-                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            with _tm.stage("写 session_index.jsonl"):
+                with open(idx_path, "w", encoding="utf-8") as f:
+                    for entry in all_entries:
+                        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             _log(f"开始 evaluate_sessions: {len(all_results)} sessions...")
-            eval_result = evaluate_sessions(
-                sessions=all_results, report_dir=str(local_base), progress_cb=_log,
-                key_name=f"{_env_key_name}/{slot}",
-                obs_path=obs_dst,
-            )
+            with _tm.stage("质检 evaluate"):
+                eval_result = evaluate_sessions(
+                    sessions=all_results, report_dir=str(local_base), progress_cb=_log,
+                    key_name=f"{_env_key_name}/{slot}",
+                    obs_path=obs_dst,
+                )
             _log(f"evaluate_sessions 完成: total_sessions={eval_result.get('total_sessions', 0)}")
             eval_report_path = eval_result.get("report_path", "")
             analysis_json_path = eval_result.get("analysis_json_path", "")
@@ -819,7 +1006,8 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
         if obs_dst:
             _log(f"同步到 OBS: {obs_dst}")
             obs_parent = obs_dst.rstrip("/").rsplit("/", 1)[0] + "/"
-            ok, msg = _run_upload_cmd(str(local_base), obs_parent, upload_script, log_cb=_log)
+            with _tm.stage("上传 OBS"):
+                ok, msg = _run_upload_cmd(str(local_base), obs_parent, upload_script, log_cb=_log)
             if ok:
                 _log("上传成功")
                 # 整目录上传成功：记入本次质检的 session 数（否则 files_uploaded 恒为 0）
@@ -831,6 +1019,12 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
             _log("仅本地复制，未上传 OBS（提交时 OBS 前缀为空）；如需上传可对本记录「重试上传」")
 
     _done_label = _mcfg.mode_label
+
+    # 分段耗时汇总：回答「总耗时里有多少是真正的复制/上传」。并行下载目录时各段是
+    # 各线程墙钟累加，分项之和可能大于总耗时，故注明并发度避免误读。
+    _tm_note = (f"dir_workers={dir_workers} 并行，分项为各线程累加"
+                if dir_workers > 1 and len(mtime_dirs) > 1 else "")
+    _log(_tm.summary_line(f"耗时 {mode}", note=_tm_note))
 
     # 判定失败只看「真错误」(errors)：上传失败、异常等。
     # warnings（如 new-api 索引未构建被跳过）不影响已成功部分的产出，不判失败。
@@ -865,6 +1059,13 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                       files_skipped=total_skipped,
                       eval_report_path=eval_report_path,
                       analysis_json=analysis_json_stored)
+
+    # 收尾：把进度补满（成功/失败都补，避免列表里留着 97% 这种尾巴）。
+    try:
+        _progress_reporter.set_phase(_mcfg.mode_label, total=max(_progress_total[0], 0))
+        _progress_reporter.finish()
+    except Exception:  # noqa: BLE001  进度条失败不影响任务结果
+        logger.debug("进度收尾失败（忽略）", exc_info=True)
 
 
 
@@ -1169,7 +1370,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
                 return JSONResponse({"detail": f"目录不存在: {mt}"}, status_code=400)
 
         slot = _key_slot(api_key)
-        now_tag = datetime.now().strftime("%y%m%d%H%M%S")
+        now_tag = _new_now_tag()
 
         record_id = create_record(
             api_key=api_key, key_slot=slot,
@@ -1225,7 +1426,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         mode = rec.get("mode") or _default_mode()
         obs_prefix = (rec.get("obs_dst", "") or "").strip().rstrip("/")
         force = False
-        now_tag = datetime.now().strftime("%y%m%d%H%M%S")
+        now_tag = _new_now_tag()
 
         persist_params(record_id, mode=mode, obs_prefix=obs_prefix, force=force,
                        now_tag=now_tag, env_dir=str(env_dir), env_key_name=env_key_name,
@@ -1266,7 +1467,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
                     break
             else:
                 obs_prefix = _d.rstrip("/").rsplit("/", 1)[0]
-        now_tag = datetime.now().strftime("%y%m%d%H%M%S")
+        now_tag = _new_now_tag()
 
         new_record_id = create_record(
             api_key=rec["api_key"], key_slot=rec["key_slot"],
@@ -1321,7 +1522,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
                     break
             else:
                 obs_prefix = obs_dst.rstrip("/").rsplit("/", 1)[0]
-        now_tag = datetime.now().strftime("%y%m%d%H%M%S")
+        now_tag = _new_now_tag()
 
         new_record_id = create_record(
             api_key=rec["api_key"], key_slot=rec["key_slot"],
@@ -1728,7 +1929,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
 
         slot = _key_slot(api_key)
         obs_prefix = load_obs_base()
-        now_tag = datetime.now().strftime("%y%m%d%H%M%S")
+        now_tag = _new_now_tag()
         obs_sub = _public_obs_sub(mode)
 
         record_id = create_record(

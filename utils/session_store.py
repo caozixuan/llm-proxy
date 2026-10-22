@@ -558,12 +558,14 @@ def get_session_stats(root_dir: str, threshold: int = 5) -> Dict[str, Dict[str, 
 # 读取全部 sessions（供导出，替代 _read_session_cache）
 # ---------------------------------------------------------------------------
 
-def export_sessions(root_dir: str) -> List[Dict[str, Any]]:
+def export_sessions(root_dir: str, api_key: str = "") -> List[Dict[str, Any]]:
     """
     返回完整 session 列表（含 trace_list），格式与原 .session_cache.jsonl 行兼容。
     供 export_sync.export_session_index 使用。
+
+    api_key 非空时下推到 SQL，只取该 key 的 session 及其 traces（与 new-api 分支同语义）。
     """
-    sessions = list_sessions(root_dir)
+    sessions = list_sessions(root_dir, api_key=api_key)
     if not sessions:
         return []
     session_keys = [s["session_key"] for s in sessions]

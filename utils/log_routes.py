@@ -31,6 +31,7 @@ from utils.message_common import (
 from utils.q1_index import get_effective_q1, should_update_q1, update_q1
 import utils.session_store as _ss
 import utils.newapi_index_db as nidb
+from utils.timing import StageTimer
 
 _CACHE_LOCK = threading.Lock()
 _LOG_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -881,9 +882,10 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
     倒序，traces 仅对分页切片按叶子批量取。
     """
     leaves = _export_key_leaves(roots, env_dir, api_key)
+    _ptm = StageTimer()
+    _ptm.add("叶子解析", 0.0)  # 占位，保持汇总里阶段顺序稳定
     known_keys: set = set()
     known_models: set = set()
-
     # 搜索（首句 q1search / 内容 search）需要读全部候选文件才能确定命中与否，
     # 无法下推分页，保持「全量收集→过滤→切页」；无搜索时（打开页面的默认情形）
     # 才走分页下推：每叶子只取最新 offset+limit 条，用 COUNT 求和得到精确 total。
@@ -891,59 +893,61 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
 
     if has_search:
         all_sessions: List[Tuple[dict, str]] = []
-        for leaf in leaves:
-            try:
-                _refresh_state("anthropic", leaf, force=refresh)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                backend = _read_backend(leaf)
-                sels = backend.list_sessions(leaf, api_key=api_key, model=model, min_msg_count=min_messages)
-                for s in sels:
-                    all_sessions.append((s, leaf))
-                    if s.get("api_key"):
-                        known_keys.add(s["api_key"])
-                    for m in s.get("models", []):
-                        if m:
-                            known_models.add(m)
+        with _ptm.stage("读取会话"):
+            for leaf in leaves:
                 try:
-                    for m in backend.get_known_models(leaf):
-                        if m:
-                            known_models.add(m)
+                    _refresh_state("anthropic", leaf, force=refresh)
                 except Exception:  # noqa: BLE001
                     pass
-            except Exception:  # noqa: BLE001
-                continue
+                try:
+                    backend = _read_backend(leaf)
+                    sels = backend.list_sessions(leaf, api_key=api_key, model=model, min_msg_count=min_messages)
+                    for s in sels:
+                        all_sessions.append((s, leaf))
+                        if s.get("api_key"):
+                            known_keys.add(s["api_key"])
+                        for m in s.get("models", []):
+                            if m:
+                                known_models.add(m)
+                    try:
+                        for m in backend.get_known_models(leaf):
+                            if m:
+                                known_models.add(m)
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    continue
     else:
         # 分页下推：全局按 last_ts DESC 取前 offset+limit 条，来自某叶子的部分必然是
         # 该叶子 last_ts 最新的前 offset+limit 条（LEAF_PAGE 下推保证覆盖），
         # 因此每叶子 list_sessions(limit=need) 一次即可拼出全局前 need 条。
         all_sessions = []
         need = max(offset + limit, limit)
-        for leaf in leaves:
-            try:
-                _refresh_state("anthropic", leaf, force=refresh)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                backend = _read_backend(leaf)
-                sels = backend.list_sessions(leaf, api_key=api_key, model=model,
-                                             min_msg_count=min_messages, offset=0, limit=need)
-                for s in sels:
-                    all_sessions.append((s, leaf))
-                    if s.get("api_key"):
-                        known_keys.add(s["api_key"])
-                    for m in s.get("models", []):
-                        if m:
-                            known_models.add(m)
+        with _ptm.stage("读取会话"):
+            for leaf in leaves:
                 try:
-                    for m in backend.get_known_models(leaf):
-                        if m:
-                            known_models.add(m)
+                    _refresh_state("anthropic", leaf, force=refresh)
                 except Exception:  # noqa: BLE001
                     pass
-            except Exception:  # noqa: BLE001
-                continue
+                try:
+                    backend = _read_backend(leaf)
+                    sels = backend.list_sessions(leaf, api_key=api_key, model=model,
+                                                 min_msg_count=min_messages, offset=0, limit=need)
+                    for s in sels:
+                        all_sessions.append((s, leaf))
+                        if s.get("api_key"):
+                            known_keys.add(s["api_key"])
+                        for m in s.get("models", []):
+                            if m:
+                                known_models.add(m)
+                    try:
+                        for m in backend.get_known_models(leaf):
+                            if m:
+                                known_models.add(m)
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    continue
 
     q1search = (q1search or "").strip()
     if q1search:
@@ -961,8 +965,9 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
                 ok = False
             return pair if ok else None
         workers = min(32, (os.cpu_count() or 4) * 4)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            all_sessions = [p for p in ex.map(_hit, all_sessions) if p is not None]
+        with _ptm.stage("内容搜索"):
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                all_sessions = [p for p in ex.map(_hit, all_sessions) if p is not None]
 
     all_sessions.sort(key=lambda t: t[0].get("last_ts", "") or t[0].get("first_ts", "") or "", reverse=True)
     if has_search:
@@ -971,15 +976,21 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
     else:
         # 分页下推路径：收集的只是每叶子前 need 条，total 需用 COUNT 跨叶子精确求和。
         total = 0
-        for leaf in leaves:
-            try:
-                backend = _read_backend(leaf)
-                total += backend.count_sessions(leaf, api_key=api_key, model=model,
-                                                min_msg_count=min_messages)
-            except Exception:  # noqa: BLE001
-                continue
+        with _ptm.stage("COUNT 求总数"):
+            for leaf in leaves:
+                try:
+                    backend = _read_backend(leaf)
+                    total += backend.count_sessions(leaf, api_key=api_key, model=model,
+                                                    min_msg_count=min_messages)
+                except Exception:  # noqa: BLE001
+                    continue
 
-    items = _build_agg_items(all_sessions[offset:offset + limit] if limit > 0 else all_sessions[offset:])
+    with _ptm.stage("组装 items"):
+        items = _build_agg_items(all_sessions[offset:offset + limit] if limit > 0 else all_sessions[offset:])
+
+    _export_view_logger.info(
+        "export-view aggregate key=%s model=%s 叶子=%d 命中=%d %s",
+        api_key[-8:] if api_key else "", model, len(leaves), total, _ptm.summary_line("aggregate 耗时"))
 
     return {"items": items, "total": total, "known_keys": sorted(known_keys), "known_models": sorted(known_models)}
 
@@ -1045,6 +1056,10 @@ _AGG_CACHE_LOCK = threading.Lock()
 _AGG_CACHE: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
 _AGG_CACHE_TTL = 900  # 秒；收集结果缓存有效期
 
+# 导出浏览读链路的耗时打点（阶段累计 + 最慢叶子），只进日志与 poll payload，
+# 不新增 DB / 缓存结构。
+_export_view_logger = logging.getLogger("export-view")
+
 
 def _agg_cache_key(api_key: str, model: str, min_messages: int) -> Tuple[str, str, int]:
     return (api_key or "", model or "", int(min_messages or 1))
@@ -1077,7 +1092,8 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
     global _AGG_STREAM_SEQ
     # 先查结果缓存：命中则直接造一个「已完成」任务，poll 一次即拿全量，免重复收集。
     if not refresh and not search and not q1search:
-        cached = _agg_cache_get(api_key, model, min_messages)
+        with StageTimer() as _cache_tm:
+            cached = _agg_cache_get(api_key, model, min_messages)
         if cached is not None:
             with _AGG_STREAM_LOCK:
                 _AGG_STREAM_SEQ += 1
@@ -1093,9 +1109,19 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
                     "leaves_done": cached.get("leaves_total", 0),
                     "cached": True,
                     "_ts": time.time(),
+                    "_t0": time.time(),
+                    "_timings": {"缓存命中": _cache_tm.elapsed(),
+                                 "叶子解析": 0.0, "读取会话": 0.0, "组装 items": 0.0},
+                    "_slow_leaves": [],
                 }
+            _export_view_logger.info(
+                "export-view 缓存命中 key=%s model=%s min=%s items=%s 用时 %.3fs",
+                api_key[-8:] if api_key else "", model, min_messages,
+                cached.get("total", 0), _cache_tm.elapsed())
             return tid
-    leaves = _export_key_leaves(roots, env_dir, api_key)
+    _leaf_tm = StageTimer()
+    with _leaf_tm.stage("叶子解析"):
+        leaves = _export_key_leaves(roots, env_dir, api_key)
     if not leaves:
         # 无叶子可读：直接给一个已完成的任务，避免前端空转。
         with _AGG_STREAM_LOCK:
@@ -1105,7 +1131,12 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
                 "status": "done", "items": [], "total": 0, "cursor": 0,
                 "known_keys": set(), "known_models": set(),
                 "leaves_total": 0, "leaves_done": 0, "_ts": 0,
+                "_t0": time.time(),
+                "_timings": {"叶子解析": _leaf_tm.elapsed()},
+                "_slow_leaves": [],
             }
+        _export_view_logger.info("export-view 无叶子 key=%s model=%s 叶子解析 %.3fs",
+                                 api_key[-8:] if api_key else "", model, _leaf_tm.elapsed())
         return tid
 
     with _AGG_STREAM_LOCK:
@@ -1118,8 +1149,16 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
             "_ts": time.time(), "_env": env_dir, "_min": min_messages,
             "_key": api_key, "_model": model, "_search": search, "_q1": q1search,
             "_refresh": refresh,
+            # 耗时打点：_timings 为阶段累计（秒），_slow_leaves 只留最慢 5 个叶子，
+            # 避免大 key（90+ 叶子）时任务字典膨胀。前端 poll 里带 elapsed_s 出去。
+            "_t0": time.time(),
+            "_timings": {"叶子解析": _leaf_tm.elapsed(), "读取会话": 0.0, "组装 items": 0.0},
+            "_slow_leaves": [],
         }
         _AGG_STREAM_TASKS[tid] = task
+    _export_view_logger.info(
+        "export-view 流式开始 key=%s model=%s 叶子=%d 叶子解析 %.3fs",
+        api_key[-8:] if api_key else "", model, len(leaves), _leaf_tm.elapsed())
 
     def _run():
         # 逐叶收集。叶子已按 mtime 倒序（_export_key_leaves 里 sorted(reverse=True)），
@@ -1133,8 +1172,9 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
                 pass
             try:
                 backend = _read_backend(leaf)
-                sels = backend.list_sessions(leaf, api_key=task["_key"], model=task["_model"],
-                                             min_msg_count=task["_min"])
+                with StageTimer() as _sel_tm:
+                    sels = backend.list_sessions(leaf, api_key=task["_key"], model=task["_model"],
+                                                 min_msg_count=task["_min"])
             except Exception:  # noqa: BLE001
                 with _AGG_STREAM_LOCK:
                     task["leaves_done"] += 1  # 该叶失败也算已处理，进度才能收敛到 100%
@@ -1154,13 +1194,22 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
             except Exception:  # noqa: BLE001
                 pass
             # 该叶子读完：组装 items 追加进队列，供前端增量取走。同时推进 leaves_done。
-            items = _build_agg_items(leaf_items) if leaf_items else []
+            with StageTimer() as _build_tm:
+                items = _build_agg_items(leaf_items) if leaf_items else []
+            _sel_s, _build_s = _sel_tm.elapsed(), _build_tm.elapsed()
             with _AGG_STREAM_LOCK:
                 if items:
                     task["items"].extend(items)
                     task["total"] = len(task["items"])  # 已收集到的 item 数
                 task["leaves_done"] += 1
                 task["_ts"] = time.time()
+                _tm = task["_timings"]
+                _tm["读取会话"] = _tm.get("读取会话", 0.0) + _sel_s
+                _tm["组装 items"] = _tm.get("组装 items", 0.0) + _build_s
+                # 只留最慢 5 个叶子，便于定位个别慢叶（NFS/大库）。串行收集，锁开销可忽略。
+                task["_slow_leaves"].append((round(_sel_s + _build_s, 3), leaf))
+                task["_slow_leaves"].sort(reverse=True)
+                del task["_slow_leaves"][5:]
         with _AGG_STREAM_LOCK:
             # total 以「实际收集到的 item 数」为准，保证前端 loaded 收敛到 totalItems，
             # 滚动到底时 loadMore 判定 loaded >= totalItems 恒成立，不会再发分页请求。
@@ -1168,6 +1217,7 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
             task["leaves_done"] = task["leaves_total"]
             task["status"] = "done"
             task["_ts"] = time.time()
+            _elapsed = time.time() - task.get("_t0", task["_ts"])
             snapshot = {
                 "items": list(task["items"]),
                 "total": task["total"],
@@ -1175,9 +1225,18 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
                 "known_models": sorted(task["known_models"]),
                 "leaves_total": task["leaves_total"],
             }
+            _leaf_n = task["leaves_total"]
+            _items_n = task["total"]
+            _parts = list(task["_timings"].items())
+            _slow = list(task["_slow_leaves"])
         # 收集完成：写入结果缓存，供同 key+model 再次打开时秒开（refresh/search 不缓存）。
         if not task["_refresh"] and not task["_search"] and not task["_q1"]:
             _agg_cache_put(task["_key"], task["_model"], task["_min"], snapshot)
+        _export_view_logger.info(
+            "export-view 流式完成 key=%s model=%s 叶子=%d items=%d 总耗时 %.2fs | %s | 最慢叶子: %s",
+            task["_key"][-8:] if task["_key"] else "", task["_model"], _leaf_n, _items_n, _elapsed,
+            " + ".join("%s %.2fs" % (n, v) for n, v in _parts),
+            "; ".join("%.2fs %s" % (s, l) for s, l in _slow) or "无")
 
     t = threading.Thread(target=_run, daemon=True, name="agg-stream-" + tid)
     t.start()
@@ -1210,6 +1269,10 @@ def export_view_aggregate_stream_poll(task_id: str) -> Dict[str, Any]:
             "cached": task.get("cached", False),
             "known_keys": sorted(task["known_keys"]),
             "known_models": sorted(task["known_models"]),
+            # 已用时间（秒）+ 阶段累计耗时，前端显示「已用 xx.xs」，便于判断是
+            # 收集慢还是推送慢。任务字典里没有 _t0 的（旧任务/被修剪）给 0。
+            "elapsed_s": round(max(0.0, now - task.get("_t0", now)), 2),
+            "timings": {k: round(v, 2) for k, v in (task.get("_timings") or {}).items()},
         }
 
 
@@ -1224,27 +1287,29 @@ def export_view_list_payload(roots, env_dir: str, min_messages: int = 1, offset:
     文件行保留所属 session_key 供 trace 归属。
     """
     leaves = _export_key_leaves(roots, env_dir, api_key)
+    _ltm = StageTimer()
     sessions_by_leaf: List[Tuple[dict, str]] = []
     known_keys: set = set()
     known_models: set = set()
 
-    for leaf in leaves:
-        try:
-            _refresh_state("anthropic", leaf, force=refresh)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            backend = _read_backend(leaf)
-            sels = backend.list_sessions(leaf, api_key=api_key, model=model, min_msg_count=min_messages)
-        except Exception:  # noqa: BLE001
-            continue
-        for s in sels:
-            sessions_by_leaf.append((s, leaf))
-            if s.get("api_key"):
-                known_keys.add(s["api_key"])
-            for m in s.get("models", []):
-                if m:
-                    known_models.add(m)
+    with _ltm.stage("读取会话"):
+        for leaf in leaves:
+            try:
+                _refresh_state("anthropic", leaf, force=refresh)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                backend = _read_backend(leaf)
+                sels = backend.list_sessions(leaf, api_key=api_key, model=model, min_msg_count=min_messages)
+            except Exception:  # noqa: BLE001
+                continue
+            for s in sels:
+                sessions_by_leaf.append((s, leaf))
+                if s.get("api_key"):
+                    known_keys.add(s["api_key"])
+                for m in s.get("models", []):
+                    if m:
+                        known_models.add(m)
 
     q1search = (q1search or "").strip()
     if q1search:
@@ -1259,8 +1324,9 @@ def export_view_list_payload(roots, env_dir: str, min_messages: int = 1, offset:
             ok = bool(fn) and _match_messages_content(ld, fn, search, _root_format(ld) == "newapi")
             return pair if ok else None
         workers = min(32, (os.cpu_count() or 4) * 4)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            sessions_by_leaf = [p for p in ex.map(_hit, sessions_by_leaf) if p is not None]
+        with _ltm.stage("内容搜索"):
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                sessions_by_leaf = [p for p in ex.map(_hit, sessions_by_leaf) if p is not None]
 
     # 按叶子批量取 trace，展开为文件行
     from collections import defaultdict
@@ -1268,11 +1334,12 @@ def export_view_list_payload(roots, env_dir: str, min_messages: int = 1, offset:
     for s, ld in sessions_by_leaf:
         by_leaf[ld].append(s["session_key"])
     traces_map: Dict[str, Dict[str, List]] = {}
-    for ld, keys in by_leaf.items():
-        try:
-            traces_map[ld] = _read_backend(ld).get_traces_batch(keys)
-        except Exception:  # noqa: BLE001
-            traces_map[ld] = {}
+    with _ltm.stage("批量取 trace"):
+        for ld, keys in by_leaf.items():
+            try:
+                traces_map[ld] = _read_backend(ld).get_traces_batch(keys)
+            except Exception:  # noqa: BLE001
+                traces_map[ld] = {}
 
     raw: List[Dict[str, Any]] = []
     for s, ld in sessions_by_leaf:
@@ -1294,6 +1361,9 @@ def export_view_list_payload(roots, env_dir: str, min_messages: int = 1, offset:
     total = len(raw)
     paged = raw[offset:offset + limit] if limit > 0 else raw[offset:]
     items = [{k: v for k, v in r.items() if not k.startswith("_")} for r in paged]
+    _export_view_logger.info(
+        "export-view list key=%s model=%s 叶子=%d 文件行=%d %s",
+        api_key[-8:] if api_key else "", model, len(leaves), total, _ltm.summary_line("list 耗时"))
     return {"items": items, "total": total, "known_keys": sorted(known_keys), "known_models": sorted(known_models)}
 
 

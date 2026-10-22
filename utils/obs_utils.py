@@ -109,6 +109,7 @@ def run_upload_cmd(
 
     cmd = [upload_script, local, dst, str(jobs)]
     try:
+        _t_start = _time.monotonic()
         proc = Popen(cmd, stdout=PIPE, stderr=STDOUT, text=True)
         lines: List[str] = []
         line_count = 0
@@ -135,10 +136,35 @@ def run_upload_cmd(
             proc.wait()
             if log_cb:
                 try:
-                    log_cb(f"上传超时（{timeout}s）")
+                    log_cb(f"上传超时（{timeout}s，已用 {_time.monotonic() - _t_start:.1f}s）")
                 except Exception:
                     pass
             return False, f"Command timed out after {timeout}s"
+        # 上传段耗时 + obsutil 自报的字节数/吞吐：这是「复制上传时间」的客观分母，
+        # 供上层对比总耗时（obsutil 输出样例见 tools/obs_upload.sh 的 Succeed bytes/Metrics 行）。
+        _up_s = _time.monotonic() - _t_start
+        _bytes = _tps = None
+        for ln in reversed(lines[-40:]):
+            if _bytes is None:
+                m = re.search(r"Succeed bytes:\s*([\d.]+\s*[A-Za-z]+)", ln)
+                if m:
+                    _bytes = m.group(1)
+            if _tps is None:
+                m = re.search(r"average tps:([\d.]+)", ln)
+                if m:
+                    _tps = m.group(1)
+            if _bytes and _tps:
+                break
+        if log_cb:
+            _extra = ""
+            if _bytes:
+                _extra += f"，{_bytes}"
+            if _tps:
+                _extra += f"，平均 {_tps} obj/s"
+            try:
+                log_cb(f"[耗时] 上传 OBS: {_up_s:.2f}s{_extra}")
+            except Exception:
+                pass
         if proc.returncode == 0:
             last = lines[-1] if lines else ""
             if log_cb and last:

@@ -6,15 +6,94 @@ SQLite 后端，记录每次导出操作的状态和结果。
 """
 
 import os
+import socket
 import sqlite3
 import threading
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
 _lock = threading.Lock()
 _conn: Optional[sqlite3.Connection] = None
 _db_path: str = ""
+
+# ── worker 归属 / 心跳 ─────────────────────────────────────────────────────
+# 每条 running/pending 记录标记「哪个 worker 领的」+「最近一次心跳的 unix 秒」。
+# 启动清理（cancel_interrupted）据此只清理「所属 worker 已不存活」的遗留任务，
+# 而不是像以前那样把全表 running/queued/pending 一并取消 —— 后者在起第 2 个
+# worker 时会误杀第 1 个正在跑的任务。
+#
+# owner 标识 = "<hostname>:<pid>:<单调启动随机串>"。hostname + pid 足以判断
+# 「本机这个 worker 进程是否还活着」（os.kill(pid, 0)）；随机串用于防止 pid 复用
+# 造成的误判（重启后新 worker 换了 pid 或同一 pid 但不同实例）。
+_worker_id: str = ""
+
+# 心跳超过这个秒数即视为「所属 worker 已死」（进程被 SIGKILL、机器异常重启等
+# 无法走优雅退出的场景）。取 3 倍心跳间隔，容忍一次丢拍。
+HEARTBEAT_TIMEOUT = float(os.getenv("EXPORT_WORKER_HEARTBEAT_TIMEOUT", "180"))
+
+
+def _make_worker_id() -> str:
+    import uuid
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def set_worker_id(worker_id: str = "") -> str:
+    """登记本进程的 worker 标识（进程内全局）。空串时自动生成。
+
+    worker 进程启动时调用一次；之后 claim_next_queued() 把该标识写进记录的
+    owner_worker，heartbeat() 刷新 owner_heartbeat。
+    """
+    global _worker_id
+    _worker_id = worker_id or _make_worker_id()
+    return _worker_id
+
+
+def get_worker_id() -> str:
+    if not _worker_id:
+        set_worker_id()
+    return _worker_id
+
+
+def _pid_alive(pid: int) -> bool:
+    """本机进程是否存活。EPERM 表示存在但无权限 —— 仍算存活。"""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _owner_alive(owner: str, heartbeat_ts: float, timeout_sec: float = HEARTBEAT_TIMEOUT) -> bool:
+    """判断某条记录的 owner 是否仍存活。
+
+    判据：
+      1) owner 指向本机：**以进程是否存在为准**（owner 是 claim 时写入、从不转手，
+         进程没了任务就不可能还在跑）。owner 就是本 worker 自然也算存活。
+         pid 复用只会导致「误判为存活 → 不清理」，不会误杀，方向安全。
+      2) owner 不是本机（共享存储上的多机部署）：无法探活，退化为心跳超时判定。
+    """
+    if not owner:
+        return False
+    parts = owner.split(":", 2)
+    host = parts[0] if parts else ""
+    try:
+        pid = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        pid = 0
+    if host == socket.gethostname():
+        if owner == _worker_id:
+            return True
+        return _pid_alive(pid)
+    # 跨机：只能看心跳新鲜度
+    return (time.time() - float(heartbeat_ts or 0)) <= timeout_sec
 
 
 def _get_export_log_dir() -> Path:
@@ -105,6 +184,18 @@ def init_db(db_dir: str):
             # 软删除标记：删除任务=置 1，列表默认过滤掉。行与 obs_dst/local_copy_dir
             # 等指向云端/本地产物的元数据都保留，误删可恢复。见 delete_record()。
             "is_delete INTEGER NOT NULL DEFAULT 0",
+            # 任务归属的 worker 标识（owner_worker）+ 最近心跳时间（owner_heartbeat，
+            # unix 秒）。用于「多 worker 启动时只清理各自已死进程的遗留任务」：
+            # 老库/老记录该列为空串/0，由 cancel_interrupted() 的兼容分支处理。
+            # 见 claim_next_queued() / heartbeat() / cancel_interrupted()。
+            "owner_worker TEXT NOT NULL DEFAULT ''",
+            "owner_heartbeat REAL NOT NULL DEFAULT 0",
+            # 进度：done/total 当前阶段已完成/总数（session 或目录，看 phase），
+            # phase 是阶段名（生成索引 / 重构 / 上传 …）。供前端画进度条。
+            # 由 update_progress() 节流写入，任务结束不清零，便于回看各阶段规模。
+            "progress_done INTEGER NOT NULL DEFAULT 0",
+            "progress_total INTEGER NOT NULL DEFAULT 0",
+            "progress_phase TEXT NOT NULL DEFAULT ''",
         ]:
             try:
                 _conn.execute(f"ALTER TABLE export_records ADD COLUMN {col_def}")
@@ -141,6 +232,23 @@ def create_record(
         )
         conn.commit()
     return cur.lastrowid
+
+
+def update_progress(record_id: int, phase: str = "", done: int = 0, total: int = 0) -> None:
+    """更新进度列（供前端进度条）。
+
+    与 append_log 分开：append_log 每次都要读改写整段 JSON（O(n²)），而进度需要
+    高频更新（每完成一个 session 一次）。这里只做一次单行 UPDATE，代价固定。
+    调用方负责节流（见 export_routes._ProgressReporter）。
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE export_records SET progress_phase = ?, progress_done = ?, "
+            "progress_total = ? WHERE id = ?",
+            (phase or "", int(done or 0), int(total or 0), record_id),
+        )
+        conn.commit()
 
 
 def update_status(record_id: int, status: str, **kwargs):
@@ -275,14 +383,75 @@ def claim_next_queued() -> Optional[dict]:
             return None
         rec = dict(row)
         cur = conn.execute(
-            "UPDATE export_records SET status = 'pending' WHERE id = ? AND status = 'queued'",
-            (rec["id"],),
+            "UPDATE export_records SET status = 'pending', owner_worker = ?, "
+            "owner_heartbeat = ? WHERE id = ? AND status = 'queued'",
+            (get_worker_id(), time.time(), rec["id"]),
         )
         conn.commit()
         if cur.rowcount == 0:
             return None  # 被其他 worker 抢先
     rec["status"] = "pending"
+    rec["owner_worker"] = _worker_id
     return rec
+
+
+def heartbeat(record_id: int, worker_id: str = "") -> None:
+    """刷新该记录（及本 worker 持有的其它在途记录）的心跳时间。
+
+    长任务（大叶导出可达几十分钟）期间必须持续续命，否则别的 worker 会用
+    「心跳超时」把这条正在跑的任务判成遗留并取消。调用方（export_routes 的
+    _run_task_inner 循环）在每个目录/检查点调一次即可，开销是一次点更新。
+
+    worker_id 省略时用本进程标识；带上它是为了兼容「同一进程同时执行多条任务」
+    的回退模式（EXPORT_QUEUE_IN_PROCESS=1 的 N 个 runner 线程）。
+    """
+    wid = worker_id or get_worker_id()
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE export_records SET owner_heartbeat = ? "
+            "WHERE id = ? AND owner_worker = ?",
+            (time.time(), record_id, wid),
+        )
+        conn.commit()
+
+
+def ensure_owner(record_id: int, worker_id: str = "") -> None:
+    """把记录归属到自己名下（若尚未归属或已归属自己），并刷新心跳。
+
+    覆盖两种「不经过 claim_next_queued」的执行路径：
+      - EXPORT_QUEUE_IN_PROCESS=1 的回退模式（app 进程内 runner 直接调 _run_task）；
+      - upload_retry（记录本来就存在，worker 直接把它置 running 后重传）。
+    这两种情况若不登记 owner，别的 worker 启动时会把这条 running 记录当作
+    「无归属的老记录」清掉。
+    """
+    wid = worker_id or get_worker_id()
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE export_records SET owner_worker = ?, owner_heartbeat = ? "
+            "WHERE id = ? AND (owner_worker = '' OR owner_worker = ?)",
+            (wid, time.time(), record_id, wid),
+        )
+        conn.commit()
+
+
+def heartbeat_owner(worker_id: str = "") -> int:
+    """把本 worker 名下所有非终态记录的心跳一次性续上，返回受影响行数。
+
+    用于长任务里的批量续命（进程内可能有多条 pending/running），比逐条点更新
+    省事务。终态记录（success/failed/cancelled）不动，避免把已完成的行也拖着走。
+    """
+    wid = worker_id or get_worker_id()
+    conn = _get_conn()
+    with _lock:
+        cur = conn.execute(
+            "UPDATE export_records SET owner_heartbeat = ? "
+            "WHERE owner_worker = ? AND status IN ('running', 'pending')",
+            (time.time(), wid),
+        )
+        conn.commit()
+    return cur.rowcount
 
 
 def get_record(record_id: int) -> Optional[dict]:
@@ -346,7 +515,10 @@ def latest_quality_record(source_export_id: int) -> Optional[dict]:
     return dict(row) if row else None
 
 
-_SLIM_COLS = "id, key_slot, api_key, key_name, mtime_dirs, status, mode, created_at, total_sessions, files_uploaded, obs_dst, local_copy_dir, error_message, manage_name"
+# 列表页用的精简列。started_at/finished_at/files_skipped 必须在内：模板
+# templates/export.html 的「开始 / 完成（耗时）/ 跳过」子行直接渲染这三个字段，
+# 少任何一个都会静默不显示。
+_SLIM_COLS = "id, key_slot, api_key, key_name, mtime_dirs, status, mode, created_at, started_at, finished_at, total_sessions, files_uploaded, files_skipped, obs_dst, local_copy_dir, error_message, manage_name, progress_done, progress_total, progress_phase"
 
 _DS_COLS = "id, key_slot, api_key, key_name, status, mode, created_at, total_sessions, obs_dst, error_message, local_copy_dir, in_manage, manage_name"
 
@@ -450,26 +622,56 @@ def mark_interrupted():
         conn.commit()
 
 
-def cancel_interrupted() -> int:
-    """启动时把所有遗留的 running/queued/pending 任务直接取消，队列从零开始。
+def cancel_interrupted(reason: str = "服务重启，队列已清空") -> int:
+    """启动时清理**所属 worker 已不存活**的遗留任务，返回受影响行数。
 
-    不再重新入队（此前的 take_interrupted + _requeue_interrupted 会在频繁重启时
-    反复重建任务并刷屏日志）。重启即视为放弃上一轮排队：全部标 cancelled，
-    用户可在页面上按需手动重跑。返回受影响行数。
+    这是多 worker 部署的关键：以前是「一把梭」把全表 running/queued/pending 全标
+    cancelled，起第 2 个 worker 就会杀掉第 1 个正在跑的任务。现在按记录的
+    owner_worker / owner_heartbeat 逐条判活，只清理孤儿：
 
-    注意：draft（草稿）状态不在此列——它是用户显式保存待启动的任务，
-    重启后保留，等待手动「启动」。
+      - running/pending 且 owner 为空（老库/老记录、或升级瞬间在途）：
+        没有归属信息，无法证明有活进程在跑它 → 视为遗留，清理（保持旧的保守语义）。
+      - running/pending 且有 owner：
+        owner 对应的进程仍存在（或心跳未超时）→ **保留**，不动；
+        进程已死且心跳已过期 → 清理。
+      - queued：**不清**。queued 从未被任何 worker 领取（claim 时才写 owner），
+        也没有「归属进程」可言；队列是跨 worker 共享的，任何存活 worker 都能领取。
+        旧版启动即清空队列的语义在多 worker 下不成立（会误删别的 worker 刚入队的
+        任务），故明确改为保留。老版本遗留的 queued 记录若缺 task_json，worker
+        领取时会标 failed 并提示重建（见 export_jobs.load_params），不会静默执行。
+      - draft / 终态：不动。
+
+    兼容性约定（明确且安全）：
+      * 老库第一次升级上来，所有老记录的 owner_worker 都是 ''；running/pending
+        会被清理，行为与旧版一致，不会因为「没法判活」而把队列卡住。
     """
     conn = _get_conn()
+    cancelled = 0
     with _lock:
-        cur = conn.execute(
-            "UPDATE export_records SET status = 'cancelled', "
-            "error_message = '服务重启，队列已清空', "
-            "finished_at = datetime('now','localtime') "
-            "WHERE status IN ('running', 'queued', 'pending')"
-        )
+        rows = conn.execute(
+            "SELECT id, status, owner_worker, owner_heartbeat FROM export_records "
+            "WHERE status IN ('running', 'pending') AND is_delete = 0"
+        ).fetchall()
+
+        to_cancel = []
+        for r in rows:
+            owner = r["owner_worker"] or ""
+            if not owner:
+                to_cancel.append(r["id"])          # 老记录：无归属信息，保守清理
+            elif not _owner_alive(owner, r["owner_heartbeat"] or 0):
+                to_cancel.append(r["id"])          # 所属 worker 已死，清理其遗留
+
+        if to_cancel:
+            ph = ",".join("?" for _ in to_cancel)
+            cur = conn.execute(
+                "UPDATE export_records SET status = 'cancelled', "
+                "error_message = ?, finished_at = datetime('now','localtime') "
+                f"WHERE id IN ({ph}) AND status IN ('running', 'pending')",
+                [reason, *to_cancel],
+            )
+            cancelled = cur.rowcount
         conn.commit()
-    return cur.rowcount
+    return cancelled
 
 
 def take_interrupted() -> list:
