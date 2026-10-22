@@ -77,6 +77,13 @@ _DB_NAME = "index.db"
 # 故按远低于下限的固定批大小切分。
 _TRACES_IN_CHUNK = 500
 
+# index.jsonl 尾部残行宽限期（秒）：活尾通常几百毫秒内就写完；超过这么久文件
+# 还是停在半行上，基本可判定是崩溃留下的残行，跳过它、推进 offset，避免摄取永久卡住。
+try:
+    _TORN_TAIL_GRACE_SEC = max(10.0, float(os.getenv("NEWAPI_TORN_TAIL_GRACE", "120")))
+except ValueError:
+    _TORN_TAIL_GRACE_SEC = 120.0
+
 # enrich 失败重试上限：合并文件「尚未落盘」是活跃叶子的常态瞬态失败，
 # 保持 q1_hash=NULL 让后续构建重扫重试；累计到此上限仍失败才标死（q1_hash=''）永久跳过。
 _MAX_ENRICH_ATTEMPTS = 3
@@ -166,6 +173,9 @@ CREATE TABLE IF NOT EXISTS traces (
     success      INTEGER DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS traces_sk ON traces(session_key);
+-- 增量追加时同一条记录可能被重放（watermark 回退、截断重建、并发重试），
+-- 唯一键让 INSERT OR IGNORE 天然去重，避免同一 filename 在会话下重复成 trace。
+CREATE UNIQUE INDEX IF NOT EXISTS traces_dedupe ON traces(session_key, filename);
 
 CREATE TABLE IF NOT EXISTS chain_index (
     lookup_key   TEXT PRIMARY KEY,
@@ -198,6 +208,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "attempts" not in cols:
         conn.execute("ALTER TABLE requests ADD COLUMN attempts INTEGER DEFAULT 0")
         conn.commit()
+    # 老库补 traces 去重唯一键。历史库由 rebuild_sessions 的 DELETE+全量插生成，
+    # 理论上无重复；万一有（曾被外部工具半途写入），降级为普通索引，不让连接路径报错。
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS traces_dedupe ON traces(session_key, filename)")
+    except sqlite3.IntegrityError:
+        logger.warning("traces 存在重复行，traces_dedupe 降级为普通索引")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS traces_dedupe_nu ON traces(session_key, filename)")
 
 
 def _db_exists(leaf_dir: str) -> bool:
@@ -219,18 +238,32 @@ def _meta_set(conn: sqlite3.Connection, k: str, v: str) -> None:
 
 def _iter_index_lines(leaf_dir: str, start_offset: int) -> Tuple[List[dict], int]:
     """从 index.jsonl 的 start_offset 处读到末尾，返回 (entries, end_offset)。
-    只解析非 _meta 行；解析失败的行跳过。"""
+
+    只解析非 _meta 行；解析失败的行跳过。
+    **end_offset 只推进到最后一个完整行（以 \\n 结尾）**：最后一行的写入可能被撕裂
+    （append 时恰好读到半个 JSON），若像以前那样取 f.tell() 就把 offset 越过该行，
+    这半行永远是坏的、下一轮也从它之后开始读——记录永久丢失。停在最后一个换行处，
+    让下一轮重读该未完成行。返回的 end_offset 恒 >= start_offset。
+    """
     index_file = os.path.join(leaf_dir, _INDEX_NAME)
     entries: List[dict] = []
     try:
         with open(index_file, "rb") as f:
             f.seek(start_offset)
             data = f.read()
-            end_offset = f.tell()
     except OSError:
         return [], start_offset
-    for raw in data.split(b"\n"):
-        line = raw.decode("utf-8", errors="ignore").strip()
+    if not data:
+        return [], start_offset
+    # 只消费到最后一个换行；其后的残余是未写完的行，留给下一轮
+    cut = data.rfind(b"\n")
+    if cut < 0:
+        return [], start_offset          # 整段都没有完整行
+    complete, tail = data[: cut + 1], len(data) - (cut + 1)
+    consumed = cut + 1
+    end_offset = start_offset + consumed
+    for raw in complete.split(b"\n"):
+        line = raw.decode("utf-8", errors="ignore").replace("\r", "").strip()
         if not line:
             continue
         try:
@@ -240,6 +273,21 @@ def _iter_index_lines(leaf_dir: str, start_offset: int) -> Tuple[List[dict], int
         if entry.get("_meta"):
             continue
         entries.append(entry)
+    if tail:
+        # 尾部残留：通常只是「一行还没写完」，下一轮读到完整行即可。
+        # 但若文件已很久没变化（进程崩溃留下的残行、写了一半的损坏文件），
+        # 它会永久卡住 offset < size → needs_build 恒真、watcher 每轮空转。
+        # 超过宽限期仍无变化，就认定是垃圾尾行，跳过它推进 offset。
+        try:
+            age = time.time() - os.path.getmtime(index_file)
+        except OSError:
+            age = 0.0
+        if age > _TORN_TAIL_GRACE_SEC:
+            logger.warning("index.jsonl 尾部有 %d 字节残缺且已 %ds 未变化，跳过：%s",
+                           tail, int(age), index_file)
+            end_offset += tail
+        else:
+            logger.debug("index.jsonl 尾部有 %d 字节未完成行（offset 停在 %d）", tail, end_offset)
     return entries, end_offset
 
 
@@ -275,19 +323,22 @@ def ingest(leaf_dir: str) -> int:
                     continue
                 usage = e.get("usage") if isinstance(e.get("usage"), dict) else {}
                 success = 1 if (usage.get("token_out") or 0) > 0 else 0
-                conn.execute(
+                cur = conn.execute(
                     "INSERT OR IGNORE INTO requests(req_file, ts, model, api_key, usage_json, success) "
                     "VALUES(?,?,?,?,?,?)",
                     (
                         req_file,
                         str(e.get("ts") or ""),
-                        str(e.get("model") or ""),
-                        str(e.get("api_key") or ""),
+                        _safe_text(str(e.get("model") or "")),
+                        _safe_text(str(e.get("api_key") or "")),
                         json.dumps(usage, ensure_ascii=False),
                         success,
                     ),
                 )
-                n += 1
+                # 只统计真正插入的行：req_file 重复（重放/同一记录被写了两次）时
+                # INSERT OR IGNORE 不插入，此时不应标 sessions_dirty——否则会留下
+                # 「脏但无新行可折叠」的状态，needs_build 恒真、watcher 空转。
+                n += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
             _meta_set(conn, "ingest_offset", end_offset)
             _meta_set(conn, "updated_at", str(int(time.time())))
             if n:
@@ -348,6 +399,23 @@ def _worker_enrich(leaf_dir: str, req_files: List[str]) -> List[tuple]:
     return out
 
 
+def _safe_text(v: Any) -> Any:
+    """清洗孤立代理字符（U+DC80–U+DCFF 等），避免 SQLite/JSON 写入抛
+    UnicodeEncodeError（surrogates not allowed）。
+
+    new-api 的合并文件里偶发给的是被截断的 4 字节 UTF-8（如 \ud835），json 解析后
+    会留下孤立代理字符；直接写 SQLite 或 json.dumps 会整体失败，导致该叶子反复
+    LEAF FAIL。这里按 UTF-8 编码并 replace 掉非法序列，语义上等价于「损坏字符变 ?」。
+    """
+    if not isinstance(v, str):
+        return v
+    try:
+        v.encode("utf-8")
+        return v
+    except UnicodeEncodeError:
+        return v.encode("utf-8", "replace").decode("utf-8")
+
+
 def _chunk(items: List[Any], n: int) -> List[List[Any]]:
     if n <= 1 or len(items) <= 1:
         return [items] if items else []
@@ -396,7 +464,8 @@ def enrich(leaf_dir: str, workers: int = 8, progress_cb=None,
                         "UPDATE requests SET q1_hash=?, msg_count=?, user_turns=?, q1_preview=?, "
                         "chain_key=?, has_res=?, success=?, model=COALESCE(NULLIF(?,''), model), "
                         "ts=COALESCE(NULLIF(?,''), ts) WHERE req_file=?",
-                        [(r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[0]) for r in ok_rows],
+                        [(r[1], r[2], r[3], _safe_text(r[4]), _safe_text(r[5]), r[6], r[7],
+                          _safe_text(r[8]), _safe_text(r[9]), r[0]) for r in ok_rows],
                     )
                 if fail_rows:
                     # 瞬态失败（合并文件多为「尚未落盘」）：累加 attempts，q1_hash 仍留 NULL 下轮重扫重试；
@@ -613,16 +682,239 @@ def _agg_one(r: sqlite3.Row, sessions: Dict[str, Dict[str, Any]],
         session["trace_list"].append(trace_entry)
 
 
+# ── Stage 3b：增量聚合（按 rowid 水位只折叠新增行）─────────────────────────
+
+# meta 里的聚合水位：已折叠进 sessions 的最大 requests.rowid。
+# 与 ingest_offset 不同——后者是 index.jsonl 字节偏移，前者是行序位置。
+_SYNC_WATERMARK = "sessions_synced_rowid"
+
+
+def _row_to_session_state(row: sqlite3.Row) -> Dict[str, Any]:
+    """把 sessions 表的一行还原成 _agg_one 用的会话状态 dict。
+
+    **msg_count 语义陷阱**：新建会话存 raw msg_count，更新分支存 full(=msg_count+has_res)，
+    故不能把 sessions.msg_count 当成 _best_req_count 用——best_req_count 列才是原始峰值。
+    trace_list 不在此还原（增量路径按条写库，不需要它）。
+    """
+    try:
+        models = json.loads(row["models"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        models = []
+    return {
+        "api_key": row["api_key"] or "",
+        "q1": row["q1"] or "",
+        "models": models if isinstance(models, list) else [],
+        "latest_file": row["latest_file"] or "",
+        "msg_count": row["msg_count"] or 0,
+        "first_ts": row["first_ts"] or "",
+        "last_ts": row["last_ts"] or "",
+        "_best_req_count": row["best_req_count"] or 0,
+        "_max_real_turns": row["max_real_turns"] or 0,
+    }
+
+
+def _agg_one_db(conn: sqlite3.Connection, r: sqlite3.Row) -> Tuple[str, bool]:
+    """增量版 _agg_one：只对该行触及的会话做 upsert，写一条 trace。
+
+    与内存版逐语句对齐（同样的切分判定、同样的 latest_file/msg_count 选择规则）。
+    返回 (session_key, is_new_session)。调用方负责 commit。
+    """
+    api_key = r["api_key"] or ""
+    model = r["model"] or ""
+    filename = os.path.basename(r["req_file"] or "")
+    ts = r["ts"] or filename
+    q1_hash = r["q1_hash"] or ""
+    msg_count = r["msg_count"] or 0
+    user_turns = r["user_turns"] or 0
+    has_res = bool(r["has_res"])
+    success = bool(r["success"])
+    full_msg_count = msg_count + (1 if has_res else 0)
+
+    base_key = f"{api_key}||{q1_hash}"
+    row = conn.execute(
+        "SELECT session_key FROM chain_index WHERE lookup_key=?", (base_key,)).fetchone()
+    sess_key = row["session_key"] if row else None
+    lookup_key = base_key
+    session = None
+    if sess_key:
+        srow = conn.execute(
+            "SELECT * FROM sessions WHERE session_key=?", (sess_key,)).fetchone()
+        session = _row_to_session_state(srow) if srow else None
+
+    # 新会话检测（与 _agg_one 完全一致的判据与碰撞规避）
+    if session is not None and user_turns <= 1 and \
+       user_turns < session.get("_max_real_turns", 1):
+        suffix = 1
+        new_lookup = f"{base_key}##session_{suffix}"
+        while conn.execute("SELECT 1 FROM chain_index WHERE lookup_key=?",
+                           (new_lookup,)).fetchone():
+            suffix += 1
+            new_lookup = f"{base_key}##session_{suffix}"
+        lookup_key = new_lookup
+        session = None
+        sess_key = None
+
+    is_new = session is None
+    if is_new:
+        sess_key = ts
+        while conn.execute("SELECT 1 FROM sessions WHERE session_key=?",
+                           (sess_key,)).fetchone():
+            sess_key = sess_key + "_x"
+        q1 = r["q1_preview"] or (r["chain_key"] or "")[:200]
+        conn.execute(
+            "INSERT INTO sessions(session_key, api_key, q1, models, latest_file, msg_count, "
+            "first_ts, last_ts, has_failure, best_req_count, max_real_turns) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                sess_key, api_key, q1, json.dumps([model] if model else [], ensure_ascii=False),
+                filename, msg_count, ts, ts,
+                0 if success else 1, msg_count, user_turns,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO chain_index(lookup_key, session_key) VALUES(?,?) "
+            "ON CONFLICT(lookup_key) DO UPDATE SET session_key=excluded.session_key",
+            (lookup_key, sess_key),
+        )
+    else:
+        models = session["models"]
+        if model and model not in models:
+            models.append(model)
+        max_turns = max(user_turns, session.get("_max_real_turns", 0))
+        best = session.get("_best_req_count", 0)
+        new_best, new_msg, new_latest = best, session["msg_count"], session["latest_file"]
+        if msg_count > best or (msg_count == best and has_res):
+            new_latest = filename
+            new_msg = full_msg_count
+            new_best = msg_count
+        conn.execute(
+            "UPDATE sessions SET api_key=?, models=?, latest_file=?, msg_count=?, "
+            "last_ts=?, best_req_count=?, max_real_turns=?, "
+            "has_failure=CASE WHEN ? THEN 1 ELSE has_failure END "
+            "WHERE session_key=?",
+            (
+                api_key, json.dumps(models, ensure_ascii=False), new_latest, new_msg,
+                ts, new_best, max_turns, 0 if success else 1, sess_key,
+            ),
+        )
+        # 惰性维护 chain_index：base_key 若尚未指向本会话则补上
+        conn.execute(
+            "INSERT INTO chain_index(lookup_key, session_key) VALUES(?,?) "
+            "ON CONFLICT(lookup_key) DO NOTHING",
+            (lookup_key, sess_key),
+        )
+
+    conn.execute(
+        "INSERT OR IGNORE INTO traces(session_key, filename, model, msg_count, ts, success) "
+        "VALUES(?,?,?,?,?,?)",
+        (sess_key, filename, model, full_msg_count, ts, 1 if success else 0),
+    )
+    return sess_key, is_new
+
+
+def sync_sessions(leaf_dir: str, batch: int = 500) -> Dict[str, Any]:
+    """Stage 3b：只折叠 rowid 水位之后的新增行，替代全量 rebuild_sessions。
+
+    保序停止：按 rowid 顺序扫描，**遇到第一行 meta 未补齐（q1_hash IS NULL）或
+    暂时失败（msg_count < 0）就停下**，水位只推进到最后一个成功折叠的 rowid。
+    这样既不会把还没 enrich 完的行永久跳过，也不会打乱 index.jsonl 的追加顺序。
+
+    bootstrap：meta 无水位（老库 / 首次）时先跑一次 rebuild_sessions 建立基线。
+
+    返回 {synced, sessions_touched, sessions_created, watermark}。
+    """
+    if not _db_exists(leaf_dir):
+        return {"synced": 0, "sessions_touched": 0, "sessions_created": 0, "watermark": 0}
+
+    # bootstrap 必须在持有 _leaf_lock 之前完成：rebuild_sessions 自身也会抢这把
+    # 非重入锁，在锁内调用会自死锁。
+    if not _meta_get(_connect(leaf_dir), _SYNC_WATERMARK, ""):
+        n = rebuild_sessions(leaf_dir)
+        c = _connect(leaf_dir, write=True)
+        try:
+            max_rowid = c.execute(
+                "SELECT COALESCE(MAX(rowid), 0) AS m FROM requests "
+                "WHERE q1_hash IS NOT NULL AND msg_count >= 0").fetchone()["m"]
+            _meta_set(c, _SYNC_WATERMARK, str(max_rowid))
+            c.commit()
+        finally:
+            c.close()
+        logger.info("sync_sessions bootstrap %s：全量重建 %d 个会话，水位=%d",
+                    leaf_dir, n, max_rowid)
+        return {"synced": 0, "sessions_touched": 0,
+                "sessions_created": n, "watermark": max_rowid}
+
+    with _leaf_lock(leaf_dir):
+        conn = _connect(leaf_dir, write=True)
+        try:
+            watermark = int(_meta_get(conn, _SYNC_WATERMARK, "0") or "0")
+            synced = 0
+            touched = set()
+            created = 0
+            newest = watermark
+            while True:
+                rows = conn.execute(
+                    "SELECT rowid AS _rid, req_file, ts, model, api_key, q1_hash, msg_count, "
+                    "user_turns, q1_preview, chain_key, has_res, success FROM requests "
+                    "WHERE rowid > ? ORDER BY rowid LIMIT ?",
+                    (newest, batch),
+                ).fetchall()
+                if not rows:
+                    break
+                stop = False
+                for r in rows:
+                    if r["q1_hash"] is None or (r["msg_count"] or 0) < 0:
+                        stop = True      # 未补齐/暂时失败：保序停在这里
+                        break
+                    sk, is_new = _agg_one_db(conn, r)
+                    touched.add(sk)
+                    if is_new:
+                        created += 1
+                    synced += 1
+                    newest = r["_rid"]
+                if synced:
+                    _meta_set(conn, _SYNC_WATERMARK, str(newest))
+                    conn.commit()
+                if stop or len(rows) < batch:
+                    break
+            if synced:
+                _meta_set(conn, "sessions_dirty", "0")
+                _meta_set(conn, "sessions_built_at", str(int(time.time())))
+                conn.commit()
+            else:
+                # 没折叠到任何行：若水位之后也没有待 enrich 的行，说明 sessions 已是
+                # 最新（dirty 是早前 ingest 留下、后来被去重/回滚掉的陈旧标志）。
+                # 不清它的话 needs_build 恒真，watcher 会每轮空转。
+                stuck = conn.execute(
+                    "SELECT EXISTS(SELECT 1 FROM requests WHERE rowid > ? "
+                    "AND (q1_hash IS NULL OR COALESCE(msg_count,0) < 0))",
+                    (newest,),
+                ).fetchone()[0]
+                if not stuck:
+                    _meta_set(conn, "sessions_dirty", "0")
+                    conn.commit()
+            return {"synced": synced, "sessions_touched": len(touched),
+                    "sessions_created": created, "watermark": newest}
+        finally:
+            if conn is not None:
+                conn.close()
+
+
 # ── 一条龙（批量构建用）────────────────────────────────────────────────────
 
 def build_leaf(leaf_dir: str, workers: int = 8, progress_cb=None,
                stall_timeout: float = 300.0) -> Dict[str, Any]:
-    """ingest → enrich → rebuild_sessions 一条龙。返回汇总统计。
-    enrich 卡住会 raise LeafStalledError（不吞），交上层 _run 跳过该叶子。"""
+    """ingest → enrich → sync_sessions 一条龙。返回汇总统计。
+    enrich 卡住会 raise LeafStalledError（不吞），交上层 _run 跳过该叶子。
+
+    第三段用增量 sync_sessions 而非全量 rebuild_sessions：批量回填时前者是增量折叠
+    （首次自动 bootstrap 全量），后者每次都整表重建，在 15w 行叶子上代价高一个量级。
+    """
     ingested = ingest(leaf_dir)
     en = enrich(leaf_dir, workers=workers, progress_cb=progress_cb,
                 stall_timeout=stall_timeout)
-    n_sessions = rebuild_sessions(leaf_dir)
+    sync_sessions(leaf_dir)
+    n_sessions = status(leaf_dir).get("sessions", 0)
     return {
         "ingested": ingested,
         "enriched": en.get("enriched", 0),
@@ -732,7 +1024,7 @@ def ensure_fresh(leaf_dir: str, workers: int = 8) -> Dict[str, Any]:
             time.sleep(0.5)          # 给活跃叶子未落盘的合并文件一点落盘时间
             ingest(leaf_dir)         # 期间 index.jsonl 可能又追加了新行
             enrich(leaf_dir, workers=workers)
-            rebuild_sessions(leaf_dir)
+            sync_sessions(leaf_dir)  # 增量折叠，不再整表重建
             rounds += 1
     except Exception:
         pass

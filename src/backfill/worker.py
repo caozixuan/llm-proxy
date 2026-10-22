@@ -48,7 +48,14 @@ logger = logging.getLogger("backfill_worker")
 
 _shutdown_requested = False
 
-AUTO_SYNC_INTERVAL = 3600  # 常驻模式下周期跑 auto_sync 的间隔（秒），默认 1 小时
+# 常驻模式下周期跑 auto_sync 的间隔（秒）。
+# 默认 0 = 关闭：new-api 叶子的实时增量已由独立进程 src/watch/worker.py 覆盖
+# （每源发现线程 + 同步池，秒级），小时级全量 auto_sync 只会和它抢锁、白跑一遍
+# sync_leaves 扫盘。需要恢复旧行为时设 BACKFILL_AUTO_SYNC_INTERVAL=3600。
+try:
+    AUTO_SYNC_INTERVAL = float(os.getenv("BACKFILL_AUTO_SYNC_INTERVAL", "0"))
+except ValueError:
+    AUTO_SYNC_INTERVAL = 0.0
 
 
 def _handle_signal(signum, frame):
@@ -146,7 +153,8 @@ def _drain(once: bool, max_workers: int, svc_dir: str = "") -> None:
         futures = set()
         while not _shutdown_requested:
             # 周期性 auto_sync（仅常驻模式；扫盘+入队在主线程同步执行，不占线程池）
-            if not once and svc_dir:
+            # AUTO_SYNC_INTERVAL<=0 表示关闭（实时索引已由 watch worker 接管）。
+            if not once and svc_dir and AUTO_SYNC_INTERVAL > 0:
                 nowm = time.monotonic()
                 if last_auto_sync is None or (nowm - last_auto_sync) >= AUTO_SYNC_INTERVAL:
                     try:

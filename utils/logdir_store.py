@@ -21,6 +21,7 @@ import json as _json
 import os
 import sqlite3
 import threading
+import time
 from datetime import datetime
 from typing import List, Optional
 
@@ -676,3 +677,342 @@ def reset_running_backfill_on_startup() -> int:
         )
         _conn.commit()
     return cur.rowcount
+
+
+# ── watch 队列（watch_queue 表）────────────────────────────────────────────
+# 独立 watch worker 进程的核心调度表：发现线程入队、同步池消费。
+# 与 backfill_requests 的区别：粒度是单个 leaf（而不是整个 root），带优先级。
+# 部分唯一索引 watch_queue_active 保证同一 leaf 不会同时有两条 pending/running。
+
+def _ensure_watch_tables() -> None:
+    """确保 watch_queue / watch_source_stats 表存在（兼容老库）。"""
+    if not _ready():
+        return
+    with _lock:
+        _conn.executescript("""
+            CREATE TABLE IF NOT EXISTS watch_queue (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                root_id       TEXT NOT NULL DEFAULT '',
+                root_path     TEXT NOT NULL DEFAULT '',
+                leaf_path     TEXT NOT NULL DEFAULT '',
+                dir_key       TEXT NOT NULL DEFAULT '',
+                priority      INTEGER NOT NULL DEFAULT 0,
+                reason        TEXT NOT NULL DEFAULT '',
+                idx_size      INTEGER NOT NULL DEFAULT 0,
+                offset_at     INTEGER NOT NULL DEFAULT 0,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                bytes_done    INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                started_at    TEXT,
+                finished_at   TEXT,
+                took_ms       INTEGER NOT NULL DEFAULT 0,
+                error         TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS watch_queue_active
+                ON watch_queue(leaf_path) WHERE status IN ('pending','running');
+            CREATE INDEX IF NOT EXISTS watch_queue_status
+                ON watch_queue(status, priority DESC, id);
+            CREATE TABLE IF NOT EXISTS watch_source_stats (
+                root_id        TEXT PRIMARY KEY,
+                bytes_per_sec  REAL NOT NULL DEFAULT 0,
+                rows_per_sec   REAL NOT NULL DEFAULT 0,
+                samples        INTEGER NOT NULL DEFAULT 0,
+                updated_at     TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            );
+        """)
+        _conn.commit()
+
+
+def enqueue_watch(root_id: str, root_path: str, leaf_path: str, dir_key: str,
+                  priority: int = 0, reason: str = "", idx_size: int = 0,
+                  offset_at: int = 0) -> bool:
+    """入队一个叶子同步任务。已有 pending/running 的同路径叶子则忽略（幂等）。
+    返回 True 表示成功入队，False 表示因唯一索引冲突被忽略（已在队）。
+    """
+    _ensure_watch_tables()
+    if not _ready():
+        return False
+    with _lock:
+        cur = _conn.execute(
+            "INSERT OR IGNORE INTO watch_queue"
+            "(root_id, root_path, leaf_path, dir_key, priority, reason, idx_size, offset_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (root_id or "", os.path.normpath(root_path) if root_path else "",
+             leaf_path, dir_key, int(priority), reason or "", int(idx_size), int(offset_at)),
+        )
+        _conn.commit()
+    return cur.rowcount > 0
+
+
+def claim_next_watch() -> Optional[dict]:
+    """同步池领取下一条 pending 任务（按 priority DESC, id ASC 排序）。
+    原子置 running；返回 None 表示队空。
+    """
+    _ensure_watch_tables()
+    if not _ready():
+        return None
+    with _lock:
+        row = _conn.execute(
+            "SELECT * FROM watch_queue WHERE status='pending' "
+            "ORDER BY priority DESC, id LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        rec = dict(row)
+        cur = _conn.execute(
+            "UPDATE watch_queue SET status='running', "
+            "started_at=datetime('now','localtime') WHERE id=? AND status='pending'",
+            (rec["id"],),
+        )
+        _conn.commit()
+        if cur.rowcount == 0:
+            return None
+    rec["status"] = "running"
+    return rec
+
+
+def touch_watch_size(leaf_path: str, idx_size: int) -> bool:
+    """把该叶子活跃队列行（pending/running）的 idx_size 刷新为最新文件大小。
+
+    发现线程每轮扫到增长都会调一次。目的有二：
+      1. 看板的 remaining_bytes / ETA 跟着文件实时前进，不冻在入队那一刻；
+      2. 返回 False 说明该叶子没有活跃行——调用方据此决定是否要入队。
+    走 watch_queue_active 部分索引，一条 UPDATE，成本可忽略。
+    """
+    _ensure_watch_tables()
+    if not _ready() or not leaf_path:
+        return False
+    with _lock:
+        cur = _conn.execute(
+            "UPDATE watch_queue SET idx_size=? "
+            "WHERE leaf_path=? AND status IN ('pending','running')",
+            (int(idx_size), leaf_path),
+        )
+        _conn.commit()
+    return cur.rowcount > 0
+
+
+def watch_active_counts() -> dict:
+    """活跃任务计数 {pending, running}：供看板显示并发水位（pool.busy）。"""
+    _ensure_watch_tables()
+    if not _ready():
+        return {"pending": 0, "running": 0}
+    with _lock:
+        row = _conn.execute(
+            "SELECT COALESCE(SUM(status='pending'),0) AS pending, "
+            "COALESCE(SUM(status='running'),0) AS running FROM watch_queue"
+        ).fetchone()
+    return {"pending": (row["pending"] if row else 0),
+            "running": (row["running"] if row else 0)}
+
+
+def finish_watch(wq_id: int, ok: bool, bytes_done: int = 0,
+                 took_ms: int = 0, error: str = "") -> None:
+    """标记任务终态（done / failed）并记录耗时/字节数。"""
+    _ensure_watch_tables()
+    if not _ready():
+        return
+    with _lock:
+        _conn.execute(
+            "UPDATE watch_queue SET status=?, bytes_done=?, took_ms=?, error=?, "
+            "finished_at=datetime('now','localtime') WHERE id=?",
+            ("done" if ok else "failed", int(bytes_done), int(took_ms), error or "", wq_id),
+        )
+        _conn.commit()
+
+
+def watch_queue_stats() -> dict:
+    """看板汇总：全局 + 按 root 分组的 {pending, running, done, failed, remaining_bytes}。"""
+    _ensure_watch_tables()
+    if not _ready():
+        return {"totals": {}, "sources": []}
+    with _lock:
+        totals_row = _conn.execute("""
+            SELECT
+              COALESCE(SUM(status='pending'), 0) AS pending,
+              COALESCE(SUM(status='running'), 0) AS running,
+              COALESCE(SUM(status='done'),    0) AS done,
+              COALESCE(SUM(status='failed'),  0) AS failed,
+              COALESCE(SUM(CASE WHEN status IN ('pending','running') THEN MAX(idx_size - offset_at, 0) ELSE 0 END), 0) AS remaining_bytes
+            FROM watch_queue
+        """).fetchone()
+        src_rows = _conn.execute("""
+            SELECT root_id, root_path,
+              COALESCE(SUM(status='pending'), 0) AS pending,
+              COALESCE(SUM(status='running'), 0) AS running,
+              COALESCE(SUM(status='done'),    0) AS done,
+              COALESCE(SUM(status='failed'),  0) AS failed,
+              COALESCE(SUM(CASE WHEN status IN ('pending','running') THEN MAX(idx_size - offset_at, 0) ELSE 0 END), 0) AS remaining_bytes
+            FROM watch_queue
+            GROUP BY root_id, root_path
+        """).fetchall()
+        stats_rows = _conn.execute(
+            "SELECT * FROM watch_source_stats"
+        ).fetchall()
+    stats_by_rid = {r["root_id"]: dict(r) for r in stats_rows}
+    sources = []
+    for r in src_rows:
+        d = dict(r)
+        st = stats_by_rid.get(d["root_id"], {})
+        bps = st.get("bytes_per_sec", 0)
+        d["bytes_per_sec"] = bps
+        rem = d.get("remaining_bytes") or 0
+        d["eta_sec"] = int(rem / bps) if bps > 0 else None
+        sources.append(d)
+    totals = dict(totals_row) if totals_row else {}
+    global_bps = sum(s["bytes_per_sec"] for s in sources if s["bytes_per_sec"])
+    rem_total = totals.get("remaining_bytes") or 0
+    totals["eta_sec"] = int(rem_total / global_bps) if global_bps > 0 else None
+    return {"totals": totals, "sources": sources}
+
+
+def update_watch_source_stats(root_id: str, bytes_done: int, took_ms: int,
+                              rows_done: int = 0) -> None:
+    """用 EMA（α=0.3）更新来源的历史吞吐率统计。"""
+    _ensure_watch_tables()
+    if not _ready() or took_ms <= 0 or bytes_done <= 0:
+        return
+    alpha = 0.3
+    new_bps = bytes_done / (took_ms / 1000.0)
+    new_rps = rows_done / (took_ms / 1000.0) if rows_done > 0 else 0.0
+    with _lock:
+        existing = _conn.execute(
+            "SELECT bytes_per_sec, rows_per_sec, samples FROM watch_source_stats WHERE root_id=?",
+            (root_id,),
+        ).fetchone()
+        if existing:
+            old_bps = existing["bytes_per_sec"] or 0.0
+            old_rps = existing["rows_per_sec"] or 0.0
+            samples = (existing["samples"] or 0) + 1
+            bps = old_bps * (1 - alpha) + new_bps * alpha if old_bps > 0 else new_bps
+            rps = old_rps * (1 - alpha) + new_rps * alpha if old_rps > 0 else new_rps
+            _conn.execute(
+                "UPDATE watch_source_stats SET bytes_per_sec=?, rows_per_sec=?, samples=?, "
+                "updated_at=datetime('now','localtime') WHERE root_id=?",
+                (bps, rps, samples, root_id),
+            )
+        else:
+            _conn.execute(
+                "INSERT INTO watch_source_stats(root_id, bytes_per_sec, rows_per_sec, samples) "
+                "VALUES (?,?,?,1)",
+                (root_id, new_bps, new_rps),
+            )
+        _conn.commit()
+
+
+def reset_watch_on_startup() -> int:
+    """watch worker 启动时把上次中断的 running 复位为 pending（断点续跑）。"""
+    _ensure_watch_tables()
+    if not _ready():
+        return 0
+    with _lock:
+        cur = _conn.execute(
+            "UPDATE watch_queue SET status='pending', started_at=NULL "
+            "WHERE status='running'"
+        )
+        _conn.commit()
+    return cur.rowcount
+
+
+def watch_queue_current() -> List[dict]:
+    """当前正在处理的叶子列表（status=running），供看板「当前处理中」展示。"""
+    _ensure_watch_tables()
+    if not _ready():
+        return []
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM watch_queue WHERE status='running' ORDER BY started_at"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def watch_queue_recent(limit: int = 200, status: str = "", q: str = "") -> List[dict]:
+    """最近的任务列表（按 id 倒序），供看板「最近同步任务」展示与前端筛选。
+
+    status 为空表示不按状态过滤；q 对 dir_key 做 LIKE 模糊匹配。
+    全部走索引/带 LIMIT —— watch_queue 从不 prune，必须限制返回行数。
+    """
+    _ensure_watch_tables()
+    if not _ready():
+        return []
+    limit = max(1, min(int(limit or 200), 1000))
+    sql = ("SELECT id, root_id, dir_key, priority, reason, status, idx_size, offset_at,"
+           " bytes_done, created_at, started_at, finished_at, took_ms, error"
+           " FROM watch_queue")
+    where, args = [], []
+    if status:
+        where.append("status = ?")
+        args.append(status)
+    if q:
+        where.append("dir_key LIKE ?")
+        args.append(f"%{q}%")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    with _lock:
+        rows = _conn.execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def watch_throughput_buckets(minutes: int = 60, bucket_sec: int = 300) -> List[dict]:
+    """吞吐趋势：把最近 N 分钟完成的任务按 bucket_sec 分桶，空桶补 0。
+
+    返回等长序列 [{t, done, failed, bytes}]，t 为桶起始 epoch 秒。
+    只统计终态（done/failed）—— finished_at 只有这两种状态才有值。
+    """
+    _ensure_watch_tables()
+    minutes = max(1, min(int(minutes or 60), 24 * 60))
+    bucket_sec = max(60, min(int(bucket_sec or 300), 3600))
+    now = int(time.time())
+    # 桶边界对齐，保证最后一桶是「当前」桶
+    start = (now // bucket_sec) * bucket_sec - (minutes * 60 // bucket_sec) * bucket_sec
+    n_buckets = max(1, (now - start) // bucket_sec + 1)
+    out = [{"t": start + i * bucket_sec, "done": 0, "failed": 0, "bytes": 0}
+           for i in range(n_buckets)]
+    if not _ready():
+        return out
+    # finished_at 由 datetime('now','localtime') 写入，是本地时间字符串。
+    # strftime('%s', x) 默认按 UTC 解析，会偏出时区差（东八区即 8 小时），
+    # 必须加 'utc' 修饰符把它当本地时间换算回 epoch。
+    _ts = "CAST(strftime('%s', finished_at, 'utc') AS INTEGER)"
+    with _lock:
+        rows = _conn.execute(
+            "SELECT " + _ts + " AS ts, status, bytes_done"
+            " FROM watch_queue"
+            " WHERE status IN ('done','failed') AND finished_at IS NOT NULL"
+            "   AND " + _ts + " >= ?",
+            (start,),
+        ).fetchall()
+    for r in rows:
+        ts = r["ts"]
+        if ts is None:
+            continue
+        idx = (int(ts) - start) // bucket_sec
+        if 0 <= idx < len(out):
+            b = out[idx]
+            b["done" if r["status"] == "done" else "failed"] += 1
+            b["bytes"] += int(r["bytes_done"] or 0)
+    return out
+
+
+def watch_leaf_backlog() -> dict:
+    """按 root 汇总 leaf_status：{root_id: {total, built, pending, building, error}}。
+
+    一次 GROUP BY 拿全，避免前端为每个源循环调 count_summary。
+    """
+    if not _ready():
+        return {}
+    with _lock:
+        rows = _conn.execute("""
+            SELECT root_id,
+                COUNT(*)                            AS total,
+                COALESCE(SUM(built), 0)             AS built,
+                COALESCE(SUM(state = 'pending'), 0) AS pending,
+                COALESCE(SUM(state = 'building'), 0) AS building,
+                COALESCE(SUM(state = 'error'), 0)   AS error
+            FROM leaf_status GROUP BY root_id
+        """).fetchall()
+    return {r["root_id"]: {k: (r[k] or 0)
+                           for k in ("total", "built", "pending", "building", "error")}
+            for r in rows}

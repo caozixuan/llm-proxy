@@ -19,6 +19,34 @@ from utils.message_common import build_chain_key, compute_q1_hash, get_first_use
 
 _COUNTS_TTL = 2.0  # 秒；/metrics/index-stats 轮询频率远低于此，足够
 
+# ---------------------------------------------------------------------------
+# 写入通知：index.jsonl 追加成功后回调，供 new-api 增量索引（见
+# utils/newapi_watcher）在秒级内把新行折叠进 index.db，而不是等小时级回填。
+# 回调在 append_index_*_async 的线程池线程里执行，不阻塞事件循环；异常一律吞掉，
+# 绝不能让「索引通知失败」影响请求响应或记录落盘。
+# ---------------------------------------------------------------------------
+_index_hooks = []
+_hooks_guard = threading.Lock()
+
+
+def register_index_hook(fn) -> None:
+    with _hooks_guard:
+        if fn not in _index_hooks:
+            _index_hooks.append(fn)
+
+
+def _fire_index_hooks(index_file: str, entry: dict) -> None:
+    if not _index_hooks:
+        return
+    with _hooks_guard:
+        hooks = list(_index_hooks)
+    for fn in hooks:
+        try:
+            fn(index_file, entry)
+        except Exception:  # noqa: BLE001 — 通知失败不影响写入
+            import logging
+            logging.debug("index hook 失败", exc_info=True)
+
 _agg_lock = threading.Lock()
 _agg_path: str = ""
 _agg_offset: int = 0
@@ -235,6 +263,7 @@ def append_index(ts: str, req_file: str, provider: str, logs_dir: str, model: st
     _total_count += total_attempts
     if success:
         _valid_count += 1
+    _fire_index_hooks(index_file, entry)
 
 
 def append_index_anthropic(ts, req_path, total_attempts, valid, logs_dir, model="", tok_in=0, tok_out=0, cache_in=0, api_key="", messages=None, channel_key="", usage=None, debug_file="", timing=None):

@@ -1164,7 +1164,7 @@ async function loadFileList(refresh = false) {
         const useStream = _exportViewMode && !hasFilter;
         try {
             if (useStream && offset === 0) {
-                await _loadAggStream(min, params);
+                await _loadAggStream(min, params, refresh);
                 return;
             }
             const res = await fetch(`${_apiPrefix()}/aggregate${params}`);
@@ -1276,11 +1276,14 @@ function _appendAggItem(chain, globalIdx) {
 // poll() 一次。收到的新条目**只进内存 aggChains**，DOM 只渲染前 PAGE_SIZE(50) 条，
 // 其余靠滚动 loadMore 从内存分页补出来（前端不把数万条全塞进 DOM）。mtime 新的叶子
 // 在前，所以最新对话秒显。轮询期间在状态栏展示收集进度（叶子 x/y、已收集 N 条）。
-async function _loadAggStream(min, params) {
+async function _loadAggStream(min, params, refresh) {
     // start 带上 model，让后台只收集该模型的会话（否则会收集全部模型，量级差很多）。
     const _model = document.getElementById('filterModel').value;
     const modelParam = _model ? `&model=${encodeURIComponent(_model)}` : '';
-    const startUrl = `${_apiPrefix()}/aggregate/stream/start?min_messages=${min}${modelParam}${_sharedParams()}`;
+    // refresh=1 让后端跳过 900s 的聚合结果缓存。用户点「刷新列表」时必须带上，
+    // 否则会拿到旧快照——之前的实现把 refresh 丢在这里，按钮等于没用。
+    const refreshParam = refresh ? '&refresh=1' : '';
+    const startUrl = `${_apiPrefix()}/aggregate/stream/start?min_messages=${min}${modelParam}${refreshParam}${_sharedParams()}`;
     const startRes = await fetch(startUrl);
     if (!startRes.ok) throw new Error(`HTTP ${startRes.status}`);
     const { task_id } = await startRes.json();

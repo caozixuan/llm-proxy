@@ -809,6 +809,12 @@ else:
 # 单 worker 下也无害（只是多写一份 {pid}.json 心跳文件）。
 inflight.enable_cross_process(SERVICE_LOG_DIR)
 
+# new-api 叶子的实时增量索引已剥离为独立进程 src/watch/worker.py：
+# 每源一个发现线程（只 stat index.jsonl）+ 8 线程同步池（ingest→enrich→sync_sessions）。
+# app 进程不再内嵌 watcher：内嵌方案会与大叶子首建抢锁、把专职回填 worker 饿死，
+# 且单线程啃 10w 行级叶子会堵住后续所有叶子。
+# 启动：`./app watch start`（`./app start` 会一并拉起）。
+
 
 def _sanitize_messages(messages: Any) -> Any:
     """

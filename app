@@ -1408,6 +1408,8 @@ _WORKER_SPECS = {
     "export": WorkerSpec("export", "utils.export_worker", "export_services",
                          instances_env="EXPORT_CONCURRENCY"),
     "backfill": WorkerSpec("backfill", "src.backfill.worker", "backfill_services"),
+    # new-api 实时索引：每源发现线程 + 8 线程同步池，独立进程跑。
+    "watch": WorkerSpec("watch", "src.watch.worker", "watch_services"),
 }
 
 
@@ -1648,13 +1650,31 @@ def cmd_backfill_worker(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_watch_worker(args: argparse.Namespace) -> int:
+    """new-api 实时索引 worker（每源发现线程 + 同步池）。"""
+    spec = _WORKER_SPECS["watch"]
+    action = args.watch_action
+    if action == "start":
+        return _worker_start(spec, args)
+    if action == "stop":
+        return _worker_stop(spec, args)
+    if action == "logs":
+        return _worker_logs(spec, args)
+    if action == "status":
+        return _print_worker_services(spec, load_state())
+    if action == "list":
+        return _print_worker_services(spec, load_state())
+    return 1
+
+
 def _start_all_workers(args: argparse.Namespace) -> None:
-    """随 app 一起拉起导出 / 回填两个独立 worker（各自幂等：已在跑则跳过）。
+    """随 app 一起拉起导出 / 回填 / 实时索引三个独立 worker（各自幂等：已在跑则跳过）。
 
     执行已从 app 进程剥离到独立进程，若不随 app 启动，导出会一直停在 queued、
-    回填停在 pending。默认随 `app start` 启动，`--no-workers` 可关闭。
+    回填停在 pending、new-api 叶子不再实时同步。默认随 `app start` 启动，
+    `--no-workers` 可关闭。
     """
-    for name in ("export", "backfill"):
+    for name in ("export", "backfill", "watch"):
         try:
             _worker_start(_WORKER_SPECS[name], args)
         except Exception as e:
@@ -1809,9 +1829,10 @@ def build_parser() -> argparse.ArgumentParser:
     ps_config.add_argument("config_file", nargs="?", help="YAML config file path, e.g. settings/obs_base.yaml")
     ps_config.set_defaults(func=cmd_sync_config)
 
-    # --- export / backfill worker subcommands（独立进程，仿 sync 守护模式）---
+    # --- export / backfill / watch worker subcommands（独立进程，仿 sync 守护模式）---
     _add_worker_subparser(subparsers, "export", "export_action", cmd_export_worker)
     _add_worker_subparser(subparsers, "backfill", "backfill_action", cmd_backfill_worker)
+    _add_worker_subparser(subparsers, "watch", "watch_action", cmd_watch_worker)
 
     # --- key subcommands ---
     p_key = subparsers.add_parser("key", help="API key management (list/add/del/stop/start/config)")

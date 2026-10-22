@@ -849,7 +849,12 @@ def _export_key_leaves(roots, env_dir: str, api_key: str) -> List[str]:
             mts = sorted(row.get("mtime_cells", {}).keys(), reverse=True)
             break
     if not mts:
-        return []
+        # 新 key（第一条会话刚写入）尚未进入 stats_index 的 rows —— 不能返回 []，
+        # 否则这个 key 在内存索引 TTL（600s）到期前永远是空白页。
+        # 回落到全量叶子枚举：慢，但只对「索引里还没有的 key」发生，且保证正确性。
+        logging.getLogger("export-view").info(
+            "_export_key_leaves: key 未命中 stats 索引，回落全量枚举（%s）", (api_key or "")[:8])
+        return _export_view_leaves(roots, env_dir)
     try:
         from utils.export_routes import _resolve_mt_for
     except Exception:  # noqa: BLE001
@@ -1083,6 +1088,23 @@ def _agg_cache_put(api_key: str, model: str, min_messages: int, entry: Dict[str,
     entry["_ts"] = time.time()
     with _AGG_CACHE_LOCK:
         _AGG_CACHE[ck] = entry
+
+
+def invalidate_agg_cache(leaf_dir: str = "") -> int:
+    """写入新数据后失效导出浏览的聚合结果缓存（_AGG_CACHE）。
+
+    该缓存按 (api_key, model, min_messages) 保存「收集完成的全量 items」，TTL 900s。
+    它的 key 里不含叶子，所以无法精确失效——新数据可能落入任意 key 的视图，
+    只能整表清空。代价可接受：清空后下一次打开重新收集一次（后台流式，前端不阻塞）。
+
+    由 utils/newapi_watcher 在叶子同步完成后调用。返回清掉的条目数。
+    """
+    with _AGG_CACHE_LOCK:
+        n = len(_AGG_CACHE)
+        _AGG_CACHE.clear()
+    if n:
+        _export_view_logger.info("聚合缓存已失效 %d 项（叶子有新数据：%s）", n, leaf_dir)
+    return n
 
 
 def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 1,

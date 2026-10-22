@@ -12,7 +12,9 @@ utils/logs_routes.py — 日志管理页面路由
 统计/预览会自动合并这些路径。
 """
 
+import logging
 import os
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -33,6 +35,17 @@ def _require_ajax(request: Request):
     if request.headers.get("x-requested-with", "").lower() != "xmlhttprequest":
         return JSONResponse({"detail": "Forbidden"}, status_code=403)
     return None
+
+
+def _source_name_map(lds) -> dict:
+    """root_id -> 显示名。无 name 时退回路径末段，再退回 root_id 前 8 位。"""
+    try:
+        srcs = lds.list_sources()
+    except Exception:  # noqa: BLE001
+        srcs = []
+    return {s.get("root_id"): (s.get("name") or os.path.basename(
+        (s.get("root_path") or "").rstrip("/")) or (s.get("root_id") or "")[:8])
+        for s in srcs}
 
 
 def _is_admin(request: Request) -> bool:
@@ -131,6 +144,12 @@ def register_logs_routes(app: FastAPI, templates: Jinja2Templates, active_env_di
     @app.get("/logs-admin")
     def logs_admin_page(request: Request):
         return templates.TemplateResponse(request, "logs_admin.html", context=_ctx(request))
+
+    @app.get("/watch")
+    def watch_page(request: Request):
+        """旧入口：实时索引看板已并入「数据管理 · 同步看板」，跳转保留书签。"""
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/logs-admin#sync", status_code=303)
 
     @app.get("/api/logs-admin/list")
     def logs_admin_list(request: Request, with_size: bool = False):
@@ -479,3 +498,171 @@ def register_logs_routes(app: FastAPI, templates: Jinja2Templates, active_env_di
         from utils.newapi_backfill import read_backfill_log
         res = read_backfill_log(root_filter=path, limit=limit)
         return JSONResponse(res)
+
+    @app.get("/api/watch/status")
+    def watch_status(request: Request):
+        """new-api 实时索引看板：队列长度、各源进度、按来源吞吐率估算的 ETA。
+
+        数据全部来自 log_dir.db 的 watch_queue / watch_source_stats 两表，
+        worker 进程只写不同读——本接口不碰 NFS，恒定亚毫秒。
+        """
+        denied = _require_ajax(request)
+        if denied:
+            return denied
+        import utils.logdir_store as lds
+        from utils.logs_config import get_root_id  # noqa: F401  (保持与其它路由同依赖)
+
+        try:
+            stats = lds.watch_queue_stats()
+        except Exception as ex:  # noqa: BLE001
+            logging.getLogger("watch").warning("watch_queue_stats 失败: %s", ex)
+            stats = {"totals": {}, "sources": []}
+
+        # 给每个源补上显示名（sources.name），并按名字排序
+        name_by_rid = _source_name_map(lds)
+        for src in stats.get("sources", []):
+            rid = src.get("root_id") or ""
+            src["name"] = name_by_rid.get(rid) or (
+                os.path.basename((src.get("root_path") or "").rstrip("/")) or rid[:8])
+        stats["sources"].sort(key=lambda s: (s.get("pending") or 0), reverse=True)
+
+        # 当前处理中的叶子 + 已用时长
+        try:
+            running = lds.watch_queue_current()
+        except Exception:  # noqa: BLE001
+            running = []
+        now = time.time()
+        current = []
+        for r in running:
+            started = r.get("started_at") or ""
+            elapsed = 0
+            if started:
+                try:
+                    elapsed = int(now - time.mktime(
+                        time.strptime(started, "%Y-%m-%d %H:%M:%S")))
+                except (ValueError, OverflowError):
+                    elapsed = 0
+            total = max(1, int(r.get("idx_size") or 0) - int(r.get("offset_at") or 0))
+            done = int(r.get("bytes_done") or 0)
+            current.append({
+                "leaf": f"{r.get('root_id', '')[:8]}/{r.get('dir_key') or ''}",
+                "leaf_path": r.get("leaf_path"),
+                "elapsed_sec": elapsed,
+                "percent": min(100, int(done * 100 / total)) if total else 0,
+            })
+
+        from utils.watch_state import worker_alive
+        alive, pid, uptime = worker_alive()
+        stats["running"] = alive
+        stats["pid"] = pid
+        stats["uptime_sec"] = uptime
+        stats["current"] = current
+        # 并发水位：size = 叶子间并发上限，busy = 当前真正在跑的任务数。
+        # 用户据此一眼看出「是否已达全量实时同步」。
+        try:
+            from utils.watch_config import CONCURRENCY as _watch_conc
+            pool_size = _watch_conc
+        except Exception:  # noqa: BLE001
+            pool_size = 8
+        stats["pool"] = {"size": pool_size,
+                         "busy": len(current),
+                         "pending": (stats.get("totals") or {}).get("pending", 0)}
+        return JSONResponse(stats)
+
+    @app.get("/api/logs-admin/overview")
+    def logs_admin_overview(request: Request, minutes: int = 60):
+        """「数据管理 · 同步看板」的只读聚合接口。
+
+        一次返回 KPI、流水线占比、来源积压、吞吐趋势、当前任务、最近任务，
+        全部读 log_dir.db（watch_queue / watch_source_stats / leaf_status / sources），
+        与 watch worker 只读不写，恒定亚毫秒。
+
+        minutes 控制吞吐趋势的时间窗口，默认 60 分钟。
+        """
+        denied = _require_ajax(request)
+        if denied:
+            return denied
+        import utils.logdir_store as lds
+
+        try:
+            stats = lds.watch_queue_stats()
+        except Exception as ex:  # noqa: BLE001
+            logging.getLogger("watch").warning("overview watch_queue_stats 失败: %s", ex)
+            stats = {"totals": {}, "sources": []}
+
+        name_by_rid = _source_name_map(lds)
+
+        try:
+            backlog = lds.watch_leaf_backlog()
+        except Exception:  # noqa: BLE001
+            backlog = {}
+
+        sources = []
+        for src in stats.get("sources", []):
+            rid = src.get("root_id") or ""
+            lb = backlog.get(rid, {})
+            src["name"] = name_by_rid.get(rid) or (
+                os.path.basename((src.get("root_path") or "").rstrip("/")) or rid[:8])
+            src["leaf_total"] = lb.get("total", 0)
+            src["leaf_built"] = lb.get("built", 0)
+            src["leaf_pending"] = lb.get("pending", 0)
+            src["leaf_error"] = lb.get("error", 0)
+            sources.append(src)
+        sources.sort(key=lambda s: (s.get("pending") or 0), reverse=True)
+
+        # 局部返回：当前处理中（复用 watch_status 的算法）
+        try:
+            running = lds.watch_queue_current()
+        except Exception:  # noqa: BLE001
+            running = []
+        now = time.time()
+        current = []
+        for r in running:
+            started = r.get("started_at") or ""
+            elapsed = 0
+            if started:
+                try:
+                    elapsed = int(now - time.mktime(
+                        time.strptime(started, "%Y-%m-%d %H:%M:%S")))
+                except (ValueError, OverflowError):
+                    elapsed = 0
+            total = max(1, int(r.get("idx_size") or 0) - int(r.get("offset_at") or 0))
+            done = int(r.get("bytes_done") or 0)
+            current.append({
+                "leaf": f"{r.get('root_id', '')[:8]}/{r.get('dir_key') or ''}",
+                "leaf_path": r.get("leaf_path"),
+                "elapsed_sec": elapsed,
+                "percent": min(100, int(done * 100 / total)) if total else 0,
+            })
+
+        try:
+            trend = lds.watch_throughput_buckets(minutes=minutes)
+        except Exception:  # noqa: BLE001
+            trend = []
+
+        try:
+            queue = lds.watch_queue_recent(limit=200)
+        except Exception:  # noqa: BLE001
+            queue = []
+        for q in queue:
+            total = max(1, int(q.get("idx_size") or 0) - int(q.get("offset_at") or 0))
+            q["percent"] = min(100, int(int(q.get("bytes_done") or 0) * 100 / total))
+            q["name"] = name_by_rid.get(q.get("root_id") or "") or ""
+
+        totals = dict(stats.get("totals") or {})
+        totals["leaves"] = sum(s.get("leaf_total", 0) for s in sources)
+        totals["built"] = sum(s.get("leaf_built", 0) for s in sources)
+
+        from utils.watch_state import worker_alive
+        alive, pid, uptime = worker_alive()
+
+        return JSONResponse({
+            "worker": {"running": alive, "pid": pid, "uptime_sec": uptime},
+            "totals": totals,
+            "sources": sources,
+            "trend": trend,
+            "current": current,
+            "queue": queue,
+            "window_minutes": minutes,
+        })
+

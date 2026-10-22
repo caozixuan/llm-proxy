@@ -56,11 +56,358 @@
 .dropdown-menu button.danger { color: #dc2626; }
 .dropdown-menu button.danger:hover { background: color-mix(in srgb, #ef4444 10%, transparent); }
 .dropdown-menu .divider { height: 1px; background: var(--border); margin: 4px 2px; }
+
+/* ===== Tab 外壳 ===== */
+.tabbar { display: flex; align-items: center; gap: 4px; margin-bottom: 18px;
+    border-bottom: 1px solid var(--border); padding-bottom: 0; flex-wrap: wrap; }
+.tabbar button { background: none; border: none; border-bottom: 2px solid transparent;
+    padding: 9px 14px; font-size: .88rem; font-weight: 600; color: var(--muted-foreground);
+    cursor: pointer; border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    transition: color var(--transition), background var(--transition); }
+.tabbar button:hover { color: var(--foreground); background: var(--muted); }
+.tabbar button.active { color: var(--primary); border-bottom-color: var(--primary); }
+.tab-status { margin-left: auto; font-size: .78rem; color: var(--muted-foreground);
+    display: flex; align-items: center; gap: 6px; padding-bottom: 8px; }
+.tab-status .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted-foreground); }
+.tab-status .dot.on { background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 18%, transparent); }
+.tab-status .dot.off { background: var(--destructive); }
+
+/* ===== KPI 行 ===== */
+.kpi-row { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+.kpi { background: var(--card); border: 1px solid var(--card-border); border-radius: var(--radius-lg);
+    padding: 15px 16px; box-shadow: var(--shadow-sm); min-width: 0; }
+.kpi-label { font-size: .76rem; color: var(--muted-foreground); }
+.kpi-value { font-size: 1.62rem; font-weight: 700; letter-spacing: -.5px; margin-top: 6px;
+    color: var(--foreground); line-height: 1.15; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+.kpi-hint { font-size: .72rem; color: var(--muted-foreground); margin-top: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 看板内的表格允许横向滚动，避免窄屏撑破布局 */
+.panel .data-table { table-layout: auto; }
+.dash-scroll { overflow-x: auto; }
+
+/* ===== 流水线 ===== */
+.pipeline { display: flex; align-items: stretch; gap: 0; margin: 4px 0 14px; }
+.pipe-box { flex: 1; min-width: 0; background: var(--muted); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 10px 12px; }
+.pipe-box .n { font-size: .68rem; font-family: var(--font-mono); color: var(--muted-foreground); }
+.pipe-box .t { font-size: .82rem; font-weight: 600; margin-top: 3px; color: var(--foreground); }
+.pipe-box .v { font-size: .74rem; color: var(--muted-foreground); margin-top: 3px; }
+.pipe-arrow { display: flex; align-items: center; justify-content: center; width: 26px;
+    color: var(--muted-foreground); font-size: .85rem; flex-shrink: 0; }
+.stacked { display: flex; height: 9px; border-radius: 5px; overflow: hidden; background: var(--muted); }
+.stacked > i { display: block; height: 100%; transition: width .3s ease; }
+.stacked > i.ok { background: var(--success); }
+.stacked > i.run { background: var(--primary); }
+.stacked > i.wait { background: var(--warning); }
+.stacked > i.err { background: var(--destructive); }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 9px; font-size: .75rem;
+    color: var(--muted-foreground); }
+.legend span { display: flex; align-items: center; gap: 5px; }
+.legend i { width: 8px; height: 8px; border-radius: 2px; display: block; }
+
+/* ===== 两栏 ===== */
+.cols2 { display: grid; grid-template-columns: 1.25fr 1fr; gap: 16px; margin-bottom: 18px; }
+.cols2 > .panel { margin-bottom: 0; }
+.backlog-row { display: flex; align-items: center; gap: 10px; font-size: .78rem; margin-bottom: 9px; }
+.backlog-row .nm { width: 118px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--foreground); }
+.backlog-row .trk { flex: 1; height: 7px; border-radius: 4px; background: var(--muted); overflow: hidden; }
+.backlog-row .trk > i { display: block; height: 100%; border-radius: 4px;
+    background: linear-gradient(90deg, var(--warning), color-mix(in srgb, var(--warning) 55%, #fff)); }
+.backlog-row .num { width: 52px; text-align: right; color: var(--muted-foreground);
+    font-family: var(--font-mono); }
+/* 处理中区块：固定高度，任务在 0↔N 之间变化时页面高度不变（超出滚动） */
+.cur-slot { height: 96px; overflow-y: auto;
+    padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px dashed var(--border); }
+.cur-slot::-webkit-scrollbar { width: 6px; }
+.cur-slot::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+/* 吞吐趋势：纯 CSS 柱状，跟随主题 */
+.trend { display: flex; align-items: flex-end; gap: 4px; height: 132px; padding-top: 8px;
+    border-bottom: 1px solid var(--border); }
+.trend > div { flex: 1; min-width: 3px; border-radius: 3px 3px 0 0; min-height: 2px;
+    background: linear-gradient(180deg, var(--primary),
+        color-mix(in srgb, var(--primary) 30%, transparent)); transition: height .3s ease; }
+.trend > div.err { background: linear-gradient(180deg, var(--destructive),
+        color-mix(in srgb, var(--destructive) 30%, transparent)); }
+.trend-axis { display: flex; justify-content: space-between; font-size: .7rem;
+    color: var(--muted-foreground); margin-top: 6px; }
+.rate-big { font-size: 1.5rem; font-weight: 700; letter-spacing: -.5px; }
+.rate-unit { font-size: .72rem; color: var(--muted-foreground); margin-left: 4px; }
+
+/* 只读列表的空态 / 进度条 */
+.inline-progress { width: 76px; height: 6px; border-radius: 3px; background: var(--muted);
+    overflow: hidden; display: inline-block; vertical-align: middle; }
+.inline-progress > i { display: block; height: 100%; background: var(--primary); }
+.mono-sm { font-family: var(--font-mono); font-size: .74rem; color: var(--muted-foreground); }
+.badge-warn { background: color-mix(in srgb, #f59e0b 18%, transparent); color: #b45309; }
+
+@media (max-width: 1100px) {
+    .kpi-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .cols2 { grid-template-columns: 1fr; }
+    .pipeline { flex-wrap: wrap; }
+    .pipe-arrow { display: none; }
+    .pipe-box { flex: 1 1 44%; margin: 3px; }
+}
+@media (max-width: 750px) {
+    .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .pipe-box { flex: 1 1 100%; }
+}
 {% endblock %}
 
 {% block content %}
 {% raw %}
 <div id="app">
+    <div class="page-header">
+        <h1>数据管理</h1>
+        <p class="page-subtitle">new-api 叶子 index.db 的实时增量同步与来源配置</p>
+    </div>
+
+    <div class="tabbar">
+        <button :class="{active: tab === 'sync'}" @click="setTab('sync')">同步看板</button>
+        <button :class="{active: tab === 'sources'}" @click="setTab('sources')">来源与路径</button>
+        <span class="tab-status">
+            <span class="dot" :class="ov.worker.running ? 'on' : 'off'"></span>
+            {{ ov.worker.running ? ('同步运行中 · pid ' + ov.worker.pid) : 'worker 未运行' }}
+        </span>
+    </div>
+
+    <!-- ===================== Tab 1：同步看板 ===================== -->
+    <div v-show="tab === 'sync'">
+        <!-- KPI 行 -->
+        <div class="kpi-row">
+            <div class="kpi">
+                <div class="kpi-label">来源 Watcher</div>
+                <div class="kpi-value">{{ watcherCount }}</div>
+                <div class="kpi-hint">{{ ov.worker.running ? ('运行 ' + fmtUptime(ov.worker.uptime_sec)) : '未运行' }}</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">累计发现目录</div>
+                <div class="kpi-value">{{ fmtNum(ov.totals.leaves) }}</div>
+                <div class="kpi-hint">log_dir.db 已登记叶子</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">等待同步</div>
+                <div class="kpi-value">{{ fmtNum(ov.totals.pending) }}</div>
+                <div class="kpi-hint">剩余 {{ fmtBytes(ov.totals.remaining_bytes) }}</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">写入成功</div>
+                <div class="kpi-value">{{ fmtNum(ov.totals.done) }}</div>
+                <div class="kpi-hint">已建叶子 {{ fmtNum(ov.totals.built) }}</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">预计队列清空</div>
+                <div class="kpi-value">{{ fmtEta(ov.totals.eta_sec) }}</div>
+                <div class="kpi-hint">按来源历史吞吐估算</div>
+            </div>
+        </div>
+
+        <!-- 流水线 -->
+        <div class="panel">
+            <div class="toolbar" style="margin-bottom:10px;">
+                <h6 style="margin:0;">索引同步流水线</h6>
+            </div>
+            <div class="pipeline">
+                <div class="pipe-box">
+                    <div class="n">01</div>
+                    <div class="t">发现登记</div>
+                    <div class="v">每源 stat 轮询</div>
+                </div>
+                <div class="pipe-arrow">→</div>
+                <div class="pipe-box">
+                    <div class="n">02</div>
+                    <div class="t">待同步队列</div>
+                    <div class="v">{{ fmtNum(ov.totals.pending) }} 个等待</div>
+                </div>
+                <div class="pipe-arrow">→</div>
+                <div class="pipe-box">
+                    <div class="n">03</div>
+                    <div class="t">同步池</div>
+                    <div class="v">{{ fmtNum(ov.totals.running) }} 个处理中</div>
+                </div>
+                <div class="pipe-arrow">→</div>
+                <div class="pipe-box">
+                    <div class="n">04</div>
+                    <div class="t">index.db 写入</div>
+                    <div class="v">{{ fmtNum(ov.totals.done) }} 个已完成</div>
+                </div>
+            </div>
+            <div class="stacked">
+                <i class="ok" :style="{width: pipePct.done + '%'}"></i>
+                <i class="run" :style="{width: pipePct.run + '%'}"></i>
+                <i class="wait" :style="{width: pipePct.wait + '%'}"></i>
+                <i class="err" :style="{width: pipePct.err + '%'}"></i>
+            </div>
+            <div class="legend">
+                <span><i style="background:var(--success)"></i>成功 {{ fmtNum(ov.totals.done) }}</span>
+                <span><i style="background:var(--primary)"></i>运行中 {{ fmtNum(ov.totals.running) }}</span>
+                <span><i style="background:var(--warning)"></i>排队中 {{ fmtNum(ov.totals.pending) }}</span>
+                <span><i style="background:var(--destructive)"></i>失败 {{ fmtNum(ov.totals.failed) }}</span>
+            </div>
+        </div>
+
+        <!-- 两栏：来源积压 + 吞吐趋势 -->
+        <div class="cols2">
+            <div class="panel">
+                <div class="toolbar" style="margin-bottom:14px;">
+                    <h6 style="margin:0;">来源待处理积压</h6>
+                    <span class="muted" style="font-size:.74rem; margin-left:auto;">处理中 {{ ov.current.length }}</span>
+                </div>
+                <div class="cur-slot">
+                    <div v-for="c in ov.current" :key="c.leaf_path" class="backlog-row">
+                        <span class="nm" style="width:130px;" :title="c.leaf_path">{{ c.leaf }}</span>
+                        <span class="trk">
+                            <i style="background:linear-gradient(90deg, var(--primary), color-mix(in srgb, var(--primary) 45%, #fff)); width:0;"
+                               :style="{width: c.percent + '%'}"></i>
+                        </span>
+                        <span class="num">{{ fmtEta(c.elapsed_sec) }}</span>
+                    </div>
+                    <div v-if="ov.current.length === 0" class="backlog-row" style="color:var(--muted-foreground);">
+                        <span class="nm" style="width:130px;">—</span>
+                        <span class="trk"><i style="width:0"></i></span>
+                        <span class="num">空闲</span>
+                    </div>
+                </div>
+                <div v-if="ov.sources.length === 0"
+                     class="hint" style="margin:0;">暂无来源</div>
+                <div v-for="s in ov.sources" :key="s.root_id" class="backlog-row"
+                     :style="(s.pending || 0) === 0 ? 'opacity:.45' : ''">
+                    <span class="nm" :title="s.root_path">{{ s.name }}</span>
+                    <span class="trk"><i :style="{width: backlogPct(s) + '%'}"></i></span>
+                    <span class="num">{{ fmtNum(s.pending) }}</span>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="toolbar" style="margin-bottom:8px; align-items:baseline;">
+                    <h6 style="margin:0;">索引处理吞吐趋势</h6>
+                    <span class="muted" style="font-size:.72rem;">最近 {{ ov.window_minutes || 60 }} 分钟 · {{ bucketMinutes }} 分钟/柱</span>
+                </div>
+                <div style="margin:2px 0 10px;">
+                    <span class="rate-big">{{ trendRate }}</span>
+                    <span class="rate-unit">个/分钟</span>
+                </div>
+                <div class="trend">
+                    <div v-for="(b, i) in ov.trend" :key="i"
+                         :class="{err: b.failed > 0 && b.done === 0}"
+                         :style="{height: trendHeight(b) + '%'}"
+                         :title="trendTip(b)"></div>
+                </div>
+                <div class="trend-axis">
+                    <span>{{ axisLabel('start') }}</span>
+                    <span>{{ axisLabel('mid') }}</span>
+                    <span>当前</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 来源运行概览 -->
+        <div class="panel">
+            <div class="toolbar" style="margin-bottom:12px;">
+                <h6 style="margin:0;">来源运行概览</h6>
+                <span class="muted" style="font-size:.76rem;">{{ ov.sources.length }} 个来源</span>
+            </div>
+            <div class="dash-scroll">
+            <table class="data-table">
+                <thead>
+                <tr>
+                    <th>Watcher 来源</th>
+                    <th>状态</th>
+                    <th>已发现目录</th>
+                    <th>等待索引</th>
+                    <th>写入成功</th>
+                    <th>处理速度</th>
+                    <th>来源 ETA</th>
+                    <th>操作</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr v-for="s in ov.sources" :key="s.root_id">
+                    <td>
+                        <div style="font-weight:600;">{{ s.name }}</div>
+                        <div class="mono-sm" :title="s.root_path">{{ s.root_path }}</div>
+                    </td>
+                    <td>
+                        <span class="badge" :class="s.running > 0 ? 'badge-active' : (ov.worker.running ? 'badge-fmt' : 'badge-missing')">
+                            {{ s.running > 0 ? '同步中' : (ov.worker.running ? '空闲' : '已停止') }}
+                        </span>
+                    </td>
+                    <td>{{ fmtNum(s.leaf_total) }}</td>
+                    <td>
+                        <span :class="s.pending > 0 ? 'msg-err' : ''">{{ fmtNum(s.pending) }}</span>
+                    </td>
+                    <td>{{ fmtNum(s.leaf_built) }}<span class="mono-sm"> / {{ fmtNum(s.leaf_total) }}</span></td>
+                    <td>{{ s.bytes_per_sec ? fmtBytes(s.bytes_per_sec) + '/s' : '—' }}</td>
+                    <td>{{ fmtEta(s.eta_sec) }}</td>
+                    <td>
+                        <button class="btn btn-outline btn-sm" @click="gotoSource(s)">查看详情 →</button>
+                    </td>
+                </tr>
+                <tr v-if="ov.sources.length === 0">
+                    <td colspan="8" style="text-align:center; color:var(--muted-foreground); padding:24px;">暂无来源</td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+        </div>
+
+        <!-- 最近同步任务 -->
+        <div class="panel">
+            <div class="toolbar" style="margin-bottom:12px;">
+                <h6 style="margin:0;">最近同步任务</h6>
+                <input class="input input-sm" style="max-width:200px;" v-model="qSearch"
+                       placeholder="搜索目录…">
+                <select class="input input-sm" style="max-width:130px;" v-model="qStatus">
+                    <option value="">全部状态</option>
+                    <option value="pending">排队中</option>
+                    <option value="running">运行中</option>
+                    <option value="done">已完成</option>
+                    <option value="failed">失败</option>
+                </select>
+                <span class="muted" style="font-size:.76rem;">{{ filteredQueue.length }} 条</span>
+            </div>
+            <div class="dash-scroll">
+            <table class="data-table">
+                <thead>
+                <tr>
+                    <th>任务 ID</th>
+                    <th>来源</th>
+                    <th>目录</th>
+                    <th>状态</th>
+                    <th>进度</th>
+                    <th>耗时</th>
+                    <th>结束</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr v-for="q in filteredQueue.slice(0, 20)" :key="q.id">
+                    <td class="mono-sm">{{ q.id }}</td>
+                    <td>{{ q.name || '—' }}</td>
+                    <td class="mono-sm" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                        :title="q.dir_key">{{ q.dir_key }}</td>
+                    <td>
+                        <span class="badge" :class="queueBadge(q.status)">{{ queueLabel(q.status) }}</span>
+                    </td>
+                    <td>
+                        <span class="inline-progress"><i :style="{width: q.percent + '%'}"></i></span>
+                        <span class="mono-sm" style="margin-left:6px;">{{ q.percent }}%</span>
+                    </td>
+                    <td>{{ q.took_ms ? (q.took_ms + ' ms') : '—' }}</td>
+                    <td class="mono-sm">{{ q.finished_at || '—' }}</td>
+                </tr>
+                <tr v-if="filteredQueue.length === 0">
+                    <td colspan="7" style="text-align:center; color:var(--muted-foreground); padding:24px;">暂无任务</td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===================== Tab 2：来源与路径 ===================== -->
+    <div v-show="tab === 'sources'">
     <div class="panel">
         <h6>新增日志路径</h6>
         <div class="hint">
@@ -319,6 +666,7 @@
             <div v-else style="color:#999; font-size:.82rem;">暂无该源的构建记录（点「增量构建」后会产生）。</div>
         </div>
     </div>
+    </div><!-- /tab sources -->
 </div>
 {% endraw %}
 {% endblock %}
@@ -328,6 +676,20 @@
 new Vue({
     el: '#app',
     data: {
+        // 看板 Tab（只读，轮询 /api/logs-admin/overview）
+        tab: 'sync',
+        ov: {
+            worker: { running: false, pid: 0, uptime_sec: 0 },
+            totals: {},
+            sources: [],
+            trend: [],
+            current: [],
+            queue: [],
+            window_minutes: 60,
+        },
+        qSearch: '',
+        qStatus: '',
+        _ovTimer: null,
         rows: [],
         newPath: '',
         newName: '',
@@ -364,9 +726,152 @@ new Vue({
             // 抽屉里显示「当前同步的源」信息（名称/root_id）——从 rows 里找出该 path 的行
             if (!this.logDrawerPath) return null;
             return this._rowOf(this.logDrawerPath);
-        }
+        },
+        watcherCount: function() {
+            // 有任务的源数（即真正跑着发现线程的 newapi 源）
+            return (this.ov.sources || []).length;
+        },
+        pipePct: function() {
+            var t = this.ov.totals || {};
+            var done = t.done || 0, run = t.running || 0, wait = t.pending || 0, err = t.failed || 0;
+            var sum = done + run + wait + err;
+            if (!sum) return { done: 0, run: 0, wait: 0, err: 0 };
+            return {
+                done: done * 100 / sum,
+                run: run * 100 / sum,
+                wait: wait * 100 / sum,
+                err: err * 100 / sum,
+            };
+        },
+        bucketMinutes: function() {
+            // 后端把窗口切成约 12 个桶；这里按窗口长度反推每柱代表的分钟数
+            var t = this.ov.trend || [];
+            var mins = this.ov.window_minutes || 60;
+            return t.length > 1 ? Math.max(1, Math.round(mins / t.length)) : mins;
+        },
+        trendRate: function() {
+            // 窗口内已完成任务的平均速率（个/分钟）
+            var t = this.ov.trend || [];
+            var n = t.reduce(function(a, b) { return a + (b.done || 0); }, 0);
+            var mins = this.ov.window_minutes || 60;
+            return mins > 0 ? (n / mins).toFixed(1) : '0.0';
+        },
+        filteredQueue: function() {
+            // 纯前端筛选：状态精确匹配 + 目录模糊匹配
+            var q = (this.qSearch || '').trim().toLowerCase();
+            var st = this.qStatus;
+            return (this.ov.queue || []).filter(function(x) {
+                if (st && x.status !== st) return false;
+                if (q && (x.dir_key || '').toLowerCase().indexOf(q) === -1) return false;
+                return true;
+            });
+        },
     },
     methods: {
+        // ===== 看板 Tab =====
+        fmtNum: function(n) {
+            if (n === null || n === undefined) return '0';
+            return Number(n).toLocaleString('en-US');
+        },
+        fmtBytes: function(n) {
+            n = Number(n) || 0;
+            if (!n) return '0 B';
+            var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+            while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+            return n.toFixed(1) + ' ' + u[i];
+        },
+        fmtEta: function(sec) {
+            if (sec === null || sec === undefined) return '估算中';
+            if (sec <= 0) return '已完成';
+            if (sec < 60) return sec + ' 秒';
+            if (sec < 3600) return Math.round(sec / 60) + ' 分';
+            var h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+            return h + ' 时' + (m ? ' ' + m + ' 分' : '');
+        },
+        fmtUptime: function(sec) {
+            sec = Number(sec) || 0;
+            if (sec < 60) return sec + ' 秒';
+            if (sec < 3600) return Math.floor(sec / 60) + ' 分钟';
+            if (sec < 86400) return Math.floor(sec / 3600) + ' 小时';
+            return Math.floor(sec / 86400) + ' 天';
+        },
+        backlogPct: function(s) {
+            // 每源积压条占所有源里最大积压的比例（全量源，含 0 值，避免条数变化时跳动）
+            var max = (this.ov.sources || []).reduce(function(a, b) {
+                return Math.max(a, b.pending || 0);
+            }, 1);
+            return s.pending ? Math.max(2, Math.round((s.pending || 0) * 100 / max)) : 0;
+        },
+        trendHeight: function(b) {
+            var max = (this.ov.trend || []).reduce(function(a, x) {
+                return Math.max(a, (x.done || 0) + (x.failed || 0));
+            }, 1);
+            var v = (b.done || 0) + (b.failed || 0);
+            return v ? Math.max(4, Math.round(v * 100 / max)) : 2;
+        },
+        trendTip: function(b) {
+            var d = new Date((b.t || 0) * 1000);
+            var hh = ('0' + d.getHours()).slice(-2), mm = ('0' + d.getMinutes()).slice(-2);
+            return hh + ':' + mm + ' · 完成 ' + (b.done || 0) +
+                   (b.failed ? ' · 失败 ' + b.failed : '') +
+                   ' · ' + this.fmtBytes(b.bytes || 0);
+        },
+        axisLabel: function(which) {
+            var t = this.ov.trend || [];
+            if (!t.length) return '';
+            var b = which === 'mid' ? t[Math.floor(t.length / 2)] : t[0];
+            var d = new Date((b.t || 0) * 1000);
+            return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+        },
+        queueLabel: function(s) {
+            return { pending: '排队中', running: '运行中', done: '已完成', failed: '失败' }[s] || s;
+        },
+        queueBadge: function(s) {
+            return { pending: 'badge-warn', running: 'badge-fmt', done: 'badge-active',
+                     failed: 'badge-missing' }[s] || 'badge-history';
+        },
+        loadOverview: function() {
+            fetch('/api/logs-admin/overview?minutes=60',
+                  { headers: { 'x-requested-with': 'XMLHttpRequest' } })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (!d || !d.totals) return;
+                    this.ov = d;
+                }.bind(this))
+                .catch(function() {});
+        },
+        setTab: function(t) {
+            this.tab = t;
+            try { history.replaceState(null, '', '#' + t); } catch (e) {}
+            // 只有看板 Tab 才轮询，切走就停
+            if (t === 'sync') this.startOvPoll(); else this.stopOvPoll();
+        },
+        gotoSource: function(s) {
+            // 跳到「来源与路径」Tab，并展开该源的叶子详情
+            this.setTab('sources');
+            var row = null;
+            for (var i = 0; i < this.rows.length; i++) {
+                if (this.rows[i].root_id === s.root_id) { row = this.rows[i]; break; }
+            }
+            if (!row) return;   // 该源只在 watch 队列里有记录，来源表未登记
+            if (!this.leavesOpen[row.path]) this.toggleLeaves(row.path);
+            this.$nextTick(function() {
+                var el = document.querySelector('.dir-table');
+                if (el && el.scrollIntoView) {
+                    try { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) {}
+                }
+            });
+        },
+        startOvPoll: function() {
+            this.stopOvPoll();
+            if (this.tab !== 'sync' || document.hidden) return;
+            this.loadOverview();
+            this._ovTimer = setInterval(this.loadOverview, 5000);
+        },
+        stopOvPoll: function() {
+            if (this._ovTimer) { clearInterval(this._ovTimer); this._ovTimer = null; }
+        },
+
         fmtLabel: function(f) {
             var m = { native: '本项目', newapi: 'new-api', unknown: '未知', empty: '空', missing: '缺失' };
             return m[f] || f;
@@ -714,7 +1219,22 @@ new Vue({
         }
     },
     mounted: function() {
+        // Tab 初值：hash 优先，默认同步看板
+        var h = (location.hash || '').replace('#', '');
+        this.tab = (h === 'sources' || h === 'sync') ? h : 'sync';
+
         this.load();
+        // 看板轮询：仅看板 Tab 可见且页面在前台时跑
+        this.startOvPoll();
+        var self = this;
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) self.stopOvPoll();
+            else self.startOvPoll();
+        });
+        window.addEventListener('hashchange', function() {
+            var t = (location.hash || '').replace('#', '');
+            if ((t === 'sync' || t === 'sources') && t !== self.tab) self.setTab(t);
+        });
         // 点击菜单外部时关闭「更多」下拉
         this._closeMenu = function(e) {
             if (!e.target.closest || !e.target.closest('.dropdown')) this.openMenu = null;
@@ -722,6 +1242,7 @@ new Vue({
         document.addEventListener('click', this._closeMenu);
     },
     beforeDestroy: function() {
+        this.stopOvPoll();
         if (this._closeMenu) document.removeEventListener('click', this._closeMenu);
         // 清掉所有「构建完成检测」定时器，防止组件销毁后残留轮询
         var self = this;

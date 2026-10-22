@@ -1,0 +1,170 @@
+{% extends "_layout.html" %}
+{% block title %}实时索引{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h1>实时索引</h1>
+    <p class="page-subtitle">new-api 叶子 index.db 的实时增量同步：每源发现线程 + 8 线程同步池</p>
+</div>
+
+<div class="stat-row" id="watchStats">
+    <div class="stat-card">
+        <div class="stat-label">处理中</div>
+        <div class="stat-value" id="vRunning">-</div>
+        <div class="stat-hint" id="hRunning"></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">排队</div>
+        <div class="stat-value" id="vPending">-</div>
+        <div class="stat-hint">等待同步的叶子</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">已完成</div>
+        <div class="stat-value" id="vDone">-</div>
+        <div class="stat-hint" id="hFailed"></div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">预计剩余</div>
+        <div class="stat-value" id="vEta">-</div>
+        <div class="stat-hint" id="hBytes"></div>
+    </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+    <div class="card-header">
+        <span>正在处理的叶子</span>
+        <span class="muted" id="currentCount"></span>
+    </div>
+    <div id="currentList" class="current-list">
+        <div class="muted" style="padding:12px">暂无</div>
+    </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+    <div class="card-header">
+        <span>按来源</span>
+        <span class="muted">ETA 按各来源历史吞吐率估算</span>
+    </div>
+    <table class="data-table">
+        <thead>
+        <tr>
+            <th>来源</th>
+            <th>排队</th>
+            <th>处理中</th>
+            <th>已完成</th>
+            <th>失败</th>
+            <th>剩余数据量</th>
+            <th>吞吐率</th>
+            <th>预计剩余</th>
+        </tr>
+        </thead>
+        <tbody id="sourceRows">
+        <tr><td colspan="8" class="muted">加载中…</td></tr>
+        </tbody>
+    </table>
+</div>
+
+<style>
+    .stat-row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .stat-card {
+        flex: 1 1 180px; padding: 14px 16px; border-radius: 10px;
+        background: var(--card, #fff); border: 1px solid var(--border, #e5e7eb);
+    }
+    .stat-label { font-size: 12px; color: var(--muted-foreground, #6b7280); }
+    .stat-value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+    .stat-hint { font-size: 11px; color: var(--muted-foreground, #6b7280); margin-top: 2px; }
+    .current-list { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; }
+    .cur-item { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+    .cur-bar { flex: 1; height: 6px; border-radius: 3px; background: #e5e7eb; overflow: hidden; }
+    .cur-bar > i { display: block; height: 100%; background: #3b82f6; width: 0; }
+    .bar { height: 6px; border-radius: 3px; background: #e5e7eb; overflow: hidden; width: 90px; display: inline-block; vertical-align: middle; }
+    .bar > i { display: block; height: 100%; background: #10b981; }
+</style>
+
+<script>
+(function () {
+    function fmtBytes(n) {
+        if (!n) return '0 B';
+        var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+        while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+        return n.toFixed(1) + ' ' + u[i];
+    }
+    function fmtEta(sec) {
+        if (sec === null || sec === undefined) return '估算中';
+        if (sec <= 0) return '已完成';
+        if (sec < 60) return sec + ' 秒';
+        if (sec < 3600) return Math.round(sec / 60) + ' 分';
+        var h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+        return h + ' 时' + (m ? ' ' + m + ' 分' : '');
+    }
+    function esc(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'})[c];
+        });
+    }
+
+    function render(data) {
+        var t = data.totals || {};
+        document.getElementById('vRunning').textContent = t.running || 0;
+        var pool = data.pool || {};
+        document.getElementById('hRunning').textContent = data.running
+            ? ('并发 ' + (pool.busy || 0) + '/' + (pool.size || 8) +
+               ' · pid ' + data.pid)
+            : 'worker 未运行';
+        document.getElementById('vPending').textContent = t.pending || 0;
+        document.getElementById('vDone').textContent = t.done || 0;
+        document.getElementById('hFailed').textContent = '失败 ' + (t.failed || 0);
+        document.getElementById('vEta').textContent = fmtEta(t.eta_sec);
+        document.getElementById('hBytes').textContent = '待处理 ' + fmtBytes(t.remaining_bytes || 0);
+
+        var cur = data.current || [];
+        document.getElementById('currentCount').textContent = cur.length ? cur.length + ' 个' : '';
+        var cl = document.getElementById('currentList');
+        if (!cur.length) {
+            cl.innerHTML = '<div class="muted" style="padding:12px">暂无</div>';
+        } else {
+            cl.innerHTML = cur.map(function (c) {
+                return '<div class="cur-item">' +
+                    '<span style="width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+                    esc(c.leaf) + '</span>' +
+                    '<span class="cur-bar"><i style="width:' + (c.percent || 0) + '%"></i></span>' +
+                    '<span class="muted" style="width:70px;text-align:right">' + fmtEta(c.elapsed_sec) + '</span>' +
+                    '</div>';
+            }).join('');
+        }
+
+        var rows = data.sources || [];
+        var tb = document.getElementById('sourceRows');
+        if (!rows.length) {
+            tb.innerHTML = '<tr><td colspan="8" class="muted">暂无任务</td></tr>';
+            return;
+        }
+        tb.innerHTML = rows.map(function (s) {
+            return '<tr>' +
+                '<td><div>' + esc(s.name || '') + '</div>' +
+                '<div class="muted" style="font-size:11px">' + esc(s.root_path || '') + '</div></td>' +
+                '<td>' + (s.pending || 0) + '</td>' +
+                '<td>' + (s.running || 0) + '</td>' +
+                '<td>' + (s.done || 0) + '</td>' +
+                '<td>' + (s.failed || 0) + '</td>' +
+                '<td>' + fmtBytes(s.remaining_bytes || 0) + '</td>' +
+                '<td>' + (s.bytes_per_sec ? fmtBytes(s.bytes_per_sec) + '/s' : '—') + '</td>' +
+                '<td>' + fmtEta(s.eta_sec) + '</td>' +
+                '</tr>';
+        }).join('');
+    }
+
+    function load() {
+        fetch('/api/watch/status', {headers: {'x-requested-with': 'XMLHttpRequest'}})
+            .then(function (r) { return r.json(); })
+            .then(render)
+            .catch(function (e) {
+                document.getElementById('sourceRows').innerHTML =
+                    '<tr><td colspan="8" class="muted">加载失败：' + esc(e.message) + '</td></tr>';
+            });
+    }
+
+    load();
+    setInterval(load, 5000);
+})();
+</script>
+{% endblock %}
