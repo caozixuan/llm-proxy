@@ -123,6 +123,7 @@ def full_reformat_export(
     progress_cb: Optional[Callable[[str], None]] = None,
     log_dir: Optional[str] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    on_session_done: Optional[Callable[[], None]] = None,
 ) -> dict:
     """线程池并行：对每个 session 的 **全部 trace 文件** 做合并落盘（无 analyze）。
 
