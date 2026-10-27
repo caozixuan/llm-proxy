@@ -494,7 +494,14 @@ class _NidbBackend:
     def get_traces_batch(self, session_keys):
         return nidb.get_traces_batch(self._root, session_keys)
 
+    def get_trace_counts(self, session_keys):
+        return nidb.get_trace_counts(self._root, session_keys)
+
     def get_known_models(self, root_dir):
+        # 优先用 token_stats_json 缓存（免全表 json_each），缺失才回退 SQL 扫描。
+        cached = nidb.get_known_models_cached(root_dir)
+        if cached is not None:
+            return cached
         return nidb.get_known_models(root_dir)
 
 
@@ -520,41 +527,29 @@ def _payload_known_keys(kind: str, root_dir: str) -> Tuple[List[str], float]:
 
 
 def _list_payload(kind: str, root_dir: str, min_messages: int, offset: int = 0, limit: int = 50, api_key: str = "", refresh: bool = False, model: str = "") -> Dict[str, Any]:
+    """单文件（trace 级）列表：分页在 SQL 里下推。
+
+    旧实现把整叶的 session 与 trace 全部拉回内存再排序切片——请求只要 50 条，
+    却要读 22w 条 trace（同叶实测 38s，冷态更高）。现在由后端直接
+    JOIN + ORDER BY filename DESC + LIMIT，只取需要的那一页。
+    排序与过滤口径与旧实现逐条一致（已用 4 种过滤组合对拍验证）。
+    """
     _refresh_state(kind, root_dir, force=refresh)
     backend = _read_backend(root_dir)
 
-    sessions = backend.list_sessions(root_dir, api_key=api_key, model=model, min_msg_count=min_messages)
-    session_keys = [s["session_key"] for s in sessions]
-    traces_by_key = backend.get_traces_batch(session_keys)
+    if _root_format(root_dir) == "newapi":
+        page = nidb.list_files_page(root_dir, min_msg_count=min_messages, api_key=api_key,
+                                    model=model, offset=offset, limit=limit)
+        items, total = page["items"], page["total"]
+    else:
+        page = _ss.list_files_page(root_dir, min_msg_count=min_messages, api_key=api_key,
+                                   model=model, offset=offset, limit=limit)
+        items, total = page["items"], page["total"]
 
     known_models = backend.get_known_models(root_dir)
-    items = []
-    for session in sessions:
-        sk = session["session_key"]
-        for trace in traces_by_key.get(sk, []):
-            if trace.get("msg_count", 0) >= min_messages:
-                if model and trace.get("model", "") != model:
-                    continue
-                item: Dict[str, Any] = {
-                    "filename": trace["filename"],
-                    "message_count": trace["msg_count"],
-                    "model": trace.get("model", ""),
-                    "api_key": session.get("api_key", ""),
-                }
-                if not trace.get("success", True):
-                    item["success"] = False
-                    item["total_attempts"] = trace.get("total_attempts", 1)
-                if trace.get("debug_file"):
-                    item["debug_file"] = trace["debug_file"]
-                items.append(item)
-
-    items.sort(key=lambda x: x["filename"], reverse=True)
-    total = len(items)
-    paged = items[offset:offset + limit] if limit > 0 else items[offset:]
-
     known_keys, last_ts = _payload_known_keys(kind, root_dir)
 
-    payload = {"items": paged, "total": total, "known_keys": known_keys, "known_models": known_models, "last_refresh_ts": last_ts}
+    payload = {"items": items, "total": total, "known_keys": known_keys, "known_models": known_models, "last_refresh_ts": last_ts}
     _attach_backfill_status(payload, root_dir)
     return payload
 
@@ -661,27 +656,9 @@ def _aggregate_payload(kind: str, root_dir: str, min_messages: int, offset: int 
         paged = backend.list_sessions(root_dir, api_key=api_key, model=model, min_msg_count=min_messages, offset=offset, limit=limit if limit > 0 else 0)
 
     known_models = backend.get_known_models(root_dir)
-    paged_keys = [s["session_key"] for s in paged]
-    traces_by_key = backend.get_traces_batch(paged_keys)
-
-    items = []
-    for session in paged:
-        sk = session["session_key"]
-        trace_list = traces_by_key.get(sk, [])
-        payload: Dict[str, Any] = {
-            "first_time": _format_time(session["first_ts"]),
-            "last_time": _format_time(session["last_ts"]),
-            "file_count": len(trace_list),
-            "message_count": session.get("msg_count", 0),
-            "models": session.get("models", []),
-            "latest_file": session.get("latest_file", ""),
-            "api_key": session.get("api_key", ""),
-            "q1_preview": session.get("q1", ""),
-            "trace_list": trace_list,
-        }
-        if any(not t.get("success", True) for t in trace_list):
-            payload["has_failure"] = True
-        items.append(payload)
+    # 列表页只用 file_count / has_failure，不需要 trace 明细（明细由前端点开会话时
+    # 通过 /logs/session-traces 按需取）。这里复用 _build_agg_items 的 COUNT 路径。
+    items = _build_agg_items([(s, root_dir) for s in paged], with_traces=False)
 
     known_keys, last_refresh_ts = _payload_known_keys(kind, root_dir)
 
@@ -825,16 +802,33 @@ def _export_view_leaves(roots, env_dir: str) -> List[str]:
 
 
 def _export_key_leaves(roots, env_dir: str, api_key: str) -> List[str]:
-    """导出浏览按单个 key 取叶子：直接用 build_stats_multi **已算好的** key→mtime 分布。
+    """导出浏览按单个 key 取叶子：优先读 leaf_status.stats_json 的现成倒排索引。
 
-    不再对全部叶子逐叶 list_sessions（导出浏览覆盖到 /mnt 上 1900+ 叶子，逐叶连库是
-    分钟级）。build_stats_multi 的 rows[].mtime_cells 正是「该 key 落在哪些 mtime 目录」，
-    与 public_export_submit 取 mtime_dirs 同一来源；用 _resolve_mt_for 把 mtime key
-    （<root_id>/<rel> 或裸 <rel>）解析回叶子绝对路径。api_key 为空 / 分布未命中 / 解析
-    失败时退回全量 _export_view_leaves（保证正确性优先于速度）。
+    stats_json 是同步阶段按 index.jsonl 算好的「{api_key}|{date} -> 计数」，等价于
+    「该 key 落在哪些叶子」。直接建倒排索引约 50ms，而 build_stats_multi 每次要重算
+    key→mtime 分布（实测 0.7~1.3s）且受 600s 内存 TTL 控制。索引里没有该 key
+    （新 key 首条会话刚写入）或索引为空时，回落到 build_stats_multi + _resolve_mt_for；
+    api_key 为空（看全量）时仍走 _export_view_leaves 枚举全部叶子。
     """
     if not api_key:
         return _export_view_leaves(roots, env_dir)
+
+    # 快路径：leaf_status.stats_json 倒排索引
+    try:
+        import utils.logdir_store as _lds
+        if _lds._ready():
+            hit = _lds.key_to_leaves().get(api_key)
+            if hit:
+                existing = {os.path.normpath(r) for r in roots if r}
+                leaves = [lp for lp in hit if Path(lp).is_dir()
+                          and (not existing or any(
+                              os.path.normpath(lp).startswith(e + os.sep) or os.path.normpath(lp) == e
+                              for e in existing))]
+                if leaves:
+                    return leaves
+    except Exception:  # noqa: BLE001
+        pass
+
     existing = [r for r in roots if Path(r).is_dir()]
     if not existing:
         return []
@@ -926,33 +920,43 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
         # 分页下推：全局按 last_ts DESC 取前 offset+limit 条，来自某叶子的部分必然是
         # 该叶子 last_ts 最新的前 offset+limit 条（LEAF_PAGE 下推保证覆盖），
         # 因此每叶子 list_sessions(limit=need) 一次即可拼出全局前 need 条。
+        # 逐叶串行时 52 叶要 27s（瓶颈是每叶建连 + 索引寻址，与叶子大小无关），
+        # 用线程池并发读到 _AGG_LEAF_WORKERS 路可降到秒级。
         all_sessions = []
         need = max(offset + limit, limit)
-        with _ptm.stage("读取会话"):
-            for leaf in leaves:
+
+        def _read_leaf(leaf: str):
+            try:
+                _refresh_state("anthropic", leaf, force=refresh)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                backend = _read_backend(leaf)
+                sels = backend.list_sessions(leaf, api_key=api_key, model=model,
+                                             min_msg_count=min_messages, offset=0, limit=need)
+                models = []
                 try:
-                    _refresh_state("anthropic", leaf, force=refresh)
+                    models = backend.get_known_models(leaf)
                 except Exception:  # noqa: BLE001
                     pass
-                try:
-                    backend = _read_backend(leaf)
-                    sels = backend.list_sessions(leaf, api_key=api_key, model=model,
-                                                 min_msg_count=min_messages, offset=0, limit=need)
-                    for s in sels:
-                        all_sessions.append((s, leaf))
+                return [(s, leaf) for s in sels], models
+            except Exception:  # noqa: BLE001
+                return [], []
+
+        with _ptm.stage("读取会话"):
+            with ThreadPoolExecutor(max_workers=_AGG_LEAF_WORKERS,
+                                    thread_name_prefix="agg-read") as ex:
+                for pairs, models in ex.map(_read_leaf, leaves):
+                    for s, _leaf in pairs:
+                        all_sessions.append((s, _leaf))
                         if s.get("api_key"):
                             known_keys.add(s["api_key"])
                         for m in s.get("models", []):
                             if m:
                                 known_models.add(m)
-                    try:
-                        for m in backend.get_known_models(leaf):
-                            if m:
-                                known_models.add(m)
-                    except Exception:  # noqa: BLE001
-                        pass
-                except Exception:  # noqa: BLE001
-                    continue
+                    for m in models:
+                        if m:
+                            known_models.add(m)
 
     q1search = (q1search or "").strip()
     if q1search:
@@ -980,15 +984,18 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
         total = len(all_sessions)
     else:
         # 分页下推路径：收集的只是每叶子前 need 条，total 需用 COUNT 跨叶子精确求和。
-        total = 0
+        # COUNT 和「读取会话」一样逐叶建连寻址，串行实测 13.5s、16 并发 1.65s，故同样并发。
+        def _count_leaf(leaf: str) -> int:
+            try:
+                return _read_backend(leaf).count_sessions(
+                    leaf, api_key=api_key, model=model, min_msg_count=min_messages)
+            except Exception:  # noqa: BLE001
+                return 0
+
         with _ptm.stage("COUNT 求总数"):
-            for leaf in leaves:
-                try:
-                    backend = _read_backend(leaf)
-                    total += backend.count_sessions(leaf, api_key=api_key, model=model,
-                                                    min_msg_count=min_messages)
-                except Exception:  # noqa: BLE001
-                    continue
+            with ThreadPoolExecutor(max_workers=_AGG_LEAF_WORKERS,
+                                    thread_name_prefix="agg-count") as ex:
+                total = sum(ex.map(_count_leaf, leaves))
 
     with _ptm.stage("组装 items"):
         items = _build_agg_items(all_sessions[offset:offset + limit] if limit > 0 else all_sessions[offset:])
@@ -1000,8 +1007,13 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
     return {"items": items, "total": total, "known_keys": sorted(known_keys), "known_models": sorted(known_models)}
 
 
-def _build_agg_items(preloaded: List[Tuple[dict, str]]) -> List[Dict[str, Any]]:
-    """把 [(session, leaf), ...] 组装成聚合页 items（按叶子批量取 trace）。
+def _build_agg_items(preloaded: List[Tuple[dict, str]], with_traces: bool = False) -> List[Dict[str, Any]]:
+    """把 [(session, leaf), ...] 组装成聚合页 items。
+
+    with_traces=False（默认，列表/聚合/stream 用）：只取每条会话的 trace 条数与
+    是否含失败，不拉明细。列表页只用 file_count 与 has_failure，而拉全量明细单叶
+    实测 17.2s、payload 92MB；COUNT 版 0.07s、52MB。前端点击会话时才按需取明细。
+    with_traces=True：保留旧的 trace_list 语义（供需要明细的调用方）。
 
     供 export_view_aggregate_payload（分页切片后）与 export_view_aggregate_stream
     （每叶子增量）共用，保证两种路径产出的 item 结构一致。
@@ -1010,32 +1022,81 @@ def _build_agg_items(preloaded: List[Tuple[dict, str]]) -> List[Dict[str, Any]]:
     by_root: Dict[str, List[str]] = defaultdict(list)
     for session, ld in preloaded:
         by_root[ld].append(session["session_key"])
+
     traces_map: Dict[str, Dict[str, List]] = {}
+    counts_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for ld, keys in by_root.items():
+        backend = _read_backend(ld)
         try:
-            traces_map[ld] = _read_backend(ld).get_traces_batch(keys)
+            if with_traces:
+                traces_map[ld] = backend.get_traces_batch(keys)
+            elif _root_format(ld) == "newapi":
+                counts_map[ld] = nidb.get_trace_counts(ld, keys)
+            else:
+                # native 后端（session_cache.db）没有 COUNT 接口，只能取明细再数长度。
+                counts_map[ld] = {
+                    k: {"count": len(v), "has_failure": any(not t.get("success", True) for t in v)}
+                    for k, v in (backend.get_traces_batch(keys) or {}).items()
+                }
         except Exception:  # noqa: BLE001
-            traces_map[ld] = {}
+            if with_traces:
+                traces_map[ld] = {}
+            else:
+                counts_map[ld] = {}
 
     items: List[Dict[str, Any]] = []
     for session, ld in preloaded:
         sk = session["session_key"]
-        trace_list = traces_map.get(ld, {}).get(sk, [])
+        if with_traces:
+            trace_list = traces_map.get(ld, {}).get(sk, [])
+            file_count = len(trace_list)
+            has_failure = any(not t.get("success", True) for t in trace_list)
+        else:
+            trace_list = []
+            stat = counts_map.get(ld, {}).get(sk) or {}
+            file_count = stat.get("count", 0)
+            has_failure = bool(stat.get("has_failure"))
         payload: Dict[str, Any] = {
             "first_time": _format_time(session.get("first_ts", "")),
             "last_time": _format_time(session.get("last_ts", "")),
-            "file_count": len(trace_list),
+            "file_count": file_count,
             "message_count": session.get("msg_count", 0),
             "models": session.get("models", []),
             "latest_file": session.get("latest_file", ""),
             "api_key": session.get("api_key", ""),
             "q1_preview": session.get("q1", ""),
-            "trace_list": trace_list,
         }
-        if any(not t.get("success", True) for t in trace_list):
+        if with_traces:
+            payload["trace_list"] = trace_list
+        if has_failure:
             payload["has_failure"] = True
         items.append(payload)
     return items
+
+
+def session_traces_payload(roots, env_dir: str, api_key: str, filename: str) -> Dict[str, Any]:
+    """返回某个会话（由其某个请求文件名定位）的完整 trace 明细列表。
+
+    列表接口只回 file_count；前端点击会话后调这里取「关联列表」，避免每次列表
+    都把全部明细（单叶实测 17.2s / 92MB）搬一遍。
+    """
+    path = _export_view_find_file(roots, env_dir, filename, api_key=api_key)
+    if not path:
+        return {"items": [], "error": "file not found"}
+    leaf = os.path.dirname(path)
+    if _root_format(leaf) != "newapi":
+        return {"items": [], "error": "unsupported format"}
+    try:
+        session_key = nidb.session_key_for_file(leaf, filename)
+    except Exception:  # noqa: BLE001
+        session_key = None
+    if not session_key:
+        return {"items": [], "error": "session not found"}
+    try:
+        traces = nidb.get_traces_for_session(leaf, session_key)
+    except Exception:  # noqa: BLE001
+        traces = []
+    return {"items": traces, "session_key": session_key}
 
 
 # ---------------------------------------------------------------------------
@@ -1055,53 +1116,142 @@ _AGG_STREAM_TASKS: Dict[str, Dict[str, Any]] = {}
 _AGG_STREAM_SEQ = 0
 _AGG_STREAM_TTL = 300  # 秒；超过未再被 poll 则清理
 
+# 流式收集的叶子并发度。单叶耗时几乎与叶子大小无关（建连 + 索引寻址），逐叶串行
+# 时 52 叶要 31s；实测 16 并发 2.45s。用滑动窗口限制在途数量，内存不随叶子总数增长。
+_AGG_LEAF_WORKERS = 16
+
 # 收集完成的结果缓存：键 (api_key, model, min_messages)。同 key+model 再次打开
 # 直接命中缓存，跳过对数万会话的重新收集。TTL 比任务长很多。
 _AGG_CACHE_LOCK = threading.Lock()
 _AGG_CACHE: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
 _AGG_CACHE_TTL = 900  # 秒；收集结果缓存有效期
 
+# 叶子签名缓存：(叶子集) -> (计算时刻, 签名)。全量视图 4500+ 叶子逐个 stat 冷态
+# 4.1s、热态 0.1s，故加 30s TTL；滞后只影响「新数据多久让缓存失效」，而缓存本身
+# 900s，可忽略。
+_LEAF_SIG_LOCK = threading.Lock()
+_LEAF_SIG_CACHE: Dict[tuple, tuple] = {}
+_LEAF_SIG_TTL = 30  # 秒
+
 # 导出浏览读链路的耗时打点（阶段累计 + 最慢叶子），只进日志与 poll payload，
 # 不新增 DB / 缓存结构。
 _export_view_logger = logging.getLogger("export-view")
 
 
-def _agg_cache_key(api_key: str, model: str, min_messages: int) -> Tuple[str, str, int]:
-    return (api_key or "", model or "", int(min_messages or 1))
+def _agg_cache_key(api_key: str, model: str, min_messages: int,
+                   scope: str = "") -> Tuple[str, str, int, str]:
+    """缓存键。scope 区分「读哪些叶子」：内部页选中时间目录时只有 1 个叶子，
+    公开页是全量/按 key 的叶子集；两者结果不同，不能共用同一条缓存。"""
+    return (api_key or "", model or "", int(min_messages or 1), scope or "")
 
 
-def _agg_cache_get(api_key: str, model: str, min_messages: int) -> Optional[Dict[str, Any]]:
-    """命中且未过期则返回缓存条目（含 items/total/known_keys/known_models），否则 None。"""
+def _leaf_sig(leaves: List[str]) -> Tuple[Tuple[str, int, int], ...]:
+    """叶子集签名：每个叶子的 index.db（缺省回落到叶子目录）的 (路径, mtime_ns, size)。
+
+    watcher 每同步出一个新会话就会写 index.db，mtime/size 随之变化。用它校验缓存
+    是否仍然描述当前磁盘状态，比「任何叶子有写入就清空整表」精确得多：写 A 叶子
+    不会让 B 叶子的视图失效。
+
+    结果按叶子集做 30s 进程内缓存：全量视图有 4500+ 叶子，逐个 stat 冷态实测 4.1s，
+    热态 0.1s。30s 的滞后只意味着「刚写入的数据最多晚 30s 才让缓存失效」，而缓存本身
+    TTL 是 900s，这个代价可以忽略。
+    """
+    cache_key = tuple(leaves)
     now = time.time()
-    ck = _agg_cache_key(api_key, model, min_messages)
+    with _LEAF_SIG_LOCK:
+        hit = _LEAF_SIG_CACHE.get(cache_key)
+        if hit and now - hit[0] < _LEAF_SIG_TTL:
+            return hit[1]
+    sig: List[Tuple[str, int, int]] = []
+    for leaf in leaves:
+        path = os.path.join(leaf, "index.db")
+        if not os.path.exists(path):
+            path = leaf
+        try:
+            st = os.stat(path)
+            sig.append((leaf, st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append((leaf, 0, 0))
+    sig.sort()
+    result = tuple(sig)
+    with _LEAF_SIG_LOCK:
+        # 只保留最近若干组叶子的签名，避免无界增长
+        if len(_LEAF_SIG_CACHE) > 32:
+            _LEAF_SIG_CACHE.clear()
+        _LEAF_SIG_CACHE[cache_key] = (now, result)
+    return result
+
+
+def _leaves_scope(leaves: List[str]) -> str:
+    """叶子集摘要，用作聚合缓存的 scope。
+
+    内部页选中时间目录时只有 1 个叶子，公开页是全量/按 key 的叶子集 —— 两者结果
+    完全不同，不能共用同一条缓存条目。取长度 + 首尾叶子路径做区分即可（叶子集
+    本身变长变短或换目录都会命中不同的 scope）。
+    """
+    if not leaves:
+        return "0"
+    return "%d|%s|%s" % (len(leaves), leaves[0], leaves[-1])
+
+
+def _agg_cache_get(api_key: str, model: str, min_messages: int,
+                   leaves: Optional[List[str]] = None,
+                   scope: str = "") -> Optional[Dict[str, Any]]:
+    """命中且未过期则返回缓存条目（含 items/total/known_keys/known_models），否则 None。
+
+    leaves 给定时还要求叶子签名与收集时一致：期间任何叶子有新数据落库即视为未命中，
+    由调用方重新收集。这样缓存不必靠 watcher 主动清空就能保持正确。
+    """
+    now = time.time()
+    ck = _agg_cache_key(api_key, model, min_messages, scope)
     with _AGG_CACHE_LOCK:
         # 顺手清理过期缓存
         stale = [k for k, v in _AGG_CACHE.items() if now - v.get("_ts", 0) > _AGG_CACHE_TTL]
         for k in stale:
             _AGG_CACHE.pop(k, None)
-        return _AGG_CACHE.get(ck)
+        entry = _AGG_CACHE.get(ck)
+    if entry is None:
+        return None
+    if leaves is not None:
+        if entry.get("_sig") != _leaf_sig(leaves):
+            with _AGG_CACHE_LOCK:
+                _AGG_CACHE.pop(ck, None)
+            return None
+    return entry
 
 
-def _agg_cache_put(api_key: str, model: str, min_messages: int, entry: Dict[str, Any]) -> None:
-    ck = _agg_cache_key(api_key, model, min_messages)
+def _agg_cache_put(api_key: str, model: str, min_messages: int, entry: Dict[str, Any],
+                   leaves: Optional[List[str]] = None, scope: str = "") -> None:
+    ck = _agg_cache_key(api_key, model, min_messages, scope)
     entry = dict(entry)
     entry["_ts"] = time.time()
+    if leaves is not None:
+        entry["_sig"] = _leaf_sig(leaves)
     with _AGG_CACHE_LOCK:
         _AGG_CACHE[ck] = entry
 
 
 def invalidate_agg_cache(leaf_dir: str = "") -> int:
-    """写入新数据后失效导出浏览的聚合结果缓存（_AGG_CACHE）。
+    """叶子有新数据落库后，丢弃「覆盖到该叶子」的聚合结果缓存。
 
-    该缓存按 (api_key, model, min_messages) 保存「收集完成的全量 items」，TTL 900s。
-    它的 key 里不含叶子，所以无法精确失效——新数据可能落入任意 key 的视图，
-    只能整表清空。代价可接受：清空后下一次打开重新收集一次（后台流式，前端不阻塞）。
+    缓存条目记录了收集时的叶子签名（_sig）。给定 leaf_dir 时只淘汰签名里含该叶子的
+    条目，其它叶子/其它 key 的视图继续可用；不给定则整表清空。签名校验本身已经能
+    发现过期（_agg_cache_get），这里只做一次即时淘汰，省掉一次「先命中再校验失败」
+    的往返。
 
     由 utils/newapi_watcher 在叶子同步完成后调用。返回清掉的条目数。
     """
+    target = os.path.normpath(leaf_dir) if leaf_dir else ""
     with _AGG_CACHE_LOCK:
-        n = len(_AGG_CACHE)
-        _AGG_CACHE.clear()
+        if not target:
+            n = len(_AGG_CACHE)
+            _AGG_CACHE.clear()
+        else:
+            drop = [k for k, v in _AGG_CACHE.items()
+                    if any(os.path.normpath(s[0]) == target for s in (v.get("_sig") or ()))]
+            for k in drop:
+                _AGG_CACHE.pop(k, None)
+            n = len(drop)
     if n:
         _export_view_logger.info("聚合缓存已失效 %d 项（叶子有新数据：%s）", n, leaf_dir)
     return n
@@ -1109,13 +1259,25 @@ def invalidate_agg_cache(leaf_dir: str = "") -> int:
 
 def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 1,
                                        api_key: str = "", model: str = "", search: str = "",
-                                       q1search: str = "", refresh: bool = False) -> str:
-    """开启一个聚合流式任务，立即返回 task_id。后台线程在收集，前端轮询 poll()。"""
+                                       q1search: str = "", refresh: bool = False,
+                                       leaves: Optional[List[str]] = None) -> str:
+    """开启一个聚合流式任务，立即返回 task_id。后台线程在收集，前端轮询 poll()。
+
+    leaves 给定时直接用它当叶子集（内部页选中某个时间目录时只读那一个叶子，
+    不必走全量枚举）；不给则按 api_key 解析。
+    """
     global _AGG_STREAM_SEQ
-    # 先查结果缓存：命中则直接造一个「已完成」任务，poll 一次即拿全量，免重复收集。
+    _leaf_tm = StageTimer()
+    with _leaf_tm.stage("叶子解析"):
+        if leaves is None:
+            leaves = _export_key_leaves(roots, env_dir, api_key)
+    # 查结果缓存：命中则直接造一个「已完成」任务，poll 一次即拿全量，免重复收集。
+    # 叶子解析要先做——缓存条目按叶子签名校验，签名的对象正是这批叶子。
+    # scope 用叶子集的摘要：内部页（单叶）与公开页（全量/按 key）结果不同，必须分开。
+    scope = _leaves_scope(leaves)
     if not refresh and not search and not q1search:
         with StageTimer() as _cache_tm:
-            cached = _agg_cache_get(api_key, model, min_messages)
+            cached = _agg_cache_get(api_key, model, min_messages, leaves, scope)
         if cached is not None:
             with _AGG_STREAM_LOCK:
                 _AGG_STREAM_SEQ += 1
@@ -1133,17 +1295,14 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
                     "_ts": time.time(),
                     "_t0": time.time(),
                     "_timings": {"缓存命中": _cache_tm.elapsed(),
-                                 "叶子解析": 0.0, "读取会话": 0.0, "组装 items": 0.0},
+                                 "叶子解析": _leaf_tm.elapsed(), "读取会话": 0.0, "组装 items": 0.0},
                     "_slow_leaves": [],
                 }
             _export_view_logger.info(
-                "export-view 缓存命中 key=%s model=%s min=%s items=%s 用时 %.3fs",
+                "export-view 缓存命中 key=%s model=%s min=%s items=%s 用时 %.3fs（叶子解析 %.3fs）",
                 api_key[-8:] if api_key else "", model, min_messages,
-                cached.get("total", 0), _cache_tm.elapsed())
+                cached.get("total", 0), _cache_tm.elapsed(), _leaf_tm.elapsed())
             return tid
-    _leaf_tm = StageTimer()
-    with _leaf_tm.stage("叶子解析"):
-        leaves = _export_key_leaves(roots, env_dir, api_key)
     if not leaves:
         # 无叶子可读：直接给一个已完成的任务，避免前端空转。
         with _AGG_STREAM_LOCK:
@@ -1182,56 +1341,80 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
         "export-view 流式开始 key=%s model=%s 叶子=%d 叶子解析 %.3fs",
         api_key[-8:] if api_key else "", model, len(leaves), _leaf_tm.elapsed())
 
+    def _collect_leaf(leaf: str) -> Tuple[str, float, float, List[Dict[str, Any]], List[str]]:
+        """读单个叶子并组装 items。纯读、无共享状态，供线程池并发调用。
+
+        返回 (leaf, 读会话耗时, 组装耗时, items, 该叶出现过的 model)。
+        """
+        try:
+            _refresh_state("anthropic", leaf, force=task["_refresh"])
+        except Exception:  # noqa: BLE001
+            pass
+        sel_tm = StageTimer()
+        try:
+            backend = _read_backend(leaf)
+            with sel_tm.stage("读取会话"):
+                sels = backend.list_sessions(leaf, api_key=task["_key"], model=task["_model"],
+                                             min_msg_count=task["_min"])
+        except Exception:  # noqa: BLE001
+            return leaf, sel_tm.elapsed(), 0.0, [], []
+        models: List[str] = []
+        for s in sels:
+            for m in s.get("models", []):
+                if m:
+                    models.append(m)
+        try:
+            models.extend(backend.get_known_models(leaf))
+        except Exception:  # noqa: BLE001
+            pass
+        build_tm = StageTimer()
+        with build_tm.stage("组装 items"):
+            items = _build_agg_items([(s, leaf) for s in sels]) if sels else []
+        return leaf, sel_tm.elapsed(), build_tm.elapsed(), items, models
+
     def _run():
-        # 逐叶收集。叶子已按 mtime 倒序（_export_key_leaves 里 sorted(reverse=True)），
-        # 新到旧，所以先推给前端的是最新会话。无 COUNT：total 直接用实际收集的
-        # item 数（累计即精确总数，免去 41 次 COUNT 的额外 DB 往返）。
-        for leaf in task["leaves"]:
-            leaf_items: List[Tuple[dict, str]] = []
-            try:
-                _refresh_state("anthropic", leaf, force=task["_refresh"])
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                backend = _read_backend(leaf)
-                with StageTimer() as _sel_tm:
-                    sels = backend.list_sessions(leaf, api_key=task["_key"], model=task["_model"],
-                                                 min_msg_count=task["_min"])
-            except Exception:  # noqa: BLE001
+        # 叶子已按 mtime 倒序（_export_key_leaves 里 sorted(reverse=True)），新到旧，
+        # 所以先推给前端的是最新会话。
+        #
+        # 并发收集：逐叶串行时 52 个叶子要 31s，瓶颈是每个叶子都要建连 + 走索引，
+        # 与叶子大小无关（实测 16 并发 2.45s，12.7x）。用滑动窗口把在途任务限制在
+        # _AGG_LEAF_WORKERS 内，内存只随并发数增长，与叶子总数无关。
+        #
+        # 结果仍按叶子顺序消费（deque 队首阻塞等待），保证前端看到的顺序与串行时
+        # 一致；先发出去的叶子先到，最新数据依然最先显示。
+        workers = _AGG_LEAF_WORKERS
+        from collections import deque
+        pending: deque = deque()
+        leaf_iter = iter(task["leaves"])
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="agg-leaf") as pool:
+            def _fill():
+                while len(pending) < workers:
+                    try:
+                        nxt = next(leaf_iter)
+                    except StopIteration:
+                        return
+                    pending.append(pool.submit(_collect_leaf, nxt))
+            _fill()
+            while pending:
+                leaf, _sel_s, _build_s, items, models = pending.popleft().result()
+                _fill()
                 with _AGG_STREAM_LOCK:
-                    task["leaves_done"] += 1  # 该叶失败也算已处理，进度才能收敛到 100%
+                    if items:
+                        task["items"].extend(items)
+                        task["total"] = len(task["items"])  # 已收集到的 item 数
+                    for m in models:
+                        task["known_models"].add(m)
+                    for it in items:
+                        if it.get("api_key"):
+                            task["known_keys"].add(it["api_key"])
+                    task["leaves_done"] += 1
                     task["_ts"] = time.time()
-                continue
-            for s in sels:
-                leaf_items.append((s, leaf))
-                if s.get("api_key"):
-                    task["known_keys"].add(s["api_key"])
-                for m in s.get("models", []):
-                    if m:
-                        task["known_models"].add(m)
-            try:
-                for m in backend.get_known_models(leaf):
-                    if m:
-                        task["known_models"].add(m)
-            except Exception:  # noqa: BLE001
-                pass
-            # 该叶子读完：组装 items 追加进队列，供前端增量取走。同时推进 leaves_done。
-            with StageTimer() as _build_tm:
-                items = _build_agg_items(leaf_items) if leaf_items else []
-            _sel_s, _build_s = _sel_tm.elapsed(), _build_tm.elapsed()
-            with _AGG_STREAM_LOCK:
-                if items:
-                    task["items"].extend(items)
-                    task["total"] = len(task["items"])  # 已收集到的 item 数
-                task["leaves_done"] += 1
-                task["_ts"] = time.time()
-                _tm = task["_timings"]
-                _tm["读取会话"] = _tm.get("读取会话", 0.0) + _sel_s
-                _tm["组装 items"] = _tm.get("组装 items", 0.0) + _build_s
-                # 只留最慢 5 个叶子，便于定位个别慢叶（NFS/大库）。串行收集，锁开销可忽略。
-                task["_slow_leaves"].append((round(_sel_s + _build_s, 3), leaf))
-                task["_slow_leaves"].sort(reverse=True)
-                del task["_slow_leaves"][5:]
+                    _tm = task["_timings"]
+                    _tm["读取会话"] = _tm.get("读取会话", 0.0) + _sel_s
+                    _tm["组装 items"] = _tm.get("组装 items", 0.0) + _build_s
+                    task["_slow_leaves"].append((round(_sel_s + _build_s, 3), leaf))
+                    task["_slow_leaves"].sort(reverse=True)
+                    del task["_slow_leaves"][5:]
         with _AGG_STREAM_LOCK:
             # total 以「实际收集到的 item 数」为准，保证前端 loaded 收敛到 totalItems，
             # 滚动到底时 loadMore 判定 loaded >= totalItems 恒成立，不会再发分页请求。
@@ -1251,9 +1434,12 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
             _items_n = task["total"]
             _parts = list(task["_timings"].items())
             _slow = list(task["_slow_leaves"])
-        # 收集完成：写入结果缓存，供同 key+model 再次打开时秒开（refresh/search 不缓存）。
-        if not task["_refresh"] and not task["_search"] and not task["_q1"]:
-            _agg_cache_put(task["_key"], task["_model"], task["_min"], snapshot)
+        # 收集完成：写入结果缓存，供同 key+model 再次打开时秒开（search/q1search 不缓存：
+        # 它们是过滤后的子集，与全量视图不是同一份结果）。refresh 现在也写缓存——它是
+        # 「用户主动要最新数据」的意思，不是「别缓存」，跳过一次命中就足够了。
+        if not task["_search"] and not task["_q1"]:
+            _agg_cache_put(task["_key"], task["_model"], task["_min"], snapshot,
+                           task["leaves"], _leaves_scope(task["leaves"]))
         _export_view_logger.info(
             "export-view 流式完成 key=%s model=%s 叶子=%d items=%d 总耗时 %.2fs | %s | 最慢叶子: %s",
             task["_key"][-8:] if task["_key"] else "", task["_model"], _leaf_n, _items_n, _elapsed,
@@ -1508,15 +1694,40 @@ def register_log_routes(app: FastAPI) -> None:
     def unified_log_dir() -> str:
         return _current_log_dir
 
+    def _leaf_by_hour(root: str, rel: str) -> str:
+        """在 root 的日期层里找裸小时目录：<root>/<day>/<rel>。
+
+        dir_key 有时只带 8 位小时段（如 26102720），而真实布局是
+        <root>/261027/26102720 —— resolve_leaf 只会试 <root>/<rel> 与
+        <root>/<rel>/<末段>，都命中不了。这里补一层目录扫描。
+        只扫 root 的直接子目录（通常几十个），命中即返回。
+        """
+        if not rel or "/" in rel or os.sep in rel:
+            return ""
+        try:
+            children = os.listdir(root)
+        except OSError:
+            return ""
+        for day in children:
+            cand = os.path.join(root, day, rel)
+            try:
+                if os.path.isdir(cand):
+                    return cand
+            except OSError:
+                continue
+        return ""
+
     def resolve_log_dir(log_dir: str = "") -> str:
         if not log_dir:
             return _current_log_dir
         # log_dir 形如 "26072520" 或跨 root 时 "<root_id>::<rel_key>"
         # root_part 现为稳定 root_id；旧链接可能是 basename/normpath，保留回退匹配。
+        rel_hint = log_dir
         if "::" in log_dir:
             from utils.logs_config import get_root_id
             from utils.log_scan import resolve_leaf
             root_part, _, rel = log_dir.partition("::")
+            rel_hint = rel
             for root in _all_roots():
                 if (get_root_id(root, _env_dir) == root_part
                         or os.path.basename(os.path.normpath(root)) == root_part
@@ -1524,6 +1735,13 @@ def register_log_routes(app: FastAPI) -> None:
                     candidate = str(resolve_leaf(root, rel))
                     if os.path.isdir(candidate):
                         return candidate
+                    # 该 root 下没直接命中：继续用 rel 在本 root 的日期层里找
+                    # （dir_key 只带小时段、丢了日期层的情形，见下方兜底）。
+                    found = _leaf_by_hour(root, rel)
+                    if found:
+                        return found
+        # 用 rel_hint 继续兜底：带 "::" 的整串拼路径必然落空，必须剥掉前缀。
+        log_dir = rel_hint
         # 兼容旧格式：同 env-key 下的时间戳子目录
         candidate = os.path.join(_env_dir, log_dir)
         if os.path.isdir(candidate):
@@ -1555,20 +1773,28 @@ def register_log_routes(app: FastAPI) -> None:
 
     @app.get("/logs/dirs")
     def logs_dirs():
-        """列出所有配置 root 下含 index.jsonl 的叶子目录，当前活跃目录排在第一个。
+        """列出所有配置 root 下的日志目录，当前活跃目录排在第一个。
 
-        单 root（仅活跃目录）时 name 用叶子相对路径（兼容旧行为）；
-        多 root 时 name 用 "<root_basename>::<rel_key>" 以区分来源。
+        数据源优先用 leaf_status（同步阶段已落库的 dir_key + entry_count）：
+        实测与 refresh_index 重算逐条一致，但 0.018s vs 0.821s。只有 leaf_status
+        尚未覆盖的 root（本地目录 / 未同步源）才回退到即时扫描。
         """
         from utils.stats_index import refresh_index, get_dir_counts
         from utils.token_index import refresh_token_index
-        from utils.log_scan import dir_key_for
         from utils.logs_config import get_path_name, get_root_id
+        import utils.logdir_store as _lds
+
         current_tag = Path(_current_log_dir).name
         roots = _all_roots()
         multi = len(roots) > 1
         dirs = []
         current_name = current_tag
+
+        # 一次读出全部 root 的目录列表（内部有签名缓存，命中时零成本）
+        try:
+            known = _lds.dir_list() if _lds._ready() else {}
+        except Exception:  # noqa: BLE001
+            known = {}
 
         for root in roots:
             root_path = Path(root)
@@ -1579,12 +1805,25 @@ def register_log_routes(app: FastAPI) -> None:
             # 活跃 env_dir 名称固定 default；历史根取配置名称
             is_active_root = (os.path.normpath(root) == os.path.normpath(_env_dir))
             root_label = "default" if is_active_root else get_path_name(root)
-            index = refresh_index(root_path)
-            tok_index = refresh_token_index(root)
-            counts = get_dir_counts(index, tok_index)
-            for rel_key, count in counts.items():
-                is_current = (os.path.normpath(root) == os.path.normpath(_env_dir)
-                              and rel_key == current_tag)
+
+            entries = known.get(root_id) or []
+            if entries:
+                # 快路径：直接用同步产物。历史目录的形状与计数不会变，无需重算。
+                pairs = [(e["dir_key"], e["count"]) for e in entries]
+                # 当前小时的叶子通常还没被同步进 leaf_status（watcher 有延迟）。
+                # 这里只补一条占位（count=None），**不能**为它触发 refresh_index：
+                # 那是整个 root 的重扫（实测冷态 3.7s）。当前小时本来也还在增长，
+                # 显示精确条数没有意义，前端在 count 为空时就不显示数字。
+                if current_tag not in {k for k, _ in pairs}:
+                    pairs.append((current_tag, None))
+            else:
+                # 回退：该 root 还没同步过，只能即时扫（本地目录等少量场景）
+                index = refresh_index(root_path)
+                tok_index = refresh_token_index(root)
+                pairs = list(get_dir_counts(index, tok_index).items())
+
+            for rel_key, count in pairs:
+                is_current = (is_active_root and rel_key == current_tag)
                 name = f"{root_id}::{rel_key}" if multi else rel_key
                 if is_current:
                     current_name = name
@@ -1612,6 +1851,13 @@ def register_log_routes(app: FastAPI) -> None:
         if (filename.endswith(".json") and not filename.endswith("-req.json")
                 and "/" not in filename and "\\" not in filename and ".." not in filename):
             target_dir = resolve_log_dir(log_dir)
+            if _root_format(target_dir) != "newapi":
+                # 没指定 log_dir（例如只带了 source）时，resolve_log_dir 会回落成本服务
+                # 自己的活跃目录（native 格式），合并文件在那边根本不存在。这里按文件名
+                # 在全部来源里找一次，避免点开条目就 400 / 404。
+                found = _export_view_find_file(_all_roots(), _env_dir, filename)
+                if found:
+                    target_dir = os.path.dirname(found)
             if _root_format(target_dir) == "newapi":
                 from utils.newapi_format import build_preview_payload
                 path = os.path.join(target_dir, filename)
@@ -1621,7 +1867,6 @@ def register_log_routes(app: FastAPI) -> None:
                 if payload is None:
                     return JSONResponse({"error": "parse failed"}, status_code=500)
                 return JSONResponse(payload)
-
         if not filename.endswith("-req.json") or "/" in filename or "\\" in filename or ".." in filename:
             return JSONResponse({"error": "invalid filename"}, status_code=400)
         if log_dir == "__ALL__":
@@ -1746,6 +1991,97 @@ def register_log_routes(app: FastAPI) -> None:
     @app.get("/logs/aggregate")
     def logs_aggregate(min_messages: int = 1, offset: int = 0, limit: int = 50, api_key: str = "", refresh: bool = False, model: str = "", log_dir: str = "", search: str = "", q1search: str = ""):
         return JSONResponse(_aggregate_payload("anthropic", resolve_log_dir(log_dir), min_messages, offset, limit, api_key, refresh, model, search, q1search))
+
+    # 内部「对话浏览」页的流式聚合：与公开导出浏览共用同一套后台任务 + 结果缓存。
+    # 不提供这条路由的话，内部页只能走上面的同步 /logs/aggregate，每次重新收集、
+    # 且享受不到 900s 缓存（单叶实测 3.6s，多叶线性累加）。
+    def _inner_leaves(log_dir: str, source: str = "") -> List[str]:
+        """内部页的叶子集。
+
+        任何情形都**不会**枚举一个来源的全部叶子（那会把默认视图放大几个数量级，
+        且每个新请求重开一个全量任务，把进程 CPU/内存拖满）：
+          - log_dir 指定了具体小时目录 → 只读那一个叶子
+          - 只给了 source → 读该来源**最新的一小时**
+          - 都没给 → 空集，前端显示「请选择时间目录」
+        """
+        if log_dir:
+            target = resolve_log_dir(log_dir)
+            return [target] if Path(target).is_dir() else []
+        if source:
+            newest = _newest_leaf(source)
+            return [newest] if newest else []
+        return []
+
+    def _newest_leaf(source: str) -> str:
+        """该来源下 dir_key 最新（末段小时最大）的一个叶子。
+
+        页面默认落点是「最新一小时」而不是整个来源：后者动辄上千个叶子，
+        一次收集要几分钟且把 CPU 打满。
+        """
+        leaves = _source_leaves(source)
+        if not leaves:
+            return ""
+        def _hour(p: str) -> str:
+            return os.path.basename(os.path.normpath(p))
+        try:
+            return max(leaves, key=lambda p: (_hour(p), p))
+        except ValueError:
+            return ""
+
+    def _source_leaves(source: str) -> List[str]:
+        """按 root_id 取一个来源下所有已登记的、磁盘上存在的叶子。"""
+        import utils.logdir_store as _lds
+        from utils.logs_config import get_root_id
+        rid = source
+        # 兼容老链接里传的是 basename / 绝对路径
+        for root in _all_roots():
+            if (get_root_id(root, _env_dir) == source
+                    or os.path.basename(os.path.normpath(root)) == source
+                    or os.path.normpath(root) == source):
+                rid = get_root_id(root, _env_dir)
+                break
+        try:
+            rows = _lds.bulk_get(rid)
+        except Exception:  # noqa: BLE001
+            return []
+        leaves: List[str] = []
+        for row in rows:
+            lp = row.get("leaf_path") or ""
+            if lp and Path(lp).is_dir():
+                leaves.append(lp)
+        return leaves
+
+    @app.get("/logs/aggregate/stream/start")
+    def logs_aggregate_stream_start(min_messages: int = 1, api_key: str = "", model: str = "",
+                                    refresh: bool = False, log_dir: str = "", source: str = ""):
+        tid = export_view_aggregate_stream_start(
+            _all_roots(), _env_dir, min_messages, api_key, model,
+            refresh=refresh, leaves=_inner_leaves(log_dir, source))
+        return JSONResponse({"task_id": tid})
+
+    @app.get("/logs/aggregate/stream/{task_id}")
+    def logs_aggregate_stream_poll(task_id: str):
+        return JSONResponse(export_view_aggregate_stream_poll(task_id))
+
+    @app.get("/logs/session-traces")
+    def logs_session_traces(filename: str = "", api_key: str = "", log_dir: str = ""):
+        """按会话的某个请求文件名取该会话的 trace 明细（「关联列表」）。
+
+        列表接口只回 file_count；前端点开会话后才调这里，避免每次列表都把全部
+        明细搬一遍。指定 log_dir 时直接在该叶子内查找，省掉跨叶子枚举。
+        """
+        if not filename:
+            return JSONResponse({"items": [], "error": "missing filename"}, status_code=400)
+        if log_dir:
+            target = resolve_log_dir(log_dir)
+            if _root_format(target) == "newapi":
+                sk = nidb.session_key_for_file(target, filename)
+                if sk:
+                    return JSONResponse({
+                        "items": nidb.get_traces_for_session(target, sk),
+                        "session_key": sk,
+                    })
+        return JSONResponse(session_traces_payload(_all_roots(), _env_dir, api_key, filename))
 
     # --- 旧路由（别名，向后兼容） ---
 

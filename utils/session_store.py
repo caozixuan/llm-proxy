@@ -415,6 +415,58 @@ def get_traces(session_key: str) -> List[Dict[str, Any]]:
     return [_row_to_trace(r) for r in rows]
 
 
+def list_files_page(root_dir: str, min_msg_count: int = 0, api_key: str = "",
+                    model: str = "", offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+    """文件级（trace 级）分页：按 filename DESC 排序，在 SQL 里完成切片。
+
+    与 newapi_index_db.list_files_page 同口径（单文件列表视图用）。native 后端的
+    traces 表带 root_dir 列，先按 root_dir 限定再 JOIN sessions，走 traces_root_dir
+    索引，不必扫全库 359 万行。
+    """
+    conn = _get_conn()
+    where = ["s.root_dir = ?", "t.root_dir = ?", "s.msg_count >= ?", "t.msg_count >= ?"]
+    params: list = [root_dir, root_dir, min_msg_count, min_msg_count]
+    if api_key:
+        where.append("s.api_key = ?"); params.append(api_key)
+    if model:
+        where.append("t.model = ?"); params.append(model)
+        where.append("EXISTS (SELECT 1 FROM json_each(s.models) WHERE value = ?)")
+        params.append(model)
+    cond = " AND ".join(where)
+
+    total = conn.execute(
+        f"SELECT COUNT(*) AS c FROM traces t "
+        f"JOIN sessions s ON s.session_key = t.session_key WHERE {cond}",
+        params,
+    ).fetchone()[0]
+
+    sql = (f"SELECT t.filename, t.msg_count, t.model, t.success, t.debug_file, "
+           f"t.total_attempts, s.api_key FROM traces t "
+           f"JOIN sessions s ON s.session_key = t.session_key "
+           f"WHERE {cond} ORDER BY t.filename DESC")
+    p = list(params)
+    if limit > 0:
+        sql += " LIMIT ? OFFSET ?"
+        p.extend([limit, offset])
+    rows = conn.execute(sql, p).fetchall()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        item: Dict[str, Any] = {
+            "filename": r["filename"],
+            "message_count": r["msg_count"],
+            "model": r["model"] or "",
+            "api_key": r["api_key"] or "",
+        }
+        if not r["success"]:
+            item["success"] = False
+            item["total_attempts"] = r["total_attempts"] or 1
+        if r["debug_file"]:
+            item["debug_file"] = r["debug_file"]
+        items.append(item)
+    return {"items": items, "total": total or 0}
+
+
 def get_traces_batch(session_keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:
     """批量获取多个 session 的 trace_list，减少查询次数。"""
     if not session_keys:

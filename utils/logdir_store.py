@@ -29,6 +29,18 @@ _lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
 _db_path: str = ""
 
+# models_by_leaf_path() 的结果缓存：(计算时刻, {leaf_path: set(model)})。
+# 全表 4589 行 token_stats_json 解析约 0.09s，而调用方按叶子逐个调用，
+# 不缓存就要付「叶子数 × 0.09s」。写侧变化（新叶子同步）最多滞后 _MODELS_TTL 被看到。
+_MODELS_CACHE: Optional[tuple] = None
+_MODELS_TTL = 60  # 秒
+
+# dir_list() 的结果缓存：(失效签名, 计算时刻, {root_id: [...]})。
+# 签名 = (leaf_status 行数, MAX(synced_at))，同步进程写入新行才变。
+# 解析 4600 行 token_stats_json 约 0.018s，缓存在 TTL 内降到 0。
+_DIR_LIST_CACHE: Optional[tuple] = None
+_DIR_LIST_TTL = 300  # 秒
+
 
 def init_db(db_dir: str):
     global _conn, _db_path
@@ -307,6 +319,145 @@ def has_any(root_id: str) -> bool:
             "SELECT 1 FROM leaf_status WHERE root_id = ? LIMIT 1", (root_id,)
         ).fetchone()
     return row is not None
+
+
+def key_to_leaves() -> dict:
+    """从 leaf_status.stats_json 建 {api_key: [leaf_path, ...]} 倒排索引（跨全部 root）。
+
+    stats_json 是同步阶段按 index.jsonl 算好的「{api_key}|{date} -> {total,qualified}」，
+    也就是「该 key 落在哪些叶子」的现成答案。相比 build_stats_multi 每次重算
+    key→mtime 分布（实测 0.7~1.3s），这里 4591 行全读 + 建索引约 50ms。
+
+    返回的 list 按叶子路径排序，供调用方直接当叶子集用（顺序不影响正确性）。
+    """
+    if not _ready():
+        return {}
+    with _lock:
+        rows = _conn.execute(
+            "SELECT leaf_path, stats_json FROM leaf_status "
+            "WHERE leaf_path != '' AND stats_json != ''"
+        ).fetchall()
+    out: dict = {}
+    for r in rows:
+        lp = r[0]
+        if not lp:
+            continue
+        try:
+            buckets = _json.loads(r[1])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(buckets, dict):
+            continue
+        for bucket_key in buckets:
+            api_key = bucket_key.split("|", 1)[0]
+            if not api_key:
+                continue
+            lst = out.get(api_key)
+            if lst is None:
+                out[api_key] = [lp]
+            elif lst[-1] != lp:
+                lst.append(lp)
+    return out
+
+
+def dir_list() -> dict:
+    """从 leaf_status 建 {root_id: [{"dir_key", "leaf_path", "count"}, ...]}。
+
+    目录列表的全部信息（哪些小时目录、各自多少条）在同步阶段就已落库：
+    dir_key 是目录，token_stats_json.entry_count 是请求条数。实测两者与
+    get_dir_counts()/refresh_index() 逐条相同（f1563a05 的 1385 个叶子 0 处差异），
+    但读库 0.018s vs 重算索引 0.821s —— 所以列表页不该再走即时计算。
+
+    count 取 entry_count，缺失时回落 sessions（未跑过 token 统计的叶子）。
+    """
+    if not _ready():
+        return {}
+    global _DIR_LIST_CACHE
+    now = time.time()
+    with _lock:
+        # 用「行数 + 最大 synced_at」作失效键：同步进程写入新叶子或更新任何一行
+        # 都会改变二者之一。历史目录的行不会被改写，故命中期不会被无谓重算。
+        sig_row = _conn.execute(
+            "SELECT COUNT(*), MAX(synced_at) FROM leaf_status"
+        ).fetchone()
+        sig = (sig_row[0], sig_row[1]) if sig_row else (0, None)
+        if _DIR_LIST_CACHE is not None and _DIR_LIST_CACHE[0] == sig \
+                and now - _DIR_LIST_CACHE[1] < _DIR_LIST_TTL:
+            return _DIR_LIST_CACHE[2]
+        rows = _conn.execute(
+            "SELECT root_id, dir_key, leaf_path, sessions, token_stats_json "
+            "FROM leaf_status WHERE dir_key != ''"
+        ).fetchall()
+    out: dict = {}
+    for r in rows:
+        root_id, dir_key, leaf_path, sess, raw = r[0], r[1], r[2] or "", r[3] or 0, r[4] or ""
+        count = None
+        if raw:
+            try:
+                data = _json.loads(raw)
+                if isinstance(data, dict):
+                    ec = data.get("entry_count")
+                    if isinstance(ec, int):
+                        count = ec
+            except (ValueError, TypeError):
+                pass
+        if count is None:
+            count = sess
+        out.setdefault(root_id, []).append({
+            "dir_key": dir_key,
+            "leaf_path": leaf_path,
+            "count": count,
+        })
+    for lst in out.values():
+        # 按「末段小时」倒序，而不是整串：dir_key 有 '261027/26102720' 与
+        # 'details/260730/26073018' 两种形态，按整串排会把 'details/...' 全部
+        # 抬到 '26xxxx/...' 之前（'d' > '2'），导致「最新」取到最旧的目录。
+        lst.sort(key=lambda d: d["dir_key"].rsplit("/", 1)[-1], reverse=True)
+    with _lock:
+        _DIR_LIST_CACHE = (sig, now, out)
+    return out
+
+
+def models_by_leaf_path() -> dict:
+    """从 token_stats_json 取 {leaf_path: set(model)}，供列表页填模型下拉，免逐叶全表扫。
+
+    token_stats_json.models 的键形如 "{model}|{date}"。值为空（未跑过 token 统计）
+    的叶子不出现在返回值里，调用方据此决定是否回退到 SQL 扫描。
+
+    结果按 TTL 缓存：本函数每次会把 4589 行的 token_stats_json 全读并 JSON 解析
+    （实测 0.09s）。调用方是「每个叶子调一次」的形态（52 叶 → 4.7s），缓存后
+    每个请求只付一次。
+    """
+    if not _ready():
+        return {}
+    global _MODELS_CACHE
+    now = time.time()
+    with _lock:
+        if _MODELS_CACHE is not None and now - _MODELS_CACHE[0] < _MODELS_TTL:
+            return _MODELS_CACHE[1]
+        rows = _conn.execute(
+            "SELECT leaf_path, token_stats_json FROM leaf_status "
+            "WHERE leaf_path != '' AND token_stats_json != ''"
+        ).fetchall()
+    out: dict = {}
+    for leaf_path, raw in rows:
+        if not leaf_path:
+            continue
+        try:
+            data = _json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        models = (data or {}).get("models") or {}
+        if not isinstance(models, dict):
+            continue
+        names = out.setdefault(leaf_path, set())
+        for mk in models:
+            name = mk.split("|", 1)[0]
+            if name:
+                names.add(name)
+    with _lock:
+        _MODELS_CACHE = (now, out)
+    return out
 
 
 def bulk_get_stats(root_id: str) -> List[dict]:

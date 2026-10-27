@@ -628,3 +628,74 @@ def query_api_keys(env_dir, force: bool = False) -> List[str]:
         for ak in dir_info.get("api_keys_set", []):
             keys.add(ak)
     return sorted(keys)
+
+
+# ---------------------------------------------------------------------------
+# 后台预热（与 stats_index._stats_warmer_loop 对齐）
+# ---------------------------------------------------------------------------
+# token 索引原先没有任何预热：refresh_token_index 只在请求里懒执行，而
+# _MEM_TTL/_COMBINED_TTL 都是 600s，于是「重启后第一次」以及「每 10 分钟过期后
+# 第一次」都由用户请求全价支付冷成本（实测 ~4.4s，其中 ~4.0s 是 4592 叶的
+# 冷 NFS stat 扫描）。5 个 token 端点还会在 _combined_lock 上串行等同一次重建。
+#
+# 这个线程只做 force=False 的常规刷新：签名命中的叶子走 leaf_status 短路，
+# 不扫 index.jsonl、不重写 .token_index.jsonl（changed=False 时 _save_index
+# 不触发），把 NFS 属性缓存与内存缓存都维持热态，用户请求恒走无锁快路径。
+
+_token_warmer_thread = None
+_token_warmer_stop = threading.Event()
+_token_logger = None
+
+
+def _get_logger():
+    global _token_logger
+    if _token_logger is None:
+        import logging
+        _token_logger = logging.getLogger("token-warmer")
+    return _token_logger
+
+
+def _token_warmer_roots(env_dir: str) -> List[str]:
+    """预热覆盖的 root 列表：全部已登记源。"""
+    roots: List[str] = [env_dir]
+    try:
+        from utils.logs_config import get_registered_roots
+        seen = {os.path.normpath(env_dir)}
+        for r in get_registered_roots(env_dir):
+            key = os.path.normpath(r)
+            if key not in seen:
+                seen.add(key)
+                roots.append(r)
+    except Exception:  # noqa: BLE001
+        pass
+    return [r for r in roots if os.path.isdir(r)]
+
+
+def _token_warmer_loop(env_dir: str, interval: float = 120.0) -> None:
+    log = _get_logger()
+    roots = _token_warmer_roots(env_dir)
+    log.info("token-warmer: 开始预热，覆盖 %d 个 root", len(roots))
+    while not _token_warmer_stop.is_set():
+        try:
+            # 走 _combined_index 而非逐 root refresh：顺带把 _combined_cache 也
+            # 建好，5 个端点并发时直接命中，不必抢 _combined_lock 重建。
+            _combined_index(roots, force=False)
+        except Exception:  # noqa: BLE001 — 预热失败绝不能影响服务
+            log.warning("token-warmer: 预热失败", exc_info=True)
+        _token_warmer_stop.wait(interval)
+
+
+def start_token_warmer(env_dir: str, interval: float = 120.0) -> None:
+    """启动 token 索引预热线程（幂等）。interval 需明显小于 _MEM_TTL(600s)，
+    否则缓存会在两次预热之间过期。默认 120s 留足余量。"""
+    global _token_warmer_thread
+    if _token_warmer_thread is not None and _token_warmer_thread.is_alive():
+        return
+    _token_warmer_stop.clear()
+    _token_warmer_thread = threading.Thread(
+        target=_token_warmer_loop,
+        args=(env_dir, interval),
+        daemon=True,
+        name="token-cache-warmer",
+    )
+    _token_warmer_thread.start()

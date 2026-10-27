@@ -5,7 +5,8 @@
 
 {% block head_extra %}
     <script src="/static/js/vue.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    {# 本地 Chart.js（4.4.7）替代 jsdelivr CDN：CDN 实测 1.5s~25s 波动且同步阻塞首屏 #}
+    <script src="/static/js/chart.min.js"></script>
 {% endblock %}
 
 {% block page_styles %}

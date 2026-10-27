@@ -77,6 +77,12 @@ _DB_NAME = "index.db"
 # 故按远低于下限的固定批大小切分。
 _TRACES_IN_CHUNK = 500
 
+# 读连接的 SQLite 内存参数（见 _connect 的说明）。叶子库大（单叶常 100~600MB），
+# 连接级 page cache 无法跨请求复用，故用 mmap 把读成本压下来。
+# 实测 476MB 叶子、单页 6 个查询：基线 7.5s → mmap 1GB + 64MB cache 3.7s。
+_MMAP_SIZE = 1 << 30      # 1GB
+_CACHE_KB = 64 * 1024     # 64MB
+
 # index.jsonl 尾部残行宽限期（秒）：活尾通常几百毫秒内就写完；超过这么久文件
 # 还是停在半行上，基本可判定是崩溃留下的残行，跳过它、推进 offset，避免摄取永久卡住。
 try:
@@ -190,13 +196,27 @@ CREATE TABLE IF NOT EXISTS meta (
 
 
 def _connect(leaf_dir: str, write: bool = False) -> sqlite3.Connection:
+    """打开叶子 index.db。
+
+    叶子库按叶子分文件，每个视图请求都要为每个叶子新建连接，连接级缓存（page
+    cache）无法跨请求复用。大叶子（476MB / 22k session）上一个 COUNT 走全表扫，
+    冷连接实测 3.1s，热连接 0.007s —— 这条路径是列表页退化成秒级的根因。
+
+    三处调整（实测：单页 6 个查询 7.5s → 3.7s）：
+      - mmap_size：让 SQLite 直接映射文件，跳过 page cache 的二次拷贝（-3.4s）
+      - cache_size：64MB 页缓存，减少随机读的重复命中开销
+      - journal_mode / synchronous 只在写连接上设：读连接设 WAL 要拿写锁，纯浪费；
+        库本身已是 WAL，读连接直接读即可
+    """
     path = db_path(leaf_dir)
     conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA mmap_size=%d" % _MMAP_SIZE)
+    conn.execute("PRAGMA cache_size=-%d" % _CACHE_KB)
     if write:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(_SCHEMA)
         _migrate(conn)
     return conn
@@ -1076,12 +1096,18 @@ def probe(leaf_dir: str) -> Dict[str, Any]:
 
 
 def status(leaf_dir: str) -> Dict[str, Any]:
-    """{built, ingested, pending, sessions, sessions_dirty}。built=有 sessions 且无待补。"""
+    """{built, ingested, pending, sessions, sessions_dirty}。built=有 sessions 且无待补。
+
+    ingested 用 MAX(rowid) 而非 COUNT(*)：requests 的 rowid 无空洞（只有文件截断时
+    才 DELETE 并紧接着全量重写），两者结果相同；但 COUNT(*) 要全表扫，单叶实测
+    5.1s（27w 行），MAX(rowid) 走主键只要 0.006s。这个函数在列表/统计/回填的
+    热路径上被反复调用，差值直接落在页面打开耗时里。
+    """
     if not _db_exists(leaf_dir):
         return {"built": False, "ingested": 0, "pending": 0, "sessions": 0, "sessions_dirty": True}
     conn = _connect(leaf_dir)
     try:
-        ingested = conn.execute("SELECT COUNT(*) AS c FROM requests").fetchone()["c"]
+        ingested = conn.execute("SELECT MAX(rowid) AS c FROM requests").fetchone()["c"] or 0
         pending = conn.execute("SELECT COUNT(*) AS c FROM requests WHERE q1_hash IS NULL").fetchone()["c"]
         n_sess = conn.execute("SELECT COUNT(*) AS c FROM sessions").fetchone()["c"]
         dirty = _meta_get(conn, "sessions_dirty", "1") == "1"
@@ -1157,6 +1183,162 @@ def count_sessions(leaf_dir: str, api_key: str = "", model: str = "",
         return row["c"] if row else 0
     finally:
         conn.close()
+
+
+def list_files_page(leaf_dir: str, min_msg_count: int = 0, api_key: str = "",
+                    model: str = "", offset: int = 0, limit: int = 50) -> Dict[str, Any]:
+    """文件级（trace 级）分页：按 filename DESC 排序，在 SQL 里完成切片。
+
+    单文件列表视图要把每个 session 展开成多条 trace 行，旧实现先把整叶 trace
+    全拉回来再内存排序切片（同叶实测 38.5s / 274428 行）。这里直接在 SQL 里
+    JOIN + ORDER BY + LIMIT，只取需要的那几页（热态 0.52s）。
+
+    排序与过滤口径与原实现完全一致：外层按 filename DESC；session 与 trace 各自
+    都要满足 msg_count >= min_msg_count；model 同时约束 trace.model 与
+    session.models 数组。
+    """
+    if not _db_exists(leaf_dir):
+        return {"items": [], "total": 0}
+    conn = _connect(leaf_dir)
+    try:
+        where = ["s.msg_count >= ?", "t.msg_count >= ?"]
+        params: list = [min_msg_count, min_msg_count]
+        if api_key:
+            where.append("s.api_key = ?"); params.append(api_key)
+        if model:
+            where.append("t.model = ?"); params.append(model)
+            where.append("EXISTS (SELECT 1 FROM json_each(s.models) WHERE value = ?)")
+            params.append(model)
+        cond = " AND ".join(where)
+
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM traces t "
+            f"JOIN sessions s ON s.session_key = t.session_key WHERE {cond}",
+            params,
+        ).fetchone()["c"]
+
+        # traces 表没有 debug_file / total_attempts 列（原实现里这两个字段对 newapi
+        # 恒为空，因为 get_traces_batch 也不返回它们），故只取实际存在的列。
+        sql = (f"SELECT t.filename, t.msg_count, t.model, t.success, s.api_key "
+               f"FROM traces t "
+               f"JOIN sessions s ON s.session_key = t.session_key "
+               f"WHERE {cond} ORDER BY t.filename DESC")
+        p = list(params)
+        if limit > 0:
+            sql += " LIMIT ? OFFSET ?"
+            p.extend([limit, offset])
+        rows = conn.execute(sql, p).fetchall()
+    finally:
+        conn.close()
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        item: Dict[str, Any] = {
+            "filename": r["filename"],
+            "message_count": r["msg_count"],
+            "model": r["model"] or "",
+            "api_key": r["api_key"] or "",
+        }
+        if not r["success"]:
+            item["success"] = False
+            item["total_attempts"] = 1
+        items.append(item)
+    return {"items": items, "total": total or 0}
+
+
+def get_trace_counts(leaf_dir: str, session_keys: List[str]) -> Dict[str, Dict[str, Any]]:
+    """返回 {session_key: {"count": n, "has_failure": bool}}，不拉 trace 明细。
+
+    列表/聚合页只需要 file_count 与 has_failure 两个标量，而 get_traces_batch 会把
+    每条 trace 明细全部拉回来。明细留到点击会话时由 get_traces_for_session 按会话取。
+
+    按 500 一批 IN + GROUP BY：实测每批只碰这些 key 的索引项（traces_sk 覆盖索引），
+    4300 个 session 的热态总额 0.12s。整表 GROUP BY 一次扫完看似更省，但热态要
+    0.35s（要遍历全部 22w+ 索引项），故只走高选择性 IN。
+    """
+    if not session_keys or not _db_exists(leaf_dir):
+        return {}
+    conn = _connect(leaf_dir)
+    try:
+        result: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(session_keys), _TRACES_IN_CHUNK):
+            chunk = session_keys[i:i + _TRACES_IN_CHUNK]
+            ph = ",".join("?" * len(chunk))
+            for row in conn.execute(
+                f"SELECT session_key, COUNT(*) AS n, MIN(success) AS ok "
+                f"FROM traces WHERE session_key IN ({ph}) GROUP BY session_key",
+                chunk,
+            ):
+                result[row["session_key"]] = {
+                    "count": row["n"] or 0,
+                    "has_failure": not bool(row["ok"]),
+                }
+        return result
+    finally:
+        conn.close()
+
+
+def session_key_for_file(leaf_dir: str, filename: str) -> Optional[str]:
+    """按请求文件名反查它所属的 session_key（traces.filename 有唯一索引）。"""
+    if not filename or not _db_exists(leaf_dir):
+        return None
+    conn = _connect(leaf_dir)
+    try:
+        row = conn.execute(
+            "SELECT session_key FROM traces WHERE filename = ? LIMIT 1", (filename,)
+        ).fetchone()
+        return row["session_key"] if row else None
+    finally:
+        conn.close()
+
+
+def get_traces_for_session(leaf_dir: str, session_key: str) -> List[Dict[str, Any]]:
+    """取单个会话的 trace 明细（含 debug_file 所需字段），供前端点击会话时按需加载。
+
+    列表页现在只回 file_count，明细改由这里独立取；单会话索引命中，毫秒级。
+    """
+    if not session_key or not _db_exists(leaf_dir):
+        return []
+    conn = _connect(leaf_dir)
+    try:
+        rows = conn.execute(
+            "SELECT filename, model, msg_count, ts, success FROM traces "
+            "WHERE session_key = ? ORDER BY ts ASC, id ASC",
+            (session_key,),
+        ).fetchall()
+    finally:
+        conn.close()
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        t: Dict[str, Any] = {
+            "filename": row["filename"],
+            "model": row["model"],
+            "msg_count": row["msg_count"],
+            "ts": row["ts"],
+        }
+        if not row["success"]:
+            t["success"] = False
+        out.append(t)
+    return out
+
+
+def get_known_models_cached(leaf_dir: str) -> Optional[List[str]]:
+    """从 leaf_status.token_stats_json 取该叶出现过的 model（免全表 json_each 扫描）。
+
+    返回 None 表示该叶没有 token 统计缓存（未跑过 /query），调用方应回退到
+    get_known_models() 的 SQL 扫描。实测全表 json_each 单叶 3.2~17.6s，而这条
+    路径只有一次 SQLite 读。
+    """
+    try:
+        import utils.logdir_store as _lds
+        if not _lds._ready():
+            return None
+        names = _lds.models_by_leaf_path().get(leaf_dir)
+        if not names:
+            return None
+        return sorted(names)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def get_traces_batch(leaf_dir: str, session_keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:

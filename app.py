@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, AsyncIterator
 from fastapi.responses import JSONResponse, StreamingResponse, Response, FileResponse
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from utils.token_index import query_token_stats, query_key_stats, query_channel_stats, query_channel_keys, query_api_keys
@@ -218,6 +219,10 @@ app.add_middleware(
     https_only=os.getenv("MONITOR_COOKIE_SECURE", "false").lower() == "true",
     max_age=max(300, int(os.getenv("MONITOR_SESSION_MAX_AGE", "43200"))),
 )
+# GZip 最后添加 → 位于最外层，压缩内层（含鉴权后）的全部响应。
+# Starlette 的 DEFAULT_EXCLUDED_CONTENT_TYPES 已含 text/event-stream，
+# 不会缓冲/压缩 SSE 流式透传（见 _filter_response_headers 处的说明）。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
@@ -1857,6 +1862,17 @@ def export_view_api_file(key: str = "", filename: str = "", log_dir: str = "",
     if data is None:
         return JSONResponse({"error": "parse failed or invalid filename"}, status_code=500)
     return JSONResponse(data)
+
+
+@app.get("/export/view/api/session-traces")
+def export_view_api_session_traces(key: str = "", filename: str = "",
+                                   access_key: str = Query(default="", alias="access-key")):
+    """按会话取 trace 明细（「关联列表」）。列表接口只回 file_count，点开才拉明细。"""
+    err, resolved_key = _check_public_view(access_key, key)
+    if err:
+        return err
+    from utils.log_routes import session_traces_payload
+    return JSONResponse(session_traces_payload(_stats_roots(), ENV_DIR, resolved_key, filename))
 
 
 @app.get("/export/view/api/file/download")

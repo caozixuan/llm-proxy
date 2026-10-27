@@ -90,7 +90,16 @@ def register_session_routes(app: FastAPI, logs_dir: str) -> None:
         })
 
     @app.get("/sessions/stats")
-    def sessions_stats(threshold: int = QUALIFIED_THRESHOLD_DEFAULT, refresh: bool = False):
+    def sessions_stats(threshold: int = QUALIFIED_THRESHOLD_DEFAULT, refresh: bool = False,
+                       include_rows: bool = False):
+        """session 统计。默认 slim：不返回 rows（key×date / key×mtime 明细矩阵）。
+
+        rows 占整个响应 ~99.9%（本机实测 2.8MB 中 2.84MB），而 /、/sessions、
+        /overview 三个页面只读 total_sessions / qualified_sessions / threshold /
+        _dir / last_refresh_ts，从不读 rows。真正需要 rows 的服务端调用方（导出
+        浏览的 key→mtime 分布）走的是 build_stats_multi 本身，不经过本端点。
+        需要明细时显式传 include_rows=1。
+        """
         roots = get_registered_roots(str(env_dir))
         existing = [r for r in roots if Path(r).is_dir()]
         if not existing:
@@ -99,8 +108,9 @@ def register_session_routes(app: FastAPI, logs_dir: str) -> None:
         # 「刷新」按钮 = bust_ttl（跳过 10s 内存 TTL、强制重扫 index.jsonl 签名），
         # 但仍 force=False 享受签名短路（未变叶子命中 leaf_status 缓存、不重算）。
         # 真正的「全量重建」保留在「数据管理」的 backfill 路径，不由统计页触发。
+        # include_rows 下传到构建层，slim 时根本不构建 rows 明细（省 ~0.45s/请求）。
         stats = build_stats_multi(existing, threshold, force=False, bust_ttl=refresh,
-                                  active_env_dir=str(env_dir))
+                                  active_env_dir=str(env_dir), include_rows=include_rows)
 
         stats["_dir"] = " + ".join(existing)
         stats["_roots"] = existing
@@ -228,3 +238,11 @@ def register_session_routes(app: FastAPI, logs_dir: str) -> None:
         })
 
     start_stats_warmer(str(env_dir))
+    # token 索引原先没有任何预热，冷成本（~4.4s，主要是 4592 叶的冷 NFS stat）
+    # 每 600s TTL 到期后由用户请求全价支付，见 utils/token_index.start_token_warmer。
+    try:
+        from utils.token_index import start_token_warmer
+        start_token_warmer(str(env_dir))
+    except Exception:  # noqa: BLE001 — 预热启动失败不影响路由注册
+        import logging
+        logging.getLogger("session-routes").warning("token warmer 启动失败", exc_info=True)

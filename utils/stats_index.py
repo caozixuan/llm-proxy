@@ -244,6 +244,11 @@ def _leaf_status_subs(env_dir: Path, rid: str):
     row 为该叶的统计缓存行（含 idx_size/idx_mtime/stats_json/stats_threshold），
     供签名判活；活跃小时叶子（可能还没进 leaf_status）并入且 row=None。
     去重按叶子绝对路径归一化。
+
+    不在枚举时逐叶 is_dir()：那是冷路径上最贵的一步（4595 次 NFS 元数据查询，
+    属性缓存冷时约 0.25ms/次），而下游 refresh_index / refresh_token_index 对
+    每叶的 `stat(index.jsonl)` 已经能证明目录存在，且都 try/except OSError。
+    这里只保留"路径存在性"的轻量过滤交给下游，省掉一次往返/叶。
     """
     import utils.logdir_store as _lds
     norm = os.path.normpath(str(env_dir))
@@ -253,21 +258,26 @@ def _leaf_status_subs(env_dir: Path, rid: str):
         lp = row.get("leaf_path") or ""
         if not lp:
             continue
-        full = lp if os.path.isabs(lp) else os.path.join(norm, lp)
+        # 相对 root 登记的 leaf_path 本身可能就是相对 root 的路径（如
+        # 'logs_all/env-99oR/26081109'），此时不能再拼一次 root，否则得到
+        # 'logs_all/env-99oR/logs_all/env-99oR/26081109'，叶子被静默丢弃。
+        if os.path.isabs(lp):
+            full = lp
+        elif os.path.normpath(lp) == norm or lp.startswith(norm + os.sep):
+            full = lp
+        else:
+            full = os.path.join(norm, lp)
         key = os.path.normpath(full)
         if key in seen:
             continue
-        p = Path(full)
-        if not p.is_dir():
-            continue
         seen.add(key)
-        out.append((p, row))
+        out.append((Path(full), row))
     # 并入活跃小时叶子（新建的小时目录可能还没同步进 leaf_status，且它永不冻结）
     active_tag = _get_active_tag()
     if active_tag:
         ap = env_dir / active_tag
         akey = os.path.normpath(str(ap))
-        if akey not in seen and ap.is_dir():
+        if akey not in seen:
             seen.add(akey)
             out.append((ap, None))
     return out
@@ -720,20 +730,37 @@ def _full_build_key_cache(index: dict) -> dict:
     }
 
 
-def _build_rows(cache: dict, threshold: int) -> dict:
-    """从 key cache 构建 build_stats_from_index 的输出格式。"""
+def _build_rows(cache: dict, threshold: int, include_rows: bool = True) -> dict:
+    """从 key cache 构建 build_stats_from_index 的输出格式。
+
+    include_rows=False 时跳过 rows 明细（key×date 的 cells + key×mtime 的
+    mtime_cells）——本机实测这部分占整个响应 99.9%（2.8MB / 2287 行 /
+    39036 个 mtime 单元），而首页、/sessions、/overview 只读 total_sessions /
+    qualified_sessions / threshold / dates。跳过它省掉每请求 ~0.45s 的纯 Python
+    重建与序列化，只保留几个标量。
+    """
     table = cache.get("table", {})
-    mtime_table = cache.get("mtime_table", {})
     totals = cache.get("totals", {})
 
     all_dates: set = set()
     for sub in table.values():
         all_dates.update(sub.keys())
+    dates = sorted(all_dates)
+
+    result = {
+        "total_sessions": totals.get("total", 0),
+        "qualified_sessions": totals.get("qualified", 0),
+        "threshold": threshold,
+        "dates": dates,
+    }
+    if not include_rows:
+        return result
+
+    mtime_table = cache.get("mtime_table", {})
     all_mtimes: set = set()
     for sub in mtime_table.values():
         all_mtimes.update(sub.keys())
-
-    dates = sorted(all_dates)
+    mtimes = sorted(all_mtimes)
     keys = sorted(table.keys())
 
     rows = []
@@ -748,7 +775,7 @@ def _build_rows(cache: dict, threshold: int) -> dict:
                 row_total += c["total"]
                 row_qualified += c["qualified"]
         mtime_cells = {}
-        for mt in sorted(all_mtimes):
+        for mt in mtimes:
             mc = mtime_table.get(key, {}).get(mt, {"total": 0, "qualified": 0})
             if mc["total"] > 0:
                 mtime_cells[mt] = {"total": mc["total"], "qualified": mc["qualified"]}
@@ -761,18 +788,13 @@ def _build_rows(cache: dict, threshold: int) -> dict:
                 "row_qualified": row_qualified,
             })
 
-    return {
-        "total_sessions": totals.get("total", 0),
-        "qualified_sessions": totals.get("qualified", 0),
-        "threshold": threshold,
-        "dates": dates,
-        "rows": rows,
-    }
+    result["rows"] = rows
+    return result
 
 
 def build_stats_multi(roots: List[str], threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
                       force: bool = False, active_env_dir: Optional[str] = None,
-                      bust_ttl: bool = False) -> dict:
+                      bust_ttl: bool = False, include_rows: bool = True) -> dict:
     """跨多个 root 刷新 + 构建 session 统计，合并 rows / dates / totals。
 
     每个 root 独立走 refresh_index + build_stats_from_index（各自缓存），
@@ -780,6 +802,9 @@ def build_stats_multi(roots: List[str], threshold: int = QUALIFIED_THRESHOLD_DEF
 
     bust_ttl=True（「刷新」按钮）跳过 10s 内存 TTL 早返回、强制重扫签名，但仍
     force=False 享受签名短路（未变叶子命中缓存）。
+
+    include_rows=False 时不下传 rows 构建（见 _build_rows），只返回标量 +
+    dates；供只需要总数/达标数的页面使用，省掉每请求 ~0.45s 的重建。
     """
     merged_rows: Dict[str, dict] = {}
     all_dates: set = set()
@@ -789,7 +814,8 @@ def build_stats_multi(roots: List[str], threshold: int = QUALIFIED_THRESHOLD_DEF
     for root in roots:
         env_path = Path(root)
         index = refresh_index(env_path, threshold, force=force, bust_ttl=bust_ttl)
-        stats = build_stats_from_index(index, threshold, env_dir=env_path)
+        stats = build_stats_from_index(index, threshold, env_dir=env_path,
+                                       include_rows=include_rows)
 
         total_sessions += stats.get("total_sessions", 0)
         qualified_sessions += stats.get("qualified_sessions", 0)
@@ -822,24 +848,28 @@ def build_stats_multi(roots: List[str], threshold: int = QUALIFIED_THRESHOLD_DEF
                 cell["total"] += c.get("total", 0)
                 cell["qualified"] += c.get("qualified", 0)
 
-    rows = sorted(merged_rows.values(), key=lambda r: r["row_total"], reverse=True)
-    return {
+    result = {
         "total_sessions": total_sessions,
         "qualified_sessions": qualified_sessions,
         "threshold": threshold,
         "dates": sorted(all_dates),
-        "rows": rows,
     }
+    if include_rows:
+        result["rows"] = sorted(merged_rows.values(), key=lambda r: r["row_total"], reverse=True)
+    return result
 
 
 def build_stats_from_index(index: dict, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
-                           env_dir: Optional[Path] = None) -> dict:
+                           env_dir: Optional[Path] = None,
+                           include_rows: bool = True) -> dict:
     """从索引数据构建统计结果，支持 bucket 级增量更新 + 磁盘持久化。
 
     三条路径:
       A) _changed_buckets 为空 → 直接从内存 key cache 构建 rows
       B) _changed_buckets 非空 → 定向增量更新 key cache，持久化后构建 rows
       C) 首次 / env 切换 → 全量构建，持久化后构建 rows
+
+    include_rows=False 跳过 rows 明细构建（见 _build_rows 说明），只产出标量。
     """
     global _current_key_cache_env
 
@@ -854,7 +884,7 @@ def build_stats_from_index(index: dict, threshold: int = QUALIFIED_THRESHOLD_DEF
 
     if is_same_env and changed_buckets is not None and len(changed_buckets) == 0:
         _current_key_cache_env = env_dir_str
-        return _build_rows(mem_cache, threshold)
+        return _build_rows(mem_cache, threshold, include_rows=include_rows)
 
     if is_same_env and changed_buckets:
         for dir_name, bk, old_c, new_c in changed_buckets:
@@ -864,7 +894,7 @@ def build_stats_from_index(index: dict, threshold: int = QUALIFIED_THRESHOLD_DEF
         if _env_dir:
             _save_key_cache(_env_dir, mem_cache)
         _current_key_cache_env = env_dir_str
-        return _build_rows(mem_cache, threshold)
+        return _build_rows(mem_cache, threshold, include_rows=include_rows)
 
     if _env_dir and not is_same_env:
         disk_cache = _load_key_cache(_env_dir)
@@ -885,14 +915,14 @@ def build_stats_from_index(index: dict, threshold: int = QUALIFIED_THRESHOLD_DEF
                 _cleanup_zeros(disk_cache)
                 disk_cache["updated_at"] = time.time()
                 _save_key_cache(_env_dir, disk_cache)
-            return _build_rows(disk_cache, threshold)
+            return _build_rows(disk_cache, threshold, include_rows=include_rows)
 
     cache = _full_build_key_cache(index)
     _mem_key_cache_map[env_dir_str] = cache
     _current_key_cache_env = env_dir_str
     if _env_dir:
         _save_key_cache(_env_dir, cache)
-    return _build_rows(cache, threshold)
+    return _build_rows(cache, threshold, include_rows=include_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1040,16 +1070,43 @@ def get_last_refresh_ts() -> float:
     return _last_refresh_ts
 
 
+def _warmer_roots(env_dir: str) -> List[str]:
+    """预热覆盖的 root 列表：全部已登记源，env_dir 排第一。
+
+    原先只预热 env_dir（活跃本地 root，5 叶），而 /sessions/stats 走
+    build_stats_multi(get_registered_roots())，覆盖 11 个 root / 4589 叶。
+    97% 的冷成本（~9200 次 NFS 元数据查询）从未被预热覆盖，首个用户请求必然
+    全价支付 —— 这是冷启动 6.5s 的主因。这里要覆盖全集。
+    """
+    roots: List[str] = [env_dir]
+    try:
+        from utils.logs_config import get_registered_roots
+        for r in get_registered_roots(env_dir):
+            if os.path.normpath(r) not in {os.path.normpath(x) for x in roots}:
+                roots.append(r)
+    except Exception:  # noqa: BLE001 — 取不到就只预热 env_dir
+        pass
+    return [r for r in roots if os.path.isdir(r)]
+
+
 def _stats_warmer_loop(env_dir: str, threshold: int, interval: float = 22.0) -> None:
     global _last_refresh_ts
     env_path = Path(env_dir)
-    _stats_logger.info("stats-warmer: 开始预热 env_dir=%s", env_dir)
+    roots = _warmer_roots(env_dir)
+    _stats_logger.info("stats-warmer: 开始预热 env_dir=%s，覆盖 %d 个 root", env_dir, len(roots))
 
-    # 首轮 force=True：全量重算并把每叶统计签名落进 leaf_status（一次性成本，之后
-    # 各请求走 DB 缓存快路径）。后续轮次 force=False：DB 枚举 + 逐叶一次 stat +
-    # 命中缓存，亚秒级，只重算签名变化的活跃叶。
-    index = refresh_index(env_path, threshold, force=True)
-    build_stats_from_index(index, threshold, env_dir=env_path)
+    # 首轮：env_dir 用 force=True（活跃本地 root，叶子少，成本可忽略，顺带把每叶
+    # 签名落进 leaf_status）；其余 root 一律 force=False —— 绝不能 force=True，
+    # 那会重扫 82GB index.jsonl。它们的 leaf_status 签名缓存已齐备（实测 4589 叶
+    # 中仅 3 叶失配），force=False 只需逐叶一次 stat，签名命中即返回。
+    for r in roots:
+        p = Path(r)
+        is_env = os.path.normpath(r) == os.path.normpath(env_dir)
+        try:
+            index = refresh_index(p, threshold, force=is_env)
+            build_stats_from_index(index, threshold, env_dir=p, include_rows=False)
+        except Exception:  # noqa: BLE001 — 单个 root 失败不影响其它 root
+            _stats_logger.warning("stats-warmer: 预热失败 root=%s", r, exc_info=True)
     _last_refresh_ts = time.time()
     _stats_logger.info("stats-warmer: 首次预热完成")
 
@@ -1057,8 +1114,13 @@ def _stats_warmer_loop(env_dir: str, threshold: int, interval: float = 22.0) -> 
         _stats_warmer_stop.wait(interval)
         if _stats_warmer_stop.is_set():
             break
-        index = refresh_index(env_path, threshold, force=False)
-        build_stats_from_index(index, threshold, env_dir=env_path)
+        for r in roots:
+            p = Path(r)
+            try:
+                index = refresh_index(p, threshold, force=False)
+                build_stats_from_index(index, threshold, env_dir=p, include_rows=False)
+            except Exception:  # noqa: BLE001
+                _stats_logger.warning("stats-warmer: 周期预热失败 root=%s", r, exc_info=True)
         _last_refresh_ts = time.time()
 
 

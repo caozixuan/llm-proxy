@@ -7,7 +7,7 @@
 {% block head_extra %}
     {# URL 里可能带完整 API Key（用于刷新恢复筛选）；限制 Referer 只发同源，避免随 CDN 请求外泄 #}
     <meta name="referrer" content="same-origin" />
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="/static/js/marked.min.js"></script>
     <script src="/static/js/chat-render.js"></script>
 {% endblock %}
 
@@ -617,6 +617,10 @@ let knownModels = new Set();
 let _logDirsLoaded = false;
 let _allDirs = [];   // /logs/dirs 原始条目，供来源/时间目录两级下拉复用
 let _keyPrefRestored = false;
+// 程序化设置三级下拉（如启动时默认选最新小时）期间为 true：此时 _pickSSOption
+// 会触发 onSelect → _reloadForTimeChange()，若不挡住，会在状态还没设全时
+// 先发一次请求（且 log_dir 仍为空，会退化成 source 全量）。
+let _suppressReload = false;
 let _backfillTimer = null;  // new-api 大叶子首次回填时的轮询定时器（切目录/离开时清除）
 
 // 取消进行中的回填轮询（切换目录、过滤条件变化或离开时调用，避免轮询叠加）
@@ -788,7 +792,8 @@ function _populateHourSelect(rootName, ym, day) {
         seen.add(ymdh);
         // 未选「日」时会在整月范围内列小时，标签补上日期避免歧义
         let label = day ? (ymdh.slice(6, 8) + '时') : _fmtYMDH(ymdh);
-        if (d.count !== undefined) label += ' (' + d.count + ')';
+        // count 为 null 表示该目录还没同步进索引（通常是当前小时，仍在增长）
+        if (d.count !== undefined && d.count !== null) label += ' (' + d.count + ')';
         items.push({ value: ymdh, label });
     });
     items.sort((a, b) => b.value.localeCompare(a.value));
@@ -799,6 +804,17 @@ function _currentRootValue() {
     const rootSel = document.getElementById('rootSelect');
     return rootSel && rootSel.tagName === 'SELECT' && rootSel.style.display !== 'none'
         ? (rootSel.value || null) : null;
+}
+
+// 未选具体小时目录时，把「当前来源」作为 source 参数发给后端，让后端读该来源
+// 的全部叶子。来源下拉在单来源时不显示（display:none），此时回落 URL 里的
+// source —— 否则用户从外部链接 ?source=xxx 进来会拿到默认活跃目录（通常没数据）。
+function _currentSourceParam() {
+    const root = _currentRootValue();
+    if (root) return '&source=' + encodeURIComponent(root);
+    const params = new URLSearchParams(window.location.search);
+    const src = params.get('source') || '';
+    return src ? '&source=' + encodeURIComponent(src) : '';
 }
 
 // logDirSelect（hidden）由三级下拉合成；currentLogDir() 读它
@@ -911,6 +927,44 @@ function _applyUrlState(state) {
     return false;
 }
 
+// 没有 URL 指定小时目录时，默认选中「当前来源下最新的一小时」。
+// 页面不提供「全部」这种默认：全量要跨上千个叶子收集，首屏根本等不到。
+// 选中后由调用方 loadFileList() 拉该小时的数据。
+function _selectNewestHour() {
+    const root = _currentRootValue();
+    // 直接从 _allDirs 算最新小时，不能先读 DOM 里的 #hourWrap —— _populateHourSelect
+    // 需要 ym 前缀才会生成选项，初始化时月份为空，DOM 里一个小时项都没有，
+    // 会直接返回 ''，导致 log_dir 为空、前端退回 source 全量（1385 个叶子）。
+    let newest = '';
+    _allDirs.forEach(d => {
+        if (root !== null && (d.root || '') !== root) return;
+        const ymdh = _ymdhFromName(d.name);
+        if (ymdh.length >= 8 && ymdh > newest) newest = ymdh;
+    });
+    if (!newest) return '';
+    const ym = _ymFromYmdh(newest), day = _dayFromYmdh(newest);
+    // 程序化设置期间挡住 onSelect → _reloadForTimeChange：此时 log_dir 还没同步，
+    // 提前发请求会退化成 source 全量。状态设完由调用方统一加载。
+    _suppressReload = true;
+    try {
+        _populateYmSelect(root);
+        if ([...document.querySelectorAll('#ymWrap .ss-option')].some(o => o.dataset.value === ym)) {
+            _pickSSOption('ymWrap', 'ymLabel', ym, _fmtYMDH(ym));
+        }
+        _populateDaySelect(root, ym);
+        if ([...document.querySelectorAll('#dayWrap .ss-option')].some(o => o.dataset.value === day)) {
+            _pickSSOption('dayWrap', 'dayLabel', day, day + '日');
+        }
+        _populateHourSelect(root, ym, day);
+        const opt = [...document.querySelectorAll('#hourWrap .ss-option')].find(o => o.dataset.value === newest);
+        if (opt) _pickSSOption('hourWrap', 'hourLabel', newest, opt.textContent);
+    } finally {
+        _suppressReload = false;
+    }
+    _syncLogDirFromSelects();
+    return newest;
+}
+
 // 兼容旧代码：_populateDirSelect 现在用三级联动实现
 function _populateDirSelect(rootName) {
     _populateYmSelect(rootName);
@@ -918,6 +972,7 @@ function _populateDirSelect(rootName) {
 
 // 切换时间目录时不清空 API Key / 模型过滤器，只重置翻页状态后重新加载
 function _reloadForTimeChange() {
+    if (_suppressReload) return;   // 程序化设置下拉期间不加载，由调用方统一触发
     _syncLogDirFromSelects();
     _writeUrlState();
     offset = 0;
@@ -929,7 +984,7 @@ function _reloadForTimeChange() {
     document.getElementById('q1Search').value = '';
     fileListEl.innerHTML = '<div class="cv-sidebar-tip"><span class="spinner"></span>加载中…</div>';
     document.getElementById('loadStatus').textContent = '';
-    loadFileList(true);
+    loadFileList();
 }
 
 async function loadLogDirs() {
@@ -1161,7 +1216,9 @@ async function loadFileList(refresh = false) {
         // 流式：只在「无搜索 + 首页」时用。搜索需要全量收集才能正确过滤，首页之外的
         // 翻页（loadMore）走内存窗口：内容已由流式/全量收集进 aggChains，DOM 只保留
         // PAGE_SIZE 的倍数，滚动到底从内存补下一段，不发网络请求。
-        const useStream = _exportViewMode && !hasFilter;
+        // 内部页与公开导出浏览共用同一条流式路径：后端两者都走并发收集 + 结果缓存，
+        // 只有公开页才走会让内部页每次重新同步收集（单叶就要 4~6s）。
+        const useStream = !hasFilter;
         try {
             if (useStream && offset === 0) {
                 await _loadAggStream(min, params, refresh);
@@ -1283,7 +1340,14 @@ async function _loadAggStream(min, params, refresh) {
     // refresh=1 让后端跳过 900s 的聚合结果缓存。用户点「刷新列表」时必须带上，
     // 否则会拿到旧快照——之前的实现把 refresh 丢在这里，按钮等于没用。
     const refreshParam = refresh ? '&refresh=1' : '';
-    const startUrl = `${_apiPrefix()}/aggregate/stream/start?min_messages=${min}${modelParam}${refreshParam}${_sharedParams()}`;
+    // 必须把 log_dir 一并发给后端：选中某个时间目录时只读那一个叶子，
+    // 否则后端会退化成枚举全部 4000+ 叶子。
+    const _ld = currentLogDir();
+    const logDirParam = _ld ? `&log_dir=${encodeURIComponent(_ld)}` : '';
+    // 只选了来源（?source=xxx）、没选具体小时目录时，把 source 也发过去：
+    // 否则后端无从得知该读哪个来源，会回落到本服务自己的活跃目录（通常没有数据）。
+    const _srcParam = _ld ? '' : _currentSourceParam();
+    const startUrl = `${_apiPrefix()}/aggregate/stream/start?min_messages=${min}${modelParam}${refreshParam}${logDirParam}${_srcParam}${_sharedParams()}`;
     const startRes = await fetch(startUrl);
     if (!startRes.ok) throw new Error(`HTTP ${startRes.status}`);
     const { task_id } = await startRes.json();
@@ -1458,26 +1522,42 @@ async function selectAggChain(idx, el) {
     el.classList.add('active');
     activeItem = el;
     const chain = aggChains[idx];
-    const _failedTrace = (chain.trace_list || []).find(function(t) { return t.success === false; });
+    const logDir = currentLogDir();
 
     chatPanel.innerHTML = '<div class="empty-state"><span class="spinner"></span><p>加载中…</p></div>';
-    renderDetailPanel({
-        api_key: chain.api_key || '',
-        models: chain.models || (chain.model ? [chain.model] : []),
-        message_count: chain.message_count || 0,
-        first_time: chain.first_time || '',
-        last_time: chain.last_time || '',
-        file_count: chain.file_count || 1,
-        trace_list: chain.trace_list || [],
-        latest_file: chain.latest_file || '',
-        has_failure: chain.has_failure || false,
-        debug_file: _failedTrace ? _failedTrace.debug_file || '' : '',
-        total_attempts: _failedTrace ? _failedTrace.total_attempts || 1 : 1,
-    });
+    // 先用列表里已有的标量把详情面板画出来（不含「关联列表」），内容与明细并行加载。
+    const _paintDetail = function(traceList, usage) {
+        const _failedTrace = (traceList || []).find(function(t) { return t.success === false; });
+        renderDetailPanel({
+            api_key: chain.api_key || '',
+            models: chain.models || (chain.model ? [chain.model] : []),
+            message_count: chain.message_count || 0,
+            first_time: chain.first_time || '',
+            last_time: chain.last_time || '',
+            file_count: chain.file_count || 1,
+            trace_list: traceList || [],
+            latest_file: chain.latest_file || '',
+            usage: usage || null,
+            has_failure: chain.has_failure || false,
+            debug_file: _failedTrace ? _failedTrace.debug_file || '' : '',
+            total_attempts: _failedTrace ? _failedTrace.total_attempts || 1 : 1,
+        });
+    };
+    _paintDetail([], null);
+
+    // 列表接口只回 file_count；「关联列表」需要明细，点开时单独取（单会话索引，
+    // 毫秒级）。失败不影响主内容显示，只是不显示关联列表。
+    const _tracesPromise = (chain.file_count > 1 || chain.has_failure)
+        ? fetch(`${_apiPrefix()}/session-traces?filename=${encodeURIComponent(chain.latest_file || '')}`
+                + `${logDir ? '&log_dir=' + encodeURIComponent(logDir) : ''}`
+                + `&api_key=${encodeURIComponent(chain.api_key || '')}${_sharedParams()}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(d => (d && d.items) || null)
+            .catch(() => null)
+        : Promise.resolve([]);
 
     if (chain.latest_file) {
         try {
-            const logDir = currentLogDir();
             const fileParams = `filename=${encodeURIComponent(chain.latest_file)}${logDir ? '&log_dir=' + encodeURIComponent(logDir) : ''}`;
             const res = await fetch(`${_apiPrefix()}/file?${fileParams}${_sharedParams()}`);
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1485,22 +1565,8 @@ async function selectAggChain(idx, el) {
             data._req_file = chain.latest_file;
             data._log_dir = logDir || '';
             renderMessages(data, `${chain.q1_preview || chain.latest_file}  (${chain.file_count} 个文件)`);
-            if (data._usage) {
-                renderDetailPanel({
-                    api_key: chain.api_key || '',
-                    models: chain.models || (chain.model ? [chain.model] : []),
-                    message_count: chain.message_count || 0,
-                    first_time: chain.first_time || '',
-                    last_time: chain.last_time || '',
-                    file_count: chain.file_count || 1,
-                    trace_list: chain.trace_list || [],
-                    latest_file: chain.latest_file || '',
-                    usage: data._usage,
-                    has_failure: chain.has_failure || false,
-                    debug_file: _failedTrace ? _failedTrace.debug_file || '' : '',
-                    total_attempts: _failedTrace ? _failedTrace.total_attempts || 1 : 1,
-                });
-            }
+            const traceList = await _tracesPromise;
+            _paintDetail(traceList, data._usage);
         } catch(e) {
             showError(`加载失败：${e.message}`);
         }
@@ -2133,11 +2199,21 @@ loadLogDirs().then(() => {
     // resetAndLoad() 会清空 key/model，所以先 resetAndLoad（跳过首次加载）再套用过滤，
     // 最后只发一次带完整条件的列表请求。
     const _urlState = _restoreUrlState();
-    _applyUrlState(_urlState);                // 设置 source + 时间下拉 + logDirSelect
+    const _hadYmdh = _applyUrlState(_urlState);   // 设置 source + 时间下拉 + logDirSelect
     resetAndLoad(true);                       // 重置状态但不发请求（会清空过滤并同步 URL）
     _applyUrlFilters(_urlState);              // 套用 URL 指定的 key/model
+    // 没有指定小时目录时，默认落到最新一小时。不提供「全部」默认：全量要跨
+    // 上千个叶子收集，首屏等不到，也会把服务打满。
+    if (!_hadYmdh) _selectNewestHour();
     _writeUrlState();                         // 把恢复后的完整条件写回 URL
-    loadFileList(true);
+    // 首次进入是「浏览」而不是「刷新」：不带 refresh，命中后端聚合结果缓存即秒开。
+    // 只有用户点「刷新列表」才走 loadFileList(true) 跳过缓存、重新收集。
+    if (currentLogDir()) {
+        loadFileList();
+    } else {
+        fileListEl.innerHTML = '<div class="cv-sidebar-tip">请选择时间目录</div>';
+        document.getElementById('loadStatus').textContent = '';
+    }
     const _params = new URLSearchParams(window.location.search);
     const _urlFile = _params.get('file');
     const _urlLogDir = _params.get('log_dir');
