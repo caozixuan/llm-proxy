@@ -188,12 +188,36 @@ def recompute_leaf(row: dict) -> bool:
             idx_size, idx_mtime = 0, 0.0
 
     # 回写时盖上新水位：stats_json 现在确实反映了 sync_rowid 时刻的 index.db。
+    #
+    # sessions 必须一并回写：stale_stats_leaves 的判据之一是「stats_json 的
+    # total 之和 != leaf_status.sessions」。若这里只写 stats_json 而不写 sessions，
+    # 两者永远对不上，该叶子会被每轮反复挑中重算——实测 240fa79b/260805/26080517
+    # 每 2 秒重算一次、日志刷屏（真实会话 2826，leaf_status.sessions 却停在 1796）。
+    # ingested/pending 同理顺手刷新，看板「待同步」靠它算欠账。
+    sessions_total = None
+    ingested = pending = None
+    if isinstance(stats, dict):
+        try:
+            sessions_total = sum(int(v.get("total", 0)) for v in stats.values())
+        except (TypeError, ValueError, AttributeError):
+            sessions_total = None
+    if is_newapi:
+        try:
+            st = nidb.status(leaf_path)
+            ingested = st.get("ingested", 0)
+            pending = st.get("pending", 0)
+            if sessions_total is None:
+                sessions_total = st.get("sessions")
+        except Exception as ex:  # noqa: BLE001
+            logger.debug("读叶子 status 失败 %s: %s", leaf_path, ex)
+
     logdir_store.set_leaf_stats(
         root_id, dir_key, leaf_path=leaf_path,
         idx_size=int(idx_size), idx_mtime=float(idx_mtime),
         stats_json=json.dumps(stats, ensure_ascii=False),
         stats_threshold=THRESHOLD,
         stats_sync_rowid=int(row.get("sync_rowid") or 0),
+        sessions=sessions_total, ingested=ingested, pending=pending,
     )
     logger.info("补算完成 %s/%s buckets=%d 用时 %.2fs 水位=%s",
                 root_id, dir_key, len(stats), elapsed, row.get("sync_rowid"))

@@ -264,9 +264,12 @@ def sync_leaves(path: str, templates=None) -> dict:
     # templates 空 → 回退该 fmt 的默认模板（等价旧硬规则），保证老源不填也能同步。
     tpls = templates if templates else default_templates(fmt)
     total = built = added = updated = 0
-    # 现有叶子的 sessions（一次查询）：已有非零值的叶子跳过 nidb.status()——那是每叶
-    # open sqlite 的最贵操作。仅历史 sessions=0（或 DB 无此叶）的已建叶子才补读。
-    existing_sessions = {r["dir_key"]: (r.get("sessions") or 0) for r in lds.bulk_get(rid)}
+    # 现有叶子的 sessions/ingested（一次查询）：已有非零值的叶子跳过 nidb.status()
+    # ——那是每叶 open sqlite 的最贵操作。仅历史 sessions=0 或 ingested=0（或 DB 无
+    # 此叶）的已建叶子才补读。
+    _existing = {r["dir_key"]: r for r in lds.bulk_get(rid)}
+    existing_sessions = {k: (v.get("sessions") or 0) for k, v in _existing.items()}
+    existing_ingested = {k: (v.get("ingested") or 0) for k, v in _existing.items()}
     # native 的 built 判定要读 session 聚合进度：一次性取该库全部 index_progress
     # （{叶子绝对路径: byte_offset}），循环内 dict 命中，避免逐叶查 SQLite。
     # session_store 未初始化时返回 {} → native 叶子一律判未 built（软失败，不崩同步）。
@@ -287,6 +290,8 @@ def sync_leaves(path: str, templates=None) -> dict:
         is_built = (_native_leaf_built(leaf, native_progress)
                     if is_native else nidb._db_exists(str(leaf)))
         sessions = None
+        ingested = None
+        pending = None
         if is_native:
             # native：无论 built 与否都回填真实 session 数（未追平的叶子也已聚合了
             # 部分会话，如实显示）。get 不到（从未聚合）→ 0，覆盖历史遗留脏值。
@@ -295,14 +300,23 @@ def sync_leaves(path: str, templates=None) -> dict:
                 built += 1
         elif is_built:
             built += 1
-            # newapi 已建叶子：仅当 DB 里该叶 sessions 还是 0（历史遗留/新叶）时才读一次
-            # status 落库（open sqlite 贵）；已有值的跳过，sessions 留 None → upsert 不覆盖。
-            if existing_sessions.get(dir_key, 0) == 0:
+            # newapi 已建叶子：只在「DB 里该叶 sessions 还是 0」或「ingested 还是 0」
+            # 时才读一次 status 落库（open sqlite 贵）；否则三项留 None → upsert 不覆盖。
+            #
+            # 为什么也要看 ingested：watcher/回填才会写 ingested，早于此的叶子（8 月初
+            # 登记那批）它一直是 0。而看板「待同步」按 entry_count - ingested 算欠账，
+            # 于是 382 个早已追平的叶子被虚报成 2700 万行待摄取。这里顺手补上。
+            if (existing_sessions.get(dir_key, 0) == 0
+                    or existing_ingested.get(dir_key, 0) == 0):
                 try:
                     st = nidb.status(str(leaf))
                     sessions = st.get("sessions", 0)
+                    ingested = st.get("ingested", 0)
+                    pending = st.get("pending", 0)
                 except Exception:
                     sessions = None
+                    ingested = None
+                    pending = None
         # state：已建=done。未建时 —— native 有 index.jsonl 却未追平 = 聚合在途，标
         # building 更贴切；newapi 无 index.db = 尚未回填，仍标 pending。
         if is_built:
@@ -314,6 +328,8 @@ def sync_leaves(path: str, templates=None) -> dict:
             leaf_path=str(leaf),  # 真实折叠叶子绝对路径，供 mtime→叶子解析直接查表
             built=is_built,
             sessions=sessions,
+            ingested=ingested,
+            pending=pending,
             state=state,
         )
         if res == "added":

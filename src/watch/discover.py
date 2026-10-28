@@ -122,18 +122,32 @@ class SourceWatcher:
         # 读真实水位（廉价 meta 点查）
         no_db = not _db_exists(leaf_str)
         offset_at = 0
+        dirty = False
+        has_null_q1 = False
         if not no_db:
             try:
                 c = _connect(leaf_str)
                 offset_at = int(_meta_get(c, "ingest_offset", "0") or 0)
+                # 字节追平 ≠ 数据齐：enrich 解析合并文件失败会留下 q1_hash IS NULL 的
+                # 行，sessions 也可能待重新折叠。这两项在文件大小上完全看不出来，
+                # 只看 offset 会把这些叶子永久漏掉（实测 jumper-001 有 5 片）。
+                # 默认值必须与 needs_build 一致（那里缺键视为脏 '1'）：
+                # 新建库尚未写过该键时，若这里当干净、那边当脏，就会出现
+                # 发现线程不入队、而 needs_build 永远为真——只剩对账线程在兜。
+                dirty = _meta_get(c, "sessions_dirty", "1") == "1"
+                if not dirty:
+                    # 走 requests_pending 部分索引，空集时几乎零成本
+                    has_null_q1 = c.execute(
+                        "SELECT 1 FROM requests WHERE q1_hash IS NULL LIMIT 1"
+                    ).fetchone() is not None
                 c.close()
             except Exception:  # noqa: BLE001
                 # db 半成品/打不开：当作需要重建
                 no_db = True
                 offset_at = 0
 
-        # 权威判定：还欠多少字节
-        lagging = no_db or idx_size > offset_at
+        # 权威判定：字节还欠，或数据欠（有未补 meta / sessions 待折叠）
+        lagging = no_db or idx_size > offset_at or dirty or has_null_q1
 
         if not lagging:
             # 已追平，更新快速短路缓存即可
@@ -153,7 +167,12 @@ class SourceWatcher:
 
         from utils.log_scan import dir_key_for
         dk = dir_key or dir_key_for(Path(self.root_path), leaf)
-        reason = "new" if no_db else "grown"
+        if no_db:
+            reason = "new"
+        elif idx_size > offset_at:
+            reason = "grown"
+        else:
+            reason = "dirty"   # 字节已追平，但有待补 meta / sessions 待折叠
         # 入队成功才推进缓存；被忽略（极小概率：touch 与 enqueue 之间的竞态）时
         # 保持旧值，下一轮自然重试。绝不因「已入队」而推进。
         if self._enqueue(leaf_str, dk, reason, idx_size, offset_at):

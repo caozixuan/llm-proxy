@@ -87,26 +87,6 @@
 .panel .data-table { table-layout: auto; }
 .dash-scroll { overflow-x: auto; }
 
-/* ===== 流水线 ===== */
-.pipeline { display: flex; align-items: stretch; gap: 0; margin: 4px 0 14px; }
-.pipe-box { flex: 1; min-width: 0; background: var(--muted); border: 1px solid var(--border);
-    border-radius: var(--radius-sm); padding: 10px 12px; }
-.pipe-box .n { font-size: .68rem; font-family: var(--font-mono); color: var(--muted-foreground); }
-.pipe-box .t { font-size: .82rem; font-weight: 600; margin-top: 3px; color: var(--foreground); }
-.pipe-box .v { font-size: .74rem; color: var(--muted-foreground); margin-top: 3px; }
-.pipe-arrow { display: flex; align-items: center; justify-content: center; width: 26px;
-    color: var(--muted-foreground); font-size: .85rem; flex-shrink: 0; }
-.stacked { display: flex; height: 9px; border-radius: 5px; overflow: hidden; background: var(--muted); }
-.stacked > i { display: block; height: 100%; transition: width .3s ease; }
-.stacked > i.ok { background: var(--success); }
-.stacked > i.run { background: var(--primary); }
-.stacked > i.wait { background: var(--warning); }
-.stacked > i.err { background: var(--destructive); }
-.legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 9px; font-size: .75rem;
-    color: var(--muted-foreground); }
-.legend span { display: flex; align-items: center; gap: 5px; }
-.legend i { width: 8px; height: 8px; border-radius: 2px; display: block; }
-
 /* ===== 两栏 ===== */
 .cols2 { display: grid; grid-template-columns: 1.25fr 1fr; gap: 16px; margin-bottom: 18px; }
 .cols2 > .panel { margin-bottom: 0; }
@@ -147,13 +127,9 @@
 @media (max-width: 1100px) {
     .kpi-row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .cols2 { grid-template-columns: 1fr; }
-    .pipeline { flex-wrap: wrap; }
-    .pipe-arrow { display: none; }
-    .pipe-box { flex: 1 1 44%; margin: 3px; }
 }
 @media (max-width: 750px) {
     .kpi-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .pipe-box { flex: 1 1 100%; }
 }
 {% endblock %}
 
@@ -202,50 +178,6 @@
                 <div class="kpi-label">预计队列清空</div>
                 <div class="kpi-value">{{ fmtEta(ov.totals.eta_sec) }}</div>
                 <div class="kpi-hint">按来源历史吞吐估算</div>
-            </div>
-        </div>
-
-        <!-- 流水线 -->
-        <div class="panel">
-            <div class="toolbar" style="margin-bottom:10px;">
-                <h6 style="margin:0;">索引同步流水线</h6>
-            </div>
-            <div class="pipeline">
-                <div class="pipe-box">
-                    <div class="n">01</div>
-                    <div class="t">发现登记</div>
-                    <div class="v">每源 stat 轮询</div>
-                </div>
-                <div class="pipe-arrow">→</div>
-                <div class="pipe-box">
-                    <div class="n">02</div>
-                    <div class="t">待同步队列</div>
-                    <div class="v">{{ fmtNum(ov.totals.pending) }} 个等待</div>
-                </div>
-                <div class="pipe-arrow">→</div>
-                <div class="pipe-box">
-                    <div class="n">03</div>
-                    <div class="t">同步池</div>
-                    <div class="v">{{ fmtNum(ov.totals.running) }} 个处理中</div>
-                </div>
-                <div class="pipe-arrow">→</div>
-                <div class="pipe-box">
-                    <div class="n">04</div>
-                    <div class="t">index.db 写入</div>
-                    <div class="v">{{ fmtNum(ov.totals.done) }} 个已完成</div>
-                </div>
-            </div>
-            <div class="stacked">
-                <i class="ok" :style="{width: pipePct.done + '%'}"></i>
-                <i class="run" :style="{width: pipePct.run + '%'}"></i>
-                <i class="wait" :style="{width: pipePct.wait + '%'}"></i>
-                <i class="err" :style="{width: pipePct.err + '%'}"></i>
-            </div>
-            <div class="legend">
-                <span><i style="background:var(--success)"></i>成功 {{ fmtNum(ov.totals.done) }}</span>
-                <span><i style="background:var(--primary)"></i>运行中 {{ fmtNum(ov.totals.running) }}</span>
-                <span><i style="background:var(--warning)"></i>排队中 {{ fmtNum(ov.totals.pending) }}</span>
-                <span><i style="background:var(--destructive)"></i>失败 {{ fmtNum(ov.totals.failed) }}</span>
             </div>
         </div>
 
@@ -337,7 +269,7 @@
                         </span>
                     </td>
                     <td>{{ fmtNum(lf.sessions) }}</td>
-                    <td><span :class="lf.new_rows > 0 ? 'msg-err' : ''">{{ fmtNum(lf.new_rows) }}</span></td>
+                    <td><span :class="lf.new_rows > 0 ? 'msg-err' : ''">{{ lf.ingested_unknown ? '—' : fmtNum(lf.new_rows) }}</span></td>
                     <td>{{ fmtNum(lf.pending_rows) }}</td>
                     <td><span :class="lf.new_keys > 0 ? 'msg-err' : ''">{{ fmtNum(lf.new_keys) }}</span></td>
                     <td class="mono-sm">{{ lf.synced_at }}</td>
@@ -419,14 +351,17 @@
                 <h6 style="margin:0;">最近同步任务</h6>
                 <input class="input input-sm" style="max-width:200px;" v-model="qSearch"
                        placeholder="搜索目录…">
-                <select class="input input-sm" style="max-width:130px;" v-model="qStatus">
+                <select class="input input-sm" style="max-width:150px;" v-model="qStatus">
+                    <option value="_active">只看活跃/失败</option>
                     <option value="">全部状态</option>
                     <option value="pending">排队中</option>
                     <option value="running">运行中</option>
                     <option value="done">已完成</option>
                     <option value="failed">失败</option>
                 </select>
-                <span class="muted" style="font-size:.76rem;">{{ filteredQueue.length }} 条</span>
+                <span class="muted" style="font-size:.76rem;">
+                    显示 {{ Math.min(20, filteredQueue.length) }} / {{ filteredQueue.length }} 条
+                </span>
             </div>
             <div class="dash-scroll">
             <table class="data-table">
@@ -750,7 +685,9 @@ new Vue({
             leaves: [],
         },
         qSearch: '',
-        qStatus: '',
+        // 默认「只看活跃/失败」：当前小时叶子每 30 秒重新入队一次，列表里
+        // 绝大多数是同样几个叶子循环的 done 行，全量视图没有信息量。
+        qStatus: '_active',
         // 待同步叶子明细分页：每页 10 条
         leafPage: 1,
         leafPageSize: 10,
@@ -796,18 +733,6 @@ new Vue({
             // 有任务的源数（即真正跑着发现线程的 newapi 源）
             return (this.ov.sources || []).length;
         },
-        pipePct: function() {
-            var t = this.ov.totals || {};
-            var done = t.done || 0, run = t.running || 0, wait = t.pending || 0, err = t.failed || 0;
-            var sum = done + run + wait + err;
-            if (!sum) return { done: 0, run: 0, wait: 0, err: 0 };
-            return {
-                done: done * 100 / sum,
-                run: run * 100 / sum,
-                wait: wait * 100 / sum,
-                err: err * 100 / sum,
-            };
-        },
         bucketMinutes: function() {
             // 后端把窗口切成约 12 个桶；这里按窗口长度反推每柱代表的分钟数
             var t = this.ov.trend || [];
@@ -822,11 +747,17 @@ new Vue({
             return mins > 0 ? (n / mins).toFixed(1) : '0.0';
         },
         filteredQueue: function() {
-            // 纯前端筛选：状态精确匹配 + 目录模糊匹配
+            // 纯前端筛选：状态 + 目录模糊匹配。
+            // qStatus === '_active' 是「只看活跃/失败」：排除 done —— 当前小时的
+            // 叶子每 30 秒重新入队一次，done 行占了绝大部分且来回都是同几个叶子。
             var q = (this.qSearch || '').trim().toLowerCase();
             var st = this.qStatus;
             return (this.ov.queue || []).filter(function(x) {
-                if (st && x.status !== st) return false;
+                if (st === '_active') {
+                    if (x.status === 'done') return false;
+                } else if (st && x.status !== st) {
+                    return false;
+                }
                 if (q && (x.dir_key || '').toLowerCase().indexOf(q) === -1) return false;
                 return true;
             });

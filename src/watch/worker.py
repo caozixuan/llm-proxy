@@ -40,6 +40,9 @@ WATCH_ENRICH_WORKERS = _cfg.ENRICH_WORKERS
 WATCH_ENRICH_INLINE_THRESHOLD = _cfg.ENRICH_INLINE_THRESHOLD
 WATCH_ENRICH_BUDGET = _cfg.ENRICH_BUDGET
 WATCH_BACKFILL_REQUEST_COOLDOWN = _cfg.BACKFILL_REQUEST_COOLDOWN
+WATCH_RECONCILE_INTERVAL = _cfg.RECONCILE_INTERVAL
+WATCH_RECONCILE_BATCH = _cfg.RECONCILE_BATCH
+WATCH_QUEUE_KEEP_DAYS = _cfg.WATCH_QUEUE_KEEP_DAYS
 
 
 class _EnrichBudget:
@@ -296,6 +299,60 @@ def _requeue_if_lagging(leaf_path: str, root_id: str, root_path: str,
         _logger.info("收尾复核补入队 %s size=%d offset=%d", dir_key, size, offset)
 
 
+def _reconciler(stop_evt: threading.Event) -> None:
+    """低频对账：为「字节追平但数据脏」的叶子补入队。
+
+    发现线程对大小没变的叶子会短路（否则每轮要打开几千个 sqlite），所以
+    enrich 留下 q1_hash IS NULL、或 sessions 待折叠的叶子，即使从没增长过也
+    永远发现不了——它们只能等人工点「增量构建」。这里每
+    WATCH_RECONCILE_INTERVAL 秒取一批最久未同步的叶子跑 needs_build()，
+    为真的补一条入队。整表轮转一圈十几小时，成本摊薄到每轮几十次 sqlite 读。
+    """
+    _logger.info("对账线程启动 interval=%.0fs batch=%d",
+                 WATCH_RECONCILE_INTERVAL, WATCH_RECONCILE_BATCH)
+    while not stop_evt.wait(WATCH_RECONCILE_INTERVAL):
+        try:
+            rows = logdir_store.least_recently_synced_leaves(WATCH_RECONCILE_BATCH)
+            if not rows:
+                continue
+            from utils.newapi_index_db import needs_build
+            from src.watch.discover import _leaf_priority
+            queued = 0
+            for r in rows:
+                if stop_evt.is_set():
+                    break
+                leaf_path = r.get("leaf_path") or ""
+                root_path = os.path.dirname(os.path.dirname(leaf_path))
+                # 该 root 正在整源回填：不掺和，回填跑完自然会覆盖
+                if root_path and logdir_store.has_active_backfill(root_path):
+                    continue
+                try:
+                    if not needs_build(leaf_path):
+                        continue
+                except Exception:  # noqa: BLE001
+                    continue
+                try:
+                    idx_size = os.path.getsize(os.path.join(leaf_path, "index.jsonl"))
+                except OSError:
+                    idx_size = 0
+                try:
+                    added = logdir_store.enqueue_watch(
+                        r.get("root_id") or "", root_path, leaf_path,
+                        r.get("dir_key") or "",
+                        priority=_leaf_priority(os.path.basename(leaf_path.rstrip("/"))),
+                        reason="reconcile", idx_size=idx_size, offset_at=0,
+                    )
+                    if added:
+                        queued += 1
+                        _logger.info("对账补入队 %s/%s", r.get("root_id"), r.get("dir_key"))
+                except Exception as ex:  # noqa: BLE001
+                    _logger.debug("对账入队失败 %s: %s", leaf_path, ex)
+            _logger.info("RECONCILE 检查 %d 叶 入队 %d", len(rows), queued)
+        except Exception as ex:  # noqa: BLE001
+            _logger.warning("对账线程异常: %s", ex)
+    _logger.info("对账线程退出")
+
+
 def _dispatcher(executor: ThreadPoolExecutor, stop_evt: threading.Event) -> None:
     """dispatcher：持续从 watch_queue 领取任务并提交到池。"""
     _logger.info("dispatcher 启动 concurrency=%d", WATCH_CONCURRENCY)
@@ -372,9 +429,17 @@ def main():
         )
         disp.start()
 
+        # 低频对账：补「字节追平但数据脏」的叶子（发现线程看不出来）
+        rec = threading.Thread(
+            target=_reconciler, args=(stop_evt,),
+            name="watch-reconciler", daemon=True,
+        )
+        rec.start()
+
         # 主循环：每轮跟进 sources 表的变化（新增源/删源/改模板），
         # 让后发现线程不必等 worker 重启就有。
         last_sync = time.monotonic()
+        last_prune = time.monotonic()
         while not _shutdown_requested:
             time.sleep(1)
             if time.monotonic() - last_sync >= WATCH_POLL_SEC:
@@ -386,6 +451,16 @@ def main():
                                      n, supervisor.thread_count())
                 except Exception as ex:  # noqa: BLE001
                     _logger.warning("发现线程维护失败: %s", ex)
+            # 队列清理：每小时一次，删掉超过保留期的终态行
+            if time.monotonic() - last_prune >= 3600:
+                last_prune = time.monotonic()
+                try:
+                    n = logdir_store.prune_watch_queue(WATCH_QUEUE_KEEP_DAYS)
+                    if n:
+                        _logger.info("清理 watch_queue 过期记录 %d 行（保留 %.0f 天）",
+                                     n, WATCH_QUEUE_KEEP_DAYS)
+                except Exception as ex:  # noqa: BLE001
+                    _logger.warning("清理 watch_queue 失败: %s", ex)
 
         _logger.info("收到关停信号，通知所有线程退出…")
         stop_evt.set()

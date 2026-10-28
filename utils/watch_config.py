@@ -65,6 +65,21 @@ ENRICH_BUDGET = _env_int("WATCH_ENRICH_BUDGET", 12)
 # watcher 每轮扫描都会追加一条请求，把 backfill_requests 刷成噪音。
 BACKFILL_REQUEST_COOLDOWN = _env_int("WATCH_BACKFILL_REQUEST_COOLDOWN", 300, minimum=0)
 
+# ── 兜底对账 ─────────────────────────────────────────────────────────────
+
+# 低频对账：每 N 秒取一批「最久未同步」的叶子跑 needs_build()，为真的补入队。
+# 为什么需要它：发现线程对「大小没变」的叶子会短路（否则每轮要打开 4700 个
+# sqlite），所以「字节追平但数据脏」的叶子（enrich 留下的 NULL meta、待折叠的
+# sessions）只靠发现永远碰不到。整源重扫的 auto_sync 太重，这里按叶子限速补漏。
+RECONCILE_INTERVAL = _env_float("WATCH_RECONCILE_INTERVAL", 600.0)
+RECONCILE_BATCH = _env_int("WATCH_RECONCILE_BATCH", 50)
+
+# ── 队列保留 ─────────────────────────────────────────────────────────────
+
+# watch_queue 里终态行（done/failed）保留多少天。这张表只增不减，一次叶子
+# 同步就是一行（实测 4 天 5.2 万行）；不清理会让看板的累计计数只涨不跌。
+WATCH_QUEUE_KEEP_DAYS = _env_float("WATCH_QUEUE_KEEP_DAYS", 7.0, minimum=0.0)
+
 # ── 发现范围 / 优先级 ────────────────────────────────────────────────────
 
 # 快扫只看最近 N 天的最近 M 小时叶子；其余靠全量扫描兜底。
@@ -100,6 +115,9 @@ def summary() -> dict:
         "enrich_inline_threshold": ENRICH_INLINE_THRESHOLD,
         "enrich_budget": ENRICH_BUDGET,
         "backfill_request_cooldown": BACKFILL_REQUEST_COOLDOWN,
+        "reconcile_interval": RECONCILE_INTERVAL,
+        "reconcile_batch": RECONCILE_BATCH,
+        "queue_keep_days": WATCH_QUEUE_KEEP_DAYS,
         "fast_scan_days": FAST_SCAN_DAYS,
         "fast_scan_hours": FAST_SCAN_HOURS,
         "full_scan_every": FULL_SCAN_EVERY,

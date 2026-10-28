@@ -236,10 +236,19 @@ def q1_hash_from_text(text: str) -> str:
     用作会话聚合键：hash 整个（未截断）Q1，避免长 query 前缀相同时误聚合，
     且聚合键定长省内存。空文本返回空串（保持与旧 chain_key 空值一致的
     聚合行为：同 api_key 下空 Q1 仍 collapse 成一个 session）。
+
+    surrogate 容错：new-api 的合并文件里偶有被截断的 4 字节 UTF-8，json 解析后
+    留下孤立代理字符（如 \\ud835），`encode("utf-8")` 会抛 UnicodeEncodeError。
+    这个异常会让整个 enrich 分片失败、该叶子永久卡在 q1_hash IS NULL（实测
+    jumper-001 有 5 片因此反复失败）。用 surrogatepass 把代理字符按原字节编码，
+    哈希仍确定且稳定，不影响其它正常文本的取值。
     """
     if not text:
         return ""
-    return hashlib.md5(text.encode("utf-8")).hexdigest()
+    try:
+        return hashlib.md5(text.encode("utf-8")).hexdigest()
+    except UnicodeEncodeError:
+        return hashlib.md5(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def compute_q1_hash(messages: List[dict]) -> str:

@@ -501,6 +501,26 @@ def bulk_get_stats(root_id: str) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+def least_recently_synced_leaves(limit: int = 50) -> List[dict]:
+    """按 synced_at 升序取最久没被同步过的叶子，供 watcher 的低频对账补漏。
+
+    为什么按「最久未同步」而不是随机/全量：全量一轮 4700 叶、每叶要打开 sqlite，
+    放到 60s 的发现循环里会把 NFS 打满。这里每轮只取一小批，整表轮转一圈要十几
+    小时，成本摊薄到可忽略，而真正卡住的叶子下一轮就会被捞到。
+
+    只返回已建（built=1）且有 index.db 的叶子：未建的归回填管。
+    """
+    if not _ready():
+        return []
+    with _lock:
+        rows = _conn.execute(
+            "SELECT root_id, dir_key, leaf_path, synced_at FROM leaf_status "
+            "WHERE leaf_path != '' AND built = 1 "
+            "ORDER BY synced_at ASC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def stale_stats_leaves(limit: int = 100) -> List[dict]:
     """列出「统计快照不可信」的叶子，供 session_worker 后台补算。
 
@@ -602,11 +622,20 @@ def update_sync_rowid(leaf_path: str, rowid: int) -> int:
 def set_leaf_stats(root_id: str, dir_key: str, *, leaf_path: str = "",
                    idx_size: int, idx_mtime: float,
                    stats_json: str, stats_threshold: int,
-                   stats_sync_rowid: Optional[int] = None) -> None:
+                   stats_sync_rowid: Optional[int] = None,
+                   sessions: Optional[int] = None,
+                   ingested: Optional[int] = None,
+                   pending: Optional[int] = None) -> None:
     """写单叶 /sessions 统计缓存：index.jsonl 签名 + 聚合结果 + threshold。
 
-    薄封装 upsert_leaf（叶子不存在则插入），一并盖 stats_built_at=now。不触碰
+    薄封装 upsert_leaf（叶子不存在则插入），一并盖 stats_built_at=now。默认不触碰
     built/state/sessions 等叶子管理字段（只写统计缓存列）。
+
+    sessions/ingested/pending: 显式传入时才一并更新。session_worker 重算时本来就从
+        index.db 读到了权威值，顺带回写让「stats_json 合计 == leaf_status.sessions」
+        这条一致性判据能收敛；否则它会每 2 秒对同一个叶子重算一次，永不停止。
+        （实证：240fa79b/260805/26080517 的 index.db 有 2826 个 session，
+          stats_json 合计也是 2826，但 leaf_status.sessions 停在 1796。）
 
     stats_sync_rowid: 这份快照对应的 index.db 同步水位（来自 leaf_status.sync_rowid）。
         读侧据此判断快照是否已落后于 index.db —— 只靠 index.jsonl 的 size+mtime
@@ -618,7 +647,8 @@ def set_leaf_stats(root_id: str, dir_key: str, *, leaf_path: str = "",
                 idx_size=idx_size, idx_mtime=idx_mtime,
                 stats_json=stats_json, stats_threshold=stats_threshold,
                 stats_built_at=_now(),
-                stats_sync_rowid=stats_sync_rowid)
+                stats_sync_rowid=stats_sync_rowid,
+                sessions=sessions, ingested=ingested, pending=pending)
 
 
 def set_leaf_token_stats(root_id: str, dir_key: str, *, leaf_path: str = "",
@@ -1026,6 +1056,41 @@ def _ensure_watch_tables() -> None:
         _conn.commit()
 
 
+def prune_watch_queue(keep_days: float = 7.0, batch: int = 5000) -> int:
+    """删除 watch_queue 里过期的终态行（done/failed），返回删除行数。
+
+    为什么必须 prune：这张表只增不减，一次叶子同步就是一行。实测 4 天就积了
+    5.2 万行、且 done 占 99.8%。看板的「成功/失败」计数是 SUM(status='done')
+    的全表聚合，不清理的话这个数字只涨不跌、永远接近 100%，没有信息量；表体积
+    也会拖慢 `watch_queue_recent` 的 ORDER BY id DESC。
+
+    只删终态（pending/running 一律保留）。分批删，避免一次长事务长期占写锁、
+    挡住 dispatcher 的 claim_next_watch。
+    """
+    if not _ready():
+        return 0
+    _ensure_watch_tables()
+    keep_days = max(0.0, float(keep_days or 0))
+    cutoff = f"-{keep_days} days"
+    deleted = 0
+    while True:
+        with _lock:
+            cur = _conn.execute(
+                "DELETE FROM watch_queue WHERE id IN ("
+                "  SELECT id FROM watch_queue "
+                "  WHERE status IN ('done','failed') "
+                "    AND COALESCE(finished_at, created_at) < datetime('now','localtime', ?) "
+                "  LIMIT ?)",
+                (cutoff, int(batch)),
+            )
+            _conn.commit()
+            n = cur.rowcount or 0
+        deleted += n
+        if n < int(batch):
+            break
+    return deleted
+
+
 def enqueue_watch(root_id: str, root_path: str, leaf_path: str, dir_key: str,
                   priority: int = 0, reason: str = "", idx_size: int = 0,
                   offset_at: int = 0) -> bool:
@@ -1373,7 +1438,13 @@ def sync_leaf_detail(limit: int = 200, only_pending: bool = True) -> List[dict]:
         # entry_count 是 index.jsonl 的总行数；ingested 是已落 requests 的行数。
         # 差值为正说明还有没摄取的新行。仅对 newapi 源成立 —— native 源不经这条路。
         is_newapi = (fmt_by_root.get(r["root_id"]) == "newapi")
-        if is_newapi and entry_count is not None:
+        # 「已建 + ingested=0」不可信：ingested 在 8 月前建好的叶子上从未被写过
+        # （watcher/回填才维护它），照字面算会把整叶行数当成欠账 —— 实测 382 个
+        # 叶子因此虚报 2700 万行，而它们的 index.db 其实早已追平。
+        # 现在两侧都会写 ingested，所以这个组合只可能是历史遗留或写入异常：
+        # 当成「未知」处理（new_rows=0 + 标记），不再制造误导性的大数。
+        ingested_unknown = bool(r["built"]) and ingested == 0
+        if is_newapi and entry_count is not None and not ingested_unknown:
             new_rows = max(0, entry_count - ingested)
         else:
             new_rows = 0
@@ -1391,6 +1462,7 @@ def sync_leaf_detail(limit: int = 200, only_pending: bool = True) -> List[dict]:
             "built": bool(r["built"]),
             "sessions": int(r["sessions"] or 0),
             "ingested": ingested,
+            "ingested_unknown": ingested_unknown,
             "pending_rows": pending_rows,
             "new_rows": new_rows,
             "new_keys": new_keys,
