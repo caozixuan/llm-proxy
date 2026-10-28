@@ -60,6 +60,18 @@
             font-size: 13px; text-align: center;
             background: var(--background); color: var(--foreground);
         }
+        /* 时间选择框：年/月/日/时合成一个 datetime-local（按小时步进） */
+        .cv-time-input {
+            padding: 5px 8px;
+            border: 1px solid var(--input-border); border-radius: var(--radius);
+            font-size: 13px;
+            background: var(--background); color: var(--foreground);
+            color-scheme: light dark;
+        }
+        .cv-time-input.invalid { border-color: #dc2626; }
+        .cv-time-hint {
+            font-size: 12px; color: #dc2626; white-space: nowrap;
+        }
         .btn-green  { background: var(--success); color: var(--success-foreground); }
         .btn-green:hover { opacity: 0.9; }
         .folder-select {
@@ -480,23 +492,12 @@
             <span class="min-msg-label" id="rootSelectLabel" style="display:none;">来源</span>
             <select class="folder-select" id="rootSelect" style="display:none;" onchange="onRootChange()">
             </select>
-            <span class="min-msg-label">月</span>
-            <div class="searchable-select" id="ymWrap" data-hidden="ymSelect" data-all="全部月">
-                <div class="ss-display" onclick="toggleSSDropdown('ymWrap')"><span id="ymLabel">全部月</span></div>
-                <div class="ss-dropdown"><input class="ss-search" type="text" placeholder="搜索月份..." oninput="filterSSOptions('ymWrap')" /><div class="ss-options"></div></div>
-            </div>
+            <span class="min-msg-label">时间</span>
+            <input class="cv-time-input" type="datetime-local" id="timeBox" step="3600"
+                   onchange="onTimeBoxChange()" title="选择年-月-日-时，定位到对应的小时目录" />
+            <span class="cv-time-hint" id="timeHint" style="display:none;"></span>
             <input type="hidden" id="ymSelect" value="" />
-            <span class="min-msg-label">日</span>
-            <div class="searchable-select" id="dayWrap" data-hidden="daySelect" data-all="全部日">
-                <div class="ss-display" onclick="toggleSSDropdown('dayWrap')"><span id="dayLabel">全部日</span></div>
-                <div class="ss-dropdown"><input class="ss-search" type="text" placeholder="搜索日期..." oninput="filterSSOptions('dayWrap')" /><div class="ss-options"></div></div>
-            </div>
             <input type="hidden" id="daySelect" value="" />
-            <span class="min-msg-label">时</span>
-            <div class="searchable-select" id="hourWrap" data-hidden="hourSelect" data-all="全部时">
-                <div class="ss-display" onclick="toggleSSDropdown('hourWrap')"><span id="hourLabel">全部时</span></div>
-                <div class="ss-dropdown"><input class="ss-search" type="text" placeholder="搜索时段..." oninput="filterSSOptions('hourWrap')" /><div class="ss-options"></div></div>
-            </div>
             <input type="hidden" id="hourSelect" value="" />
         {% else %}
         <input type="hidden" id="ymSelect" value="" />
@@ -615,11 +616,10 @@ let isLoadingMore = false;
 let knownKeys = new Set();
 let knownModels = new Set();
 let _logDirsLoaded = false;
-let _allDirs = [];   // /logs/dirs 原始条目，供来源/时间目录两级下拉复用
+let _allDirs = [];   // /logs/dirs 原始条目，供来源选择 + 时间框可选范围复用
 let _keyPrefRestored = false;
-// 程序化设置三级下拉（如启动时默认选最新小时）期间为 true：此时 _pickSSOption
-// 会触发 onSelect → _reloadForTimeChange()，若不挡住，会在状态还没设全时
-// 先发一次请求（且 log_dir 仍为空，会退化成 source 全量）。
+// 程序化设置时间框（如启动时默认选最新小时）期间为 true：此时 _reloadForTimeChange
+// 若被触发，会在状态还没设全时先发一次请求（且 log_dir 仍为空，会退化成 source 全量）。
 let _suppressReload = false;
 let _backfillTimer = null;  // new-api 大叶子首次回填时的轮询定时器（切目录/离开时清除）
 
@@ -689,115 +689,124 @@ function _rootFromName(name) {
 function _ymFromYmdh(ymdh) { return ymdh ? ymdh.slice(0,4) : ''; }
 // 从 ymdh 提取日（DD）
 function _dayFromYmdh(ymdh) { return ymdh && ymdh.length >= 6 ? ymdh.slice(4,6) : ''; }
-// 从 ymdh 提取时（HH）
-function _hourFromYmdh(ymdh) { return ymdh && ymdh.length >= 8 ? ymdh.slice(6,8) : ''; }
 
-// 填充一个 searchable-select 包装器：items = [{value, label, selected}]
-// wrapId 是外层 .searchable-select 的 id；labelId 是 ss-display 里的 span id；
-// 选中后写回 data-hidden 指定的 hidden input，并触发 wrap 上的 onSelect 回调。
-function _fillSSWrap(wrapId, labelId, items, onSelect) {
-    const wrap = document.getElementById(wrapId);
-    if (!wrap) return;
-    const optsBox = wrap.querySelector('.ss-options');
-    const labelEl = document.getElementById(labelId);
-    const hidden = document.getElementById(wrap.dataset.hidden || '');
-    const allLabel = wrap.dataset.all || '全部';
-    optsBox.innerHTML = '';
-    const allOpt = document.createElement('div');
-    allOpt.className = 'ss-option';
-    allOpt.dataset.value = '';
-    allOpt.textContent = allLabel;
-    allOpt.onclick = function() { _pickSSOption(wrapId, labelId, '', allLabel, onSelect); };
-    optsBox.appendChild(allOpt);
-    let cur = hidden ? hidden.value : '';
-    // 当前值不在新列表里 → 回落到「全部」
-    if (cur && !items.some(it => String(it.value) === String(cur))) cur = '';
-    items.forEach(it => {
-        const div = document.createElement('div');
-        div.className = 'ss-option';
-        div.dataset.value = it.value;
-        div.textContent = it.label;
-        div.onclick = function() { _pickSSOption(wrapId, labelId, it.value, it.label, onSelect); };
-        optsBox.appendChild(div);
-    });
-    if (hidden) hidden.value = cur;
-    const match = items.find(it => String(it.value) === String(cur));
-    if (labelEl) labelEl.textContent = match ? match.label : allLabel;
-    wrap.querySelectorAll('.ss-option').forEach(o => {
-        o.classList.toggle('selected', String(o.dataset.value) === String(cur));
-    });
+// ---- 时间框（datetime-local，按小时步进）----
+// 目录名的年月日是两位年份（26073018），datetime-local 的值是 ISO 形状（2026-07-30T18:00）。
+function _ymdhToLocalValue(ymdh) {
+    if (!ymdh || ymdh.length < 8) return '';
+    return '20' + ymdh.slice(0, 2) + '-' + ymdh.slice(2, 4) + '-' + ymdh.slice(4, 6)
+        + 'T' + ymdh.slice(6, 8) + ':00';
 }
 
-function _pickSSOption(wrapId, labelId, value, label, onSelect) {
-    const wrap = document.getElementById(wrapId);
-    const hidden = document.getElementById(wrap.dataset.hidden || '');
-    if (hidden) hidden.value = value;
-    const labelEl = document.getElementById(labelId);
-    if (labelEl) labelEl.textContent = label;
-    wrap.querySelectorAll('.ss-option').forEach(o => {
-        o.classList.toggle('selected', String(o.dataset.value) === String(value));
-    });
-    _closeSSDropdown(wrap.querySelector('.ss-dropdown'));
-    if (typeof onSelect === 'function') onSelect(value);
+function _localValueToYmdh(v) {
+    // v 形如 2026-07-30T18:00（部分浏览器带秒：2026-07-30T18:00:00）
+    const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})/.exec(v || '');
+    return m ? m[1].slice(2) + m[2] + m[3] + m[4] : '';
 }
 
-// 三级联动下拉填充（改用可搜索下拉组件）
-function _populateYmSelect(rootName) {
-    const seen = new Set();
+function _timeHintEl() { return document.getElementById('timeHint'); }
+
+function _showTimeHint(msg, isError) {
+    const el = _timeHintEl();
+    const box = document.getElementById('timeBox');
+    if (el) {
+        el.textContent = msg || '';
+        el.style.display = msg ? '' : 'none';
+        el.style.color = isError ? '#dc2626' : 'var(--muted-foreground)';
+    }
+    if (box) box.classList.toggle('invalid', !!isError);
+}
+
+// 当前来源下可用的小时 ymdh 列表（升序）。正常是 8 位小时目录；
+// 只有 6 位日目录的老数据按该日 00 时处理，避免整份数据都选不出来。
+function _availableYmdhs(rootName) {
+    const out = [];
+    const daily = [];
     _allDirs.forEach(d => {
         if (rootName !== null && (d.root || '') !== rootName) return;
-        const ym = _ymFromYmdh(_ymdhFromName(d.name));
-        if (ym) seen.add(ym);
-    });
-    // 按时间倒序（最新在前）：纯数字字符串比较即可
-    const items = [...seen].sort().reverse().map(ym => ({ value: ym, label: _fmtYMDH(ym) }));
-    _fillSSWrap('ymWrap', 'ymLabel', items, () => {
-        const root = _currentRootValue();
-        _populateDaySelect(root, document.getElementById('ymSelect').value);
-        _populateHourSelect(root, document.getElementById('ymSelect').value, document.getElementById('daySelect').value);
-        _reloadForTimeChange();
-    });
-    _populateDaySelect(rootName, document.getElementById('ymSelect').value);
-}
-
-function _populateDaySelect(rootName, ym) {
-    const seen = new Set();
-    if (ym) {
-        _allDirs.forEach(d => {
-            if (rootName !== null && (d.root || '') !== rootName) return;
-            const ymdh = _ymdhFromName(d.name);
-            if (!ymdh.startsWith(ym)) return;
-            const day = _dayFromYmdh(ymdh);
-            if (day) seen.add(day);
-        });
-    }
-    const items = [...seen].sort().reverse().map(d => ({ value: d, label: d + '日' }));
-    _fillSSWrap('dayWrap', 'dayLabel', items, () => {
-        const root = _currentRootValue();
-        const ymv = document.getElementById('ymSelect').value;
-        _populateHourSelect(root, ymv, document.getElementById('daySelect').value);
-        _reloadForTimeChange();
-    });
-    _populateHourSelect(rootName, ym, document.getElementById('daySelect').value);
-}
-
-function _populateHourSelect(rootName, ym, day) {
-    const prefix = ym + (day || '');
-    const items = [];
-    const seen = new Set();
-    if (prefix) _allDirs.forEach(d => {
-        if (rootName !== null && (d.root || '') !== rootName) return;
         const ymdh = _ymdhFromName(d.name);
-        if (ymdh.length < 8 || !ymdh.startsWith(prefix) || seen.has(ymdh)) return;
-        seen.add(ymdh);
-        // 未选「日」时会在整月范围内列小时，标签补上日期避免歧义
-        let label = day ? (ymdh.slice(6, 8) + '时') : _fmtYMDH(ymdh);
-        // count 为 null 表示该目录还没同步进索引（通常是当前小时，仍在增长）
-        if (d.count !== undefined && d.count !== null) label += ' (' + d.count + ')';
-        items.push({ value: ymdh, label });
+        if (ymdh.length === 8) out.push(ymdh);
+        else if (ymdh.length === 6) daily.push(ymdh + '00');
     });
-    items.sort((a, b) => b.value.localeCompare(a.value));
-    _fillSSWrap('hourWrap', 'hourLabel', items, () => { _reloadForTimeChange(); });
+    return (out.length ? out : daily).sort();
+}
+
+// 时间框的可选范围跟着来源走：min/max 卡在最早/最新有日志的小时，
+// 这样日期选择器里点不出空区间，比选完再报错友好。
+function _populateTimeBox(rootName) {
+    const box = document.getElementById('timeBox');
+    if (!box) return;
+    const list = _availableYmdhs(rootName);
+    if (!list.length) {
+        box.removeAttribute('min');
+        box.removeAttribute('max');
+        box.value = '';
+        ['ymSelect', 'daySelect', 'hourSelect'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.value = '';
+        });
+        _showTimeHint('该来源暂无日志目录', true);
+        return;
+    }
+    box.min = _ymdhToLocalValue(list[0]);
+    box.max = _ymdhToLocalValue(list[list.length - 1]);
+    // 已选的值不在新范围里（切了来源）→ 清空，由调用方决定是否落回最新
+    const cur = _localValueToYmdh(box.value);
+    if (cur && !_findDirForYmdh(rootName, cur)) {
+        box.value = '';
+        _showTimeHint('');
+    }
+}
+
+// 在 _allDirs 里找该小时对应的目录：优先 8 位小时目录，其次 6 位日目录
+function _findDirForYmdh(rootName, ymdh) {
+    const root = rootName === undefined ? _currentRootValue() : rootName;
+    const matchRoot = d => root === null || (d.root || '') === root;
+    const exact = _allDirs.find(d => matchRoot(d) && _ymdhFromName(d.name) === ymdh);
+    if (exact) return exact;
+    const dayKey = ymdh.slice(0, 6);
+    return _allDirs.find(d => matchRoot(d) && _ymdhFromName(d.name) === dayKey) || null;
+}
+
+// 把选中的 ymdh 写进三个 hidden（下游 _syncLogDirFromSelects 仍按它们合成 log_dir），
+// 并同步时间框显示。返回是否命中目录。
+function _setTimeYmdh(rootName, ymdh) {
+    const box = document.getElementById('timeBox');
+    const hit = _findDirForYmdh(rootName, ymdh);
+    if (!hit) return false;
+    if (box) box.value = _ymdhToLocalValue(ymdh);
+    const ymEl = document.getElementById('ymSelect');
+    const dayEl = document.getElementById('daySelect');
+    const hourEl = document.getElementById('hourSelect');
+    if (ymEl) ymEl.value = _ymFromYmdh(ymdh);
+    if (dayEl) dayEl.value = _dayFromYmdh(ymdh);
+    if (hourEl) hourEl.value = _ymdhFromName(hit.name).length >= 8 ? _ymdhFromName(hit.name) : '';
+    _showTimeHint('');
+    return true;
+}
+
+// 用户改时间：命中目录就加载；没命中就提示（不猜、不自动跳），
+// 并把输入框架红让用户知道当前选中时段不可用。
+function onTimeBoxChange() {
+    const box = document.getElementById('timeBox');
+    if (!box) return;
+    const ymdh = _localValueToYmdh(box.value);
+    if (!ymdh) return;   // 用户清空输入：保持原状态，不触发加载
+    const root = _currentRootValue();
+    if (!_setTimeYmdh(root, ymdh)) {
+        const list = _availableYmdhs(root);
+        const range = list.length
+            ? `可选范围 ${_fmtYMDH(list[0])} ~ ${_fmtYMDH(list[list.length - 1])}`
+            : '该来源暂无日志目录';
+        _showTimeHint('该时段没有日志（' + range + '）', true);
+        return;
+    }
+    _reloadForTimeChange();
+}
+
+// 兼容旧名称：来源切换后重填时间范围
+function _populateDirSelect(rootName) {
+    _populateTimeBox(rootName);
 }
 
 function _currentRootValue() {
@@ -817,7 +826,7 @@ function _currentSourceParam() {
     return src ? '&source=' + encodeURIComponent(src) : '';
 }
 
-// logDirSelect（hidden）由三级下拉合成；currentLogDir() 读它
+// logDirSelect（hidden）由时间框合成的三级 hidden 决定；currentLogDir() 读它
 function _syncLogDirFromSelects() {
     const hidden  = document.getElementById('logDirSelect');
     if (!hidden) return;
@@ -908,21 +917,9 @@ function _applyUrlState(state) {
         }
     }
     const root = _currentRootValue();
-    _populateYmSelect(root);
+    _populateTimeBox(root);
     if (state.ymdh && state.ymdh.length >= 8) {
-        const ym  = _ymFromYmdh(state.ymdh);    // YYMM
-        const day = _dayFromYmdh(state.ymdh);   // DD
-        if ([...document.querySelectorAll('#ymWrap .ss-option')].some(o => o.dataset.value === ym)) {
-            _pickSSOption('ymWrap', 'ymLabel', ym, _fmtYMDH(ym));
-        }
-        _populateDaySelect(root, ym);
-        if ([...document.querySelectorAll('#dayWrap .ss-option')].some(o => o.dataset.value === day)) {
-            _pickSSOption('dayWrap', 'dayLabel', day, day + '日');
-        }
-        _populateHourSelect(root, ym, day);
-        const hourOpt = [...document.querySelectorAll('#hourWrap .ss-option')].find(o => o.dataset.value === state.ymdh);
-        if (hourOpt) _pickSSOption('hourWrap', 'hourLabel', state.ymdh, hourOpt.textContent);
-        return true;
+        return _setTimeYmdh(root, state.ymdh);
     }
     return false;
 }
@@ -932,9 +929,8 @@ function _applyUrlState(state) {
 // 选中后由调用方 loadFileList() 拉该小时的数据。
 function _selectNewestHour() {
     const root = _currentRootValue();
-    // 直接从 _allDirs 算最新小时，不能先读 DOM 里的 #hourWrap —— _populateHourSelect
-    // 需要 ym 前缀才会生成选项，初始化时月份为空，DOM 里一个小时项都没有，
-    // 会直接返回 ''，导致 log_dir 为空、前端退回 source 全量（1385 个叶子）。
+    // 直接从 _allDirs 算最新小时，不能先读 DOM —— 时间框要等 _setTimeYmdh 才填值，
+    // 初始化时它还是空串，读 DOM 会拿到 ''，导致 log_dir 为空、前端退回 source 全量。
     let newest = '';
     _allDirs.forEach(d => {
         if (root !== null && (d.root || '') !== root) return;
@@ -942,32 +938,17 @@ function _selectNewestHour() {
         if (ymdh.length >= 8 && ymdh > newest) newest = ymdh;
     });
     if (!newest) return '';
-    const ym = _ymFromYmdh(newest), day = _dayFromYmdh(newest);
-    // 程序化设置期间挡住 onSelect → _reloadForTimeChange：此时 log_dir 还没同步，
+    // 程序化设置期间挡住 _reloadForTimeChange：此时 log_dir 还没同步，
     // 提前发请求会退化成 source 全量。状态设完由调用方统一加载。
     _suppressReload = true;
     try {
-        _populateYmSelect(root);
-        if ([...document.querySelectorAll('#ymWrap .ss-option')].some(o => o.dataset.value === ym)) {
-            _pickSSOption('ymWrap', 'ymLabel', ym, _fmtYMDH(ym));
-        }
-        _populateDaySelect(root, ym);
-        if ([...document.querySelectorAll('#dayWrap .ss-option')].some(o => o.dataset.value === day)) {
-            _pickSSOption('dayWrap', 'dayLabel', day, day + '日');
-        }
-        _populateHourSelect(root, ym, day);
-        const opt = [...document.querySelectorAll('#hourWrap .ss-option')].find(o => o.dataset.value === newest);
-        if (opt) _pickSSOption('hourWrap', 'hourLabel', newest, opt.textContent);
+        _populateTimeBox(root);
+        _setTimeYmdh(root, newest);
     } finally {
         _suppressReload = false;
     }
     _syncLogDirFromSelects();
     return newest;
-}
-
-// 兼容旧代码：_populateDirSelect 现在用三级联动实现
-function _populateDirSelect(rootName) {
-    _populateYmSelect(rootName);
 }
 
 // 切换时间目录时不清空 API Key / 模型过滤器，只重置翻页状态后重新加载
@@ -1028,14 +1009,17 @@ async function loadLogDirs() {
     } catch(e) {}
 }
 
-// 切换来源：清空时间选择，按新来源重填，再重新加载
+// 切换来源：重置时间框、按新来源重算可选范围，并落到该来源最新一小时
 function onRootChange() {
-    const rootSel = document.getElementById('rootSelect');
     ['ymSelect', 'daySelect', 'hourSelect'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = '';
     });
-    _populateDirSelect(rootSel.value);
+    const box = document.getElementById('timeBox');
+    if (box) box.value = '';
+    _showTimeHint('');
+    _populateDirSelect(document.getElementById('rootSelect').value);
+    _selectNewestHour();      // 内部已 _syncLogDirFromSelects；不自动请求
     _reloadForTimeChange();
 }
 
@@ -1322,7 +1306,7 @@ function _appendAggItem(chain, globalIdx) {
     el.innerHTML = `
         <div class="file-item-name">${esc(preview || '(空)')}</div>
         <div class="file-item-meta">${chain.message_count} 条 · ${chain.file_count} 个文件 · ${(chain.models || [chain.model]).filter(Boolean).join(', ') || '?'}</div>
-        <div class="file-item-meta" style="font-size:10px;color:var(--muted-foreground)">${esc(timestamp || chain.first_time || '')}</div>
+        <div class="file-item-meta" style="font-size:10px;color:var(--muted-foreground)">${esc(timestamp || chain.last_time || chain.first_time || '')}</div>
     `;
     el.addEventListener('click', () => selectAggChain(globalIdx, el));
     fileListEl.appendChild(el);
@@ -1378,7 +1362,14 @@ async function _loadAggStream(min, params, refresh) {
             break;
         }
         const newItems = data.items || [];
-        if (newItems.length) {
+        if (data.replace) {
+            // 收集结束时后端把「跨小时叶子切成的多段」合并成一条对话后会整体替换
+            // 列表（replace=true，下发全量）。此时按整份重绘，不能当增量追加。
+            aggChains = newItems.slice();
+            renderedCount = 0;
+            _renderAggWindow(true);
+            collectKeys(data);
+        } else if (newItems.length) {
             // 只进内存；不逐条塞 DOM。首屏一旦收够 PAGE_SIZE 就渲染第一页窗口。
             for (const chain of newItems) aggChains.push(chain);
             collectKeys(data);
@@ -2199,7 +2190,7 @@ loadLogDirs().then(() => {
     // resetAndLoad() 会清空 key/model，所以先 resetAndLoad（跳过首次加载）再套用过滤，
     // 最后只发一次带完整条件的列表请求。
     const _urlState = _restoreUrlState();
-    const _hadYmdh = _applyUrlState(_urlState);   // 设置 source + 时间下拉 + logDirSelect
+    const _hadYmdh = _applyUrlState(_urlState);   // 设置 source + 时间框 + logDirSelect
     resetAndLoad(true);                       // 重置状态但不发请求（会清空过滤并同步 URL）
     _applyUrlFilters(_urlState);              // 套用 URL 指定的 key/model
     // 没有指定小时目录时，默认落到最新一小时。不提供「全部」默认：全量要跨

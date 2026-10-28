@@ -3,6 +3,7 @@
 优先使用 index.jsonl 的最近窗口；缺失时降级为目录扫描。
 """
 
+import datetime
 import json
 import logging
 import os
@@ -801,6 +802,20 @@ def _export_view_leaves(roots, env_dir: str) -> List[str]:
     return leaves
 
 
+def _leaf_dir_key(leaf: str) -> str:
+    """叶子的时间目录键（YYMMDDHH），用于「新到旧」排序。
+
+    取叶子路径最后一段；少数来源的叶子名不是纯时间目录（如 native 根），此时退化为
+    用父目录 + 自身，保证排序稳定且不会把最新叶子排到后面。
+    """
+    p = os.path.normpath(leaf or "")
+    tail = os.path.basename(p)
+    if len(tail) == 8 and tail.isdigit():
+        return tail
+    parent = os.path.basename(os.path.dirname(p))
+    return parent + tail
+
+
 def _export_key_leaves(roots, env_dir: str, api_key: str) -> List[str]:
     """导出浏览按单个 key 取叶子：优先读 leaf_status.stats_json 的现成倒排索引。
 
@@ -825,7 +840,11 @@ def _export_key_leaves(roots, env_dir: str, api_key: str) -> List[str]:
                               os.path.normpath(lp).startswith(e + os.sep) or os.path.normpath(lp) == e
                               for e in existing))]
                 if leaves:
-                    return leaves
+                    # 这个倒排索引是 SELECT 出来的，没有 ORDER BY，实际是 leaf_status
+                    # 的插入顺序（最旧的目录在前）。流式聚合按叶子顺序逐叶下推，前端
+                    # 又只渲染前 50 条，不排序就会让「本小时的数据」排到滚动加载之后，
+                    # 首屏永远是最旧的内容。按目录名 YYMMDDHH 倒序，新到旧。
+                    return sorted(leaves, key=_leaf_dir_key, reverse=True)
     except Exception:  # noqa: BLE001
         pass
 
@@ -998,11 +1017,27 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
                 total = sum(ex.map(_count_leaf, leaves))
 
     with _ptm.stage("组装 items"):
-        items = _build_agg_items(all_sessions[offset:offset + limit] if limit > 0 else all_sessions[offset:])
+        # 合并必须发生在切片之前：一条逻辑对话的各段分散在不同小时叶子里，
+        # 先切页会切到「半条对话」，first_time/file_count 都不对。
+        seg_limit = offset + limit if limit > 0 else 0
+        window = all_sessions if seg_limit <= 0 else all_sessions[:seg_limit + _MERGE_SLACK]
+        merged_all = _merge_chain_segments(_build_agg_items(window))
+        if seg_limit > 0:
+            items = merged_all[offset:offset + limit]
+        else:
+            items = merged_all[offset:]
+
+    # total 语义随合并改变：以前是「session 段数」，现在是「逻辑对话数」。
+    # 分页下推时只收了每叶子前 need 段，未收集的段绝大多数会并进已有对话，
+    # 因此用合并后的条数作为 total 下界，再加未收集的段数作上界估计。
+    if not has_search:
+        uncovered = max(0, total - len(all_sessions))
+        total = len(merged_all) + uncovered
 
     _export_view_logger.info(
-        "export-view aggregate key=%s model=%s 叶子=%d 命中=%d %s",
-        api_key[-8:] if api_key else "", model, len(leaves), total, _ptm.summary_line("aggregate 耗时"))
+        "export-view aggregate key=%s model=%s 叶子=%d 命中=%d 合并后=%d %s",
+        api_key[-8:] if api_key else "", model, len(leaves), total, len(merged_all),
+        _ptm.summary_line("aggregate 耗时"))
 
     return {"items": items, "total": total, "known_keys": sorted(known_keys), "known_models": sorted(known_models)}
 
@@ -1065,6 +1100,9 @@ def _build_agg_items(preloaded: List[Tuple[dict, str]], with_traces: bool = Fals
             "latest_file": session.get("latest_file", ""),
             "api_key": session.get("api_key", ""),
             "q1_preview": session.get("q1", ""),
+            # 跨叶合并用的链标识（api_key||q1_hash）。缺失时由 _merge_chain_segments
+            # 回退到 (api_key, q1_preview) 分组。
+            "chain_lookup": session.get("chain_lookup", "") or "",
         }
         if with_traces:
             payload["trace_list"] = trace_list
@@ -1072,6 +1110,149 @@ def _build_agg_items(preloaded: List[Tuple[dict, str]], with_traces: bool = Fals
             payload["has_failure"] = True
         items.append(payload)
     return items
+
+
+# 跨小时目录切段的合并间隔上限（秒）。newapi 的 index.db 按「日/时」分叶子，每个
+# 叶子各自维护 chain_index，同一段对话跨过整点就会在新叶子里另起一条 session
+# （新建会话的 session_key 就是 ts）。实测某 key 20 条对话被切成 50 段，20/20 全跨叶。
+# 合并时若相邻两段时间差超过此值就当作两段独立对话——压测回放会把同一 prompt 重复
+# 跑很多遍，时间上并不连续，不能只按 q1 合并。
+_MERGE_MAX_GAP_SEC = 90 * 60
+
+# 分页下推时多读几段再合并：一条逻辑对话可能横跨多个小时叶子，若只取 offset+limit
+# 段就切页，页尾那条对话会被截断。多读一些能覆盖绝大多数跨叶情形，代价很小。
+_MERGE_SLACK = 200
+
+
+def _parse_agg_time(s: str) -> Optional[float]:
+    """把 item 里的 'YYYY:MM:DDTHH:MM:SS.mmm+08:00' 还原成 epoch 秒。"""
+    if not s:
+        return None
+    raw = s.strip()
+    if raw[:4].isdigit() and raw[4] == ":":
+        # _format_time 出来的展示格式：日期部分的 '-' 被换成了 ':'，还原回来
+        head, sep, tail = raw.partition("T")
+        head = head.replace(":", "-")
+        raw = head + sep + tail
+    try:
+        return datetime.datetime.fromisoformat(raw).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _merge_chain_segments(items: List[Dict[str, Any]],
+                          max_gap_sec: float = _MERGE_MAX_GAP_SEC) -> List[Dict[str, Any]]:
+    """把同一段逻辑对话跨小时叶子的多个 segment 合并成一条。
+
+    newapi 叶子按小时切库，chain_index 只在叶子内部有效，于是同一段对话在每小时目录
+    都会新开一条 session，列表里表现为「同一条对话出现好几次，各自带着自己那一小时的
+    首末时间」——用户看到的是「这条对话停在 15:59」，其实它一直持续到 17 点以后。
+
+    合并键优先用 chain_lookup（api_key||q1_hash，同 q1 被判新会话时带 ##session_N 后缀，
+    正好区分压测里重复的同一 prompt）；老数据没有该字段时回退 (api_key, q1_preview)。
+
+    两种键的可信度不同，间隔判定也不同：
+      - chain_lookup 是同步阶段算出的哈希链标识，同一 key 同一会话跨叶必然一致，
+        属于强身份，直接合并，不受时间间隔限制（实测某会话 15:41 结束、17:21 才续上，
+        间隔 1h40m，用间隔卡就会把它错切成两条）。
+      - (api_key, q1_preview) 是文本回退键，压测回放会重复同一 prompt，必须靠
+        时间连续性（max_gap_sec）把关，否则会把多次独立运行并成一条。
+
+    合并语义：
+      first_time   = 最早段的 first_time
+      last_time    = 最晚段的 last_time
+      file_count   = 各段求和（每个文件都是真实存在的一段记录）
+      message_count= 取最大（msg_count 是会话累计消息数，不是增量，求和会翻倍）
+      models       = 并集
+      has_failure  = 任一段有失败
+      latest_file  = 最晚段的 latest_file
+    """
+    if not items:
+        return []
+    items = [dict(it) for it in items]
+
+    def _key(it: Dict[str, Any]) -> Tuple[str, str]:
+        cl = (it.get("chain_lookup") or "").strip()
+        if cl:
+            return ("L", cl)
+        return ("Q", "%s|%s" % (it.get("api_key") or "", it.get("q1_preview") or ""))
+
+    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for it in items:
+        groups.setdefault(_key(it), []).append(it)
+
+    merged: List[Dict[str, Any]] = []
+    for gkey, segs in groups.items():
+        if len(segs) == 1:
+            merged.append(segs[0])
+            continue
+        segs.sort(key=lambda x: _parse_agg_time(x.get("first_time", "")) or 0.0)
+        # 强身份（哈希链标识）直接合并；文本回退键才按时间间隔切簇。
+        strong = gkey[0] == "L"
+        clusters: List[List[Dict[str, Any]]] = []
+        for seg in segs:
+            if clusters and strong:
+                clusters[-1].append(seg)
+                continue
+            if clusters:
+                prev = clusters[-1]
+                prev_end = _parse_agg_time(prev[-1].get("last_time", "")) or 0.0
+                cur_start = _parse_agg_time(seg.get("first_time", "")) or 0.0
+                if prev_end and cur_start and cur_start - prev_end <= max_gap_sec:
+                    prev.append(seg)
+                    continue
+            clusters.append([seg])
+
+        for cl in clusters:
+            if len(cl) == 1:
+                merged.append(cl[0])
+                continue
+            base = dict(cl[0])
+            base["last_time"] = cl[-1].get("last_time", "") or base.get("last_time", "")
+            base["latest_file"] = cl[-1].get("latest_file", "") or base.get("latest_file", "")
+            base["file_count"] = sum(int(s.get("file_count") or 0) for s in cl)
+            base["message_count"] = max(int(s.get("message_count") or 0) for s in cl)
+            models: List[str] = []
+            for s in cl:
+                for m in (s.get("models") or []):
+                    if m and m not in models:
+                        models.append(m)
+            base["models"] = models
+            if any(s.get("has_failure") for s in cl):
+                base["has_failure"] = True
+            else:
+                base.pop("has_failure", None)
+            base["segment_count"] = len(cl)
+            merged.append(base)
+
+    merged.sort(key=lambda x: x.get("last_time", "") or x.get("first_time", ""), reverse=True)
+    return merged
+
+
+def _stamp_chain_lookup(pairs: List[Tuple[dict, str]]) -> None:
+    """给非 newapi 后端的会话补 chain_lookup（就地修改）。
+
+    newapi 的 list_sessions 已经在 SQL 里 JOIN chain_index 带出该字段；native 后端
+    （session_cache.db）没有链表，留空后由 _merge_chain_segments 回退按 (api_key, q1)
+    分组——native 叶子按小时也分库，同一段对话同样会跨叶重复。
+    """
+    by_leaf: Dict[str, List[str]] = {}
+    for s, leaf in pairs:
+        if s.get("chain_lookup"):
+            continue
+        by_leaf.setdefault(leaf, []).append(s.get("session_key") or "")
+    for leaf, keys in by_leaf.items():
+        if _root_format(leaf) == "newapi":
+            continue
+        try:
+            m = nidb.get_sessions_chain_map(leaf, keys)
+        except Exception:  # noqa: BLE001
+            continue
+        for s, lf in pairs:
+            if lf == leaf and not s.get("chain_lookup"):
+                hit = m.get(s.get("session_key") or "")
+                if hit:
+                    s["chain_lookup"] = hit
 
 
 def session_traces_payload(roots, env_dir: str, api_key: str, filename: str) -> Dict[str, Any]:
@@ -1369,7 +1550,10 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
             pass
         build_tm = StageTimer()
         with build_tm.stage("组装 items"):
-            items = _build_agg_items([(s, leaf) for s in sels]) if sels else []
+            pairs = [(s, leaf) for s in sels]
+            if pairs:
+                _stamp_chain_lookup(pairs)
+            items = _build_agg_items(pairs) if sels else []
         return leaf, sel_tm.elapsed(), build_tm.elapsed(), items, models
 
     def _run():
@@ -1416,15 +1600,28 @@ def export_view_aggregate_stream_start(roots, env_dir: str, min_messages: int = 
                     task["_slow_leaves"].sort(reverse=True)
                     del task["_slow_leaves"][5:]
         with _AGG_STREAM_LOCK:
-            # total 以「实际收集到的 item 数」为准，保证前端 loaded 收敛到 totalItems，
-            # 滚动到底时 loadMore 判定 loaded >= totalItems 恒成立，不会再发分页请求。
-            task["total"] = len(task["items"])
+            # 收集完成：把跨小时叶子的同一条对话合并掉。合并会让条数变少，所以
+            # total 用合并后的条数——否则前端滚动到底会以为还有内容没加载。
+            raw_items = list(task["items"])
+        if not task["_search"] and not task["_q1"] and len(task["leaves"]) > 1:
+            merged_items = _merge_chain_segments(raw_items)
+        else:
+            # 单叶（内部页选中某个时间目录）不做跨叶合并；搜索路径也保持原始段，
+            # 因为命中是按文件内容判定的，合并会把某段命中的信息摊给整条对话。
+            merged_items = raw_items
+        with _AGG_STREAM_LOCK:
+            task["items"] = merged_items
+            task["total"] = len(merged_items)
+            if merged_items is not raw_items:
+                # 合并把已推给前端的原始段整体替换掉了，下次 poll 需要下发全量重绘。
+                task["_merged"] = True
+                task["cursor"] = 0
             task["leaves_done"] = task["leaves_total"]
             task["status"] = "done"
             task["_ts"] = time.time()
             _elapsed = time.time() - task.get("_t0", task["_ts"])
             snapshot = {
-                "items": list(task["items"]),
+                "items": merged_items,
                 "total": task["total"],
                 "known_keys": sorted(task["known_keys"]),
                 "known_models": sorted(task["known_models"]),
@@ -1468,9 +1665,17 @@ def export_view_aggregate_stream_poll(task_id: str) -> Dict[str, Any]:
         items = task["items"][task["cursor"]:]
         task["cursor"] = len(task["items"])
         task["_ts"] = now
+        # 合并发生在收集结束时，会把之前的原始段整体替换成合并结果。此时不能用
+        # 游标只推增量——前端拿到的是「合并列表的尾巴」，而不是整份新列表。
+        # 标记 replace=true 并下发全量，前端据此重建 aggChains。
+        replaced = bool(task.get("_merged"))
+        if replaced:
+            items = list(task["items"])
+            task["_merged"] = False   # 只替换一次，之后仍按游标增量（若还会增长）
         return {
             "status": task["status"],
             "items": items,
+            "replace": replaced,
             "total": task["total"],
             "leaves_total": task.get("leaves_total", 0),
             "leaves_done": task.get("leaves_done", 0),

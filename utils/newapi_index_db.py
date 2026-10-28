@@ -1139,7 +1139,63 @@ def _row_to_session(row: sqlite3.Row) -> Dict[str, Any]:
         "first_ts": row["first_ts"] or "",
         "last_ts": row["last_ts"] or "",
         "has_failure": bool(row["has_failure"]),
+        # 跨叶链标识：{api_key}||{q1_hash}（同 q1 被判为新会话时带 ##session_N）。
+        # 由 list_sessions / get_sessions_chain_map 用 chain_index 补齐；SELECT * 拿不到
+        # （它在另一张表里），故 keys 存在时取，缺失留空由调用方按 q1 回退。
+        "chain_lookup": (row["chain_lookup"] if "chain_lookup" in row.keys() else "") or "",
     }
+
+
+def _chain_link_map(conn: sqlite3.Connection, api_key: str = "") -> Dict[str, str]:
+    """建 {session_key: lookup_key}。
+
+    lookup_key 就是 chain_index 的主键，形式为 "{api_key}||{q1_hash}"（可能带
+    ##session_N 后缀），所以要按 key 取时直接走主键前缀范围扫描，代价与该 key 的
+    会话数成正比而非全表（实测大叶子 6.8 万行全表扫 1.5~2.1s，前缀取 21 行是毫秒级）。
+    不传 api_key（全量视图）时才退化为整表扫。
+    """
+    try:
+        if api_key:
+            lo = api_key + "||"
+            hi = api_key + "|~"     # '~' (0x7E) 大于 '|' (0x7C)，覆盖同前缀全部行
+            rows = conn.execute(
+                "SELECT session_key, lookup_key FROM chain_index "
+                "WHERE lookup_key >= ? AND lookup_key < ?", (lo, hi))
+        else:
+            rows = conn.execute(
+                "SELECT session_key, lookup_key FROM chain_index "
+                "WHERE session_key IS NOT NULL AND lookup_key IS NOT NULL")
+        return {r[0]: r[1] for r in rows if r[0] and r[1]}
+    except sqlite3.Error:
+        return {}
+
+
+def get_sessions_chain_map(leaf_dir: str, session_keys: List[str]) -> Dict[str, str]:
+    """批量取 {session_key: chain_lookup}。链标识存在叶子自己的 chain_index 表里。
+
+    小时叶子是各自独立的 index.db，同一段对话在每小时目录都会新开一条 session
+    （新建会话的 session_key 就是 ts），链标识因此只能按叶子分别取。实测覆盖 100%、
+    一对一无重复，所以这里直接 JOIN 取，不额外回填列。
+    """
+    keys = [k for k in (session_keys or []) if k]
+    if not keys or not _db_exists(leaf_dir):
+        return {}
+    conn = _connect(leaf_dir)
+    try:
+        out: Dict[str, str] = {}
+        for i in range(0, len(keys), _TRACES_IN_CHUNK):
+            chunk = keys[i:i + _TRACES_IN_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            for sk, lk in conn.execute(
+                    "SELECT session_key, lookup_key FROM chain_index "
+                    "WHERE session_key IN (%s)" % marks, chunk):
+                if lk:
+                    out[sk] = lk
+        return out
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
 
 
 def list_sessions(leaf_dir: str, api_key: str = "", model: str = "",
@@ -1160,7 +1216,17 @@ def list_sessions(leaf_dir: str, api_key: str = "", model: str = "",
         if limit > 0:
             sql += " LIMIT ? OFFSET ?"; params.extend([limit, offset])
         rows = conn.execute(sql, params).fetchall()
-        return [_row_to_session(r) for r in rows]
+        out = [_row_to_session(r) for r in rows]
+        # 补跨叶链标识。不能在 SQL 里写相关子查询：chain_index 只有 lookup_key 主键，
+        # 没有 session_key 索引，大叶子（6.8 万 session）会退化成 O(n²) 并超时；
+        # 一次全表扫 chain_index 建映射是 O(n)。
+        link = _chain_link_map(conn, api_key)
+        if link:
+            for s in out:
+                lk = link.get(s["session_key"])
+                if lk:
+                    s["chain_lookup"] = lk
+        return out
     finally:
         conn.close()
 
