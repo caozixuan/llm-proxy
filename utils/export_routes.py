@@ -598,7 +598,7 @@ def _default_mode() -> str:
 def _run_merged_hours(mtime_dirs, _env_dir, local_base, api_key, force, workers,
                       processor, _mcfg, _log, _tm, errors, warnings, _should_cancel,
                       _progress_lock, _progress_done, _progress_total, _progress_phase,
-                      _progress_reporter):
+                      _progress_reporter, dir_workers: int = 4):
     """跨小时节点聚合导出：先全收集、再合并、最后统一产出。
 
     为什么要分三阶段：newapi 的数据按小时分叶子库，同一段对话跨整点会被切成多个
@@ -623,33 +623,34 @@ def _run_merged_hours(mtime_dirs, _env_dir, local_base, api_key, force, workers,
 
     # ── 阶段 1：收集 ──────────────────────────────────────────────────
     with _tm.stage("收集会话（跨小时）"):
-        for mt in mtime_dirs:
+        # 并发收集：原逐叶路径有 dir_workers 层目录并发，这里如果写成串行循环，
+        # 14 个目录实测 16.1s，而并发 8 只要 3.0s（大目录单叶 2.7~3.3s）。
+        # 收集是纯读 + 各叶子独立，并发没有写竞态。
+        from concurrent.futures import ThreadPoolExecutor as _GTPE
+
+        def _gather_one(mt):
+            """返回 (mt, [(session, leaf)], warnings, errors, 是否被取消)。"""
             if _should_cancel():
-                _log("任务已终止（用户取消）")
-                return all_results, all_entries, 0
+                return mt, [], [], [], True
             mt_src = _resolve_mt_for(_env_dir, mt) or str(_env_dir / mt)
             try:
                 from utils.log_scan import detect_format as _df
                 _fmt = _df(mt_src)
                 if not _mcfg.supports_format(_fmt):
-                    warnings.append(f"{mt}: 非 {'/'.join(_mcfg.formats)} 格式（{_fmt}），已跳过")
-                    continue
+                    return mt, [], [f"{mt}: 非 {'/'.join(_mcfg.formats)} 格式（{_fmt}），已跳过"], [], False
                 if _fmt == "newapi":
                     import utils.newapi_index_db as _nidb
                     if _nidb.needs_build(mt_src):
-                        warnings.append(f"{mt}: 索引未构建/不完整，已跳过（请先手动构建索引）")
-                        continue
+                        return mt, [], [f"{mt}: 索引未构建/不完整，已跳过（请先手动构建索引）"], [], False
             except Exception as _pe:  # noqa: BLE001
-                warnings.append(f"{mt}: 索引未构建/不完整，已跳过（检查异常: {_pe}）")
-                continue
+                return mt, [], [f"{mt}: 索引未构建/不完整，已跳过（检查异常: {_pe}）"], [], False
 
             try:
                 exp = export_session_index(mt_src, force=force, with_sessions=True,
                                            api_key=api_key)
             except Exception as e:  # noqa: BLE001
-                errors.append(f"{mt}: {e}")
                 logger.exception("跨小时收集失败 %s", mt_src)
-                continue
+                return mt, [], [], [f"{mt}: {e}"], False
 
             sessions = exp.get("sessions")
             if sessions is None:
@@ -657,11 +658,23 @@ def _run_merged_hours(mtime_dirs, _env_dir, local_base, api_key, force, workers,
                 # 必须回落到读 session_index.jsonl，否则这一小时的数据会被静默丢掉。
                 from utils.export_sync import _load_session_index
                 sessions = _load_session_index(mt_src)
-            _log(f"[{mt}] 收集 {len(sessions)} sessions")
-            for s in sessions:
-                if api_key and s.get("api_key") != api_key:
-                    continue
-                gathered.append((s, mt_src))
+            out = [(s, mt_src) for s in sessions
+                   if not api_key or s.get("api_key") == api_key]
+            _log(f"[{mt}] 收集 {len(out)} sessions")
+            return mt, out, [], [], False
+
+        _cancelled = False
+        with _GTPE(max_workers=min(max(1, dir_workers), len(mtime_dirs))) as _ex:
+            # map 保序，warnings/errors 的先后与原串行循环一致
+            for mt, pairs, warns, errs, cancel in _ex.map(_gather_one, mtime_dirs):
+                warnings.extend(warns)
+                errors.extend(errs)
+                if cancel:
+                    _cancelled = True
+                gathered.extend(pairs)
+        if _cancelled:
+            _log("任务已终止（用户取消）")
+            return all_results, all_entries, 0
 
     if not gathered:
         _log("跨小时聚合：没有收集到任何 session")
@@ -744,9 +757,20 @@ def _run_merged_hours(mtime_dirs, _env_dir, local_base, api_key, force, workers,
         # 这里只作为「找不到时的兜底」，用 env_dir 会让兜底路径完全错误。
         _fallback_src = (_resolve_mt_for(_env_dir, mtime_dirs[0])
                          or str(_env_dir / mtime_dirs[0]))
+        # 并行度：逐叶路径是「每叶子一次 processor」，配合 dir_workers 层目录并发，
+        # 实际并行单元 ≈ min(dir_workers, 目录数) × workers（默认 4×8 = 32）。
+        # 合并路径只剩一次 processor 调用，若仍用 workers 就白白少掉一层并发。
+        # #263 实测：沿用 workers=8 比 #262 慢 56s（170s -> 226s）。这里把目录并发
+        # 补回来；上限按 CPU×4 收口，避免大盘目录数把它放大到失控。
+        try:
+            _proc_workers = int(workers) * max(1, int(dir_workers))
+        except (TypeError, ValueError):
+            _proc_workers = int(workers or 8)
+        _proc_workers = max(1, min(_proc_workers, (os.cpu_count() or 4) * 4))
+
         kw = dict(
             src_dir=_fallback_src, out_dir=str(local_base),
-            session_entries=merged, api_key=api_key or None, workers=workers,
+            session_entries=merged, api_key=api_key or None, workers=_proc_workers,
             progress_cb=lambda msg: _log(f"[merged] {msg}"),
             log_dir=_env_dir.name,
             should_cancel=_should_cancel,
@@ -1164,6 +1188,7 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
             _should_cancel=_should_cancel, _progress_lock=_progress_lock,
             _progress_done=_progress_done, _progress_total=_progress_total,
             _progress_phase=_progress_phase, _progress_reporter=_progress_reporter,
+            dir_workers=dir_workers,
         )
         mt_results = []
     elif dir_workers <= 1 or len(mtime_dirs) <= 1:

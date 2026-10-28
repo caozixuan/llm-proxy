@@ -489,6 +489,13 @@
                                placeholder="默认（8）" style="max-width:200px;">
                         <div class="text-muted" style="font-size:.72rem;margin-top:2px;">多个 mtime 目录同时处理的数量；0/留空=逐个串行。总线程≈目录并发×worker 数，目录多时注意资源。</div>
                     </div>
+                    <div class="form-check mt-1" v-if="mergeHoursAvailable">
+                        <input type="checkbox" class="form-check-input" v-model="mergeHours" id="merge-hours-check">
+                        <label class="form-check-label small" for="merge-hours-check">跨小时节点聚合（同一条对话合成一条）</label>
+                        <div class="text-muted" style="font-size:.72rem;margin-top:2px;">
+                            数据按小时分目录存放，同一段对话跨整点会被切成多条。勾选后按会话链标识把各小时段合成一条，session 数会明显变少，但每条更完整。
+                        </div>
+                    </div>
                     <div class="form-check mt-1">
                         <input type="checkbox" class="form-check-input" v-model="forceExport" id="force-check">
                         <label class="form-check-label small" for="force-check">强制重新导出（忽略缓存）</label>
@@ -670,6 +677,9 @@ new Vue({
         modalMtimes: [],
         selectedMtimes: [],
         forceExport: false,
+        // 跨小时节点聚合：把同一条对话在各小时目录里的段合成一条产物。
+        // 默认关——产物结构会变（一条记录可能引用多个源目录），下游需确认兼容。
+        mergeHours: false,
         exportMode: 'reformat',
         taskWorkers: 8,
         taskDirWorkers: 8,
@@ -724,6 +734,14 @@ new Vue({
         },
         qualifiedSessions: function() {
             return this.keys.reduce(function(s, k) { return s + (k.qualified_sessions || 0); }, 0);
+        },
+        // 跨小时聚合只对「产合并文件」的 pipeline（reformat / copy）有意义：
+        // full_reformat 有 max_mtimes=1 限制，eval 不做逐会话产物。多选目录才谈得上聚合。
+        mergeHoursAvailable: function() {
+            var m = this._modeOf(this.exportMode);
+            if (!m || !m.reformat) return false;
+            if (m.max_mtimes === 1) return false;
+            return (this.selectedMtimes || []).length > 1;
         },
         runningTasks: function() {
             var r = this.tasks.filter(function(t) { return t.status === 'running' || t.status === 'queued' || t.status === 'pending'; });
@@ -1046,6 +1064,7 @@ new Vue({
             var skip = { id: 1, progress_log: 1, analysis_json: 1, leaves_cache: 1 };
             var order = [
                 'api_key', 'key_slot', 'key_name', 'mode', 'status', 'workers', 'dir_workers',
+                'merge_hours',
                 'mtime_dirs', 'total_sessions', 'files_uploaded', 'files_skipped',
                 'obs_dst', 'local_copy_dir', 'eval_status', 'eval_report_path',
                 'source_export_id', 'in_manage', 'manage_name', 'error_message',
@@ -1186,6 +1205,7 @@ new Vue({
             this.showModal = true;
             this.modalKey = null;
             this.forceExport = false;
+            this.mergeHours = false;
             // 默认方式：配置里第一个产合并文件的模式（无则第一个）
             this.exportMode = this._defaultExportMode();
             this.taskWorkers = 8;
@@ -1233,6 +1253,7 @@ new Vue({
                 mode: this.exportMode,
                 workers: Number(this.taskWorkers) || 0,
                 dir_workers: Number(this.taskDirWorkers) || 0,
+                merge_hours: !!(this.mergeHoursAvailable && this.mergeHours),
                 start: !!start,
             };
             fetch('/api/export/run', {
@@ -1467,6 +1488,8 @@ new Vue({
             this.exportMode = r.mode || this._defaultExportMode();
             this.taskWorkers = r.workers || 0;
             this.taskDirWorkers = r.dir_workers || 0;
+            // 草稿/重试/副本都要继承原任务的跨小时聚合选择，否则一「启动」就丢
+            this.mergeHours = !!r.merge_hours;
             this.taskName = r.manage_name ? (r.manage_name + '（副本）') : '';
             this.forceExport = false;
             this.nowTag = this._nowTag();
