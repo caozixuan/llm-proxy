@@ -184,22 +184,25 @@ def _sub_is_newapi(sub: Path) -> bool:
         return False
 
 
-def _sessions_lazy_backfill(leaf: Path, threshold: int) -> dict:
-    """new-api 叶子的统计：index.db 已构建 → 读 q1 归并口径；未构建 → 裸计数近似（不阻塞）。
+def _sessions_lazy_backfill(leaf: Path, threshold: int) -> tuple:
+    """new-api 叶子的统计：(sessions 字典, 是否为裸计数近似)。
 
-    已构建（sessions>0）→ newapi_index_db.get_session_stats（真实归并值）。
-    未构建 → 返回裸计数（每请求算 1 session，近似偏大）；index.db 的构建/补 meta
-    一律经「日志管理」批量路径，绝不在此同步解析（那会让页面请求阻塞几十秒）。
-    批量构建跑完后，下次刷新读到 sessions 即自动收敛为归并值。
+    已构建（sessions>0）→ newapi_index_db.get_session_stats（真实归并值），第二项 False。
+    未构建 → 返回裸计数（每请求算 1 session，近似偏大），第二项 True。
+
+    第二项存在的意义：裸计数**绝不能**落进 leaf_status.stats_json。否则 index.db
+    建好之后，index.jsonl 的 size/mtime 没变，签名断言「缓存有效」，这份偏大
+    5~9 倍的估算就被永久固化（实测 1668 个叶子中招，如某叶 stats=208014 而真实
+    sessions=22804）。调用方据此决定是否跳过回写。
     """
     try:
         import utils.newapi_index_db as nidb
         if nidb.status(str(leaf)).get("sessions", 0) > 0:
-            return nidb.get_session_stats(str(leaf), threshold)
+            return nidb.get_session_stats(str(leaf), threshold), False
     except Exception:
         pass
     # 未构建：裸计数近似（前端在未构建时会标「聚合中·近似」），不阻塞
-    return _sessions_from_index(leaf)
+    return _sessions_from_index(leaf), True
 
 
 def _get_active_tag() -> str:
@@ -354,6 +357,11 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
         sub_by_dir: Dict[str, tuple] = {}
 
         current_dirs = set()
+        # 本轮**真正重算**过的目录。回写 leaf_status 时只有它们才能带上新的
+        # stats_sync_rowid —— 否则会把「沿用旧缓存」的 sessions 盖上最新水位，
+        # 让过期快照永远看起来有效（实测某叶 index.db 有 26 个 key、stats_json
+        # 只有 24 个，且再也不会自愈）。
+        _recomputed: set = set()
         for sub, leaf_row in leaf_iter:
                 dir_name = dir_key_for(env_dir, sub)
                 current_dirs.add(dir_name)
@@ -361,19 +369,32 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
 
                 prev = dirs_cache.get(dir_name)
 
+                # frozen 快路径：历史目录不重扫。但必须先确认 index.db 的同步水位
+                # 没有推进过 —— watcher 折叠新 session 时不改 index.jsonl，
+                # 光看 frozen 会让快照永远停在旧内容（实测某叶 index.db 有 26 个
+                # key、stats_json 只有 24 个，且不会自愈）。
+                _sig_stale = (leaf_row is not None
+                              and leaf_row.get("stats_sync_rowid", -1) != leaf_row.get("sync_rowid", -1))
                 if (not force and prev
                         and prev.get("frozen")
-                        and dir_name != active_tag):
+                        and dir_name != active_tag
+                        and not _sig_stale):
                     continue
 
                 # ── leaf_status 统计缓存签名短路 ──────────────────────────────
-                # 一次 stat index.jsonl（不开 SQLite）：size+mtime 未变且 threshold
-                # 相符且有缓存 JSON → 命中，直接用缓存 sessions，跳过下方所有磁盘
-                # 重扫/聚合。签名变化/threshold 不符/无缓存 → 落下方原分支重算，
-                # 循环末尾再回写 leaf_status（见 _writeback）。
+                # 一次 stat index.jsonl（不开 SQLite）：size+mtime 未变、threshold
+                # 相符、且**同步水位未推进**→ 命中，直接用缓存 sessions，跳过下方
+                # 所有磁盘重扫/聚合。任一不满足 → 落下方原分支重算，循环末尾再
+                # 回写 leaf_status（见 _writeback）。
+                #
+                # sync_rowid 这一条必不可少：watcher 把新 session 折叠进 index.db
+                # 时并不改 index.jsonl，只靠 size+mtime 会让快照「名义有效」却落后
+                # 于 index.db（实测某叶 sessions 有 26 个 key、stats_json 只有 24）。
+                # 两个 rowid 都是本地 log_dir.db 里的整数，比对不触网。
                 if (not force and use_leaf_db and leaf_row is not None
                         and leaf_row.get("stats_json")
-                        and leaf_row.get("stats_threshold") == threshold):
+                        and leaf_row.get("stats_threshold") == threshold
+                        and leaf_row.get("stats_sync_rowid", -1) == leaf_row.get("sync_rowid", -1)):
                     try:
                         ist = (sub / "index.jsonl").stat()
                     except OSError:
@@ -447,6 +468,7 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
                             "frozen": dir_name != active_tag,
                             "sessions": sessions,
                         }
+                        _recomputed.add(dir_name)
                         changed = True
                         continue
 
@@ -474,7 +496,11 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
                     old_sessions = prev.get("sessions", {}) if prev else {}
                     # new-api（use_index）：懒回填——consume_leaf 进 DB 后按 q1 归并口径读，
                     # 而非裸计数（每请求 1 session）。首次访问会稍慢，之后走 db_count>0 快路径。
-                    new_sessions = _sessions_lazy_backfill(sub, threshold) if use_index else {}
+                    _approx = False
+                    if use_index:
+                        new_sessions, _approx = _sessions_lazy_backfill(sub, threshold)
+                    else:
+                        new_sessions = {}
                     changed_buckets.extend(_diff_sessions(old_sessions, new_sessions, dir_name))
                     if use_index:
                         req_count = sum(v["total"] for v in new_sessions.values())
@@ -485,7 +511,11 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
                         "req_count_mtime": marker_mt,
                         "frozen": dir_name != active_tag,
                         "sessions": new_sessions,
+                        # 裸计数近似值标脏：回写 leaf_status 时跳过，否则会被签名
+                        # 「永久有效」固化下来（实测 1668 叶中招，偏大 5~9 倍）。
+                        "stats_approx": _approx,
                     }
+                    _recomputed.add(dir_name)
                     changed = True
                     continue
 
@@ -528,6 +558,7 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
                     "frozen": dir_name != active_tag,
                     "sessions": sessions,
                 }
+                _recomputed.add(dir_name)
                 changed = True
 
         # ── 回写 leaf_status 统计缓存 ──────────────────────────────────────────
@@ -558,14 +589,28 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
                 # 与库中记录一致（签名短路命中那批）→ 无需重复写
                 if (leaf_row.get("idx_size") == idx_size
                         and leaf_row.get("idx_mtime") == idx_mtime
-                        and leaf_row.get("stats_threshold") == threshold):
+                        and leaf_row.get("stats_threshold") == threshold
+                        and leaf_row.get("stats_sync_rowid", -1) == leaf_row.get("sync_rowid", -1)
+                        and not entry.get("stats_approx")):
                     continue
+                # 裸计数近似值绝不落库：index.db 建好后 index.jsonl 的 size/mtime
+                # 不会变，一旦写进去就被签名「永久有效」固化，偏大 5~9 倍且不自愈。
+                # 已存在的这类脏数据由 session_worker 按 sync_rowid 水位纠偏。
+                if entry.get("stats_approx"):
+                    continue
+                # 只有本轮真正重算过的目录才能盖上最新水位。沿用了旧缓存的目录
+                # （frozen 快路径 / marker_mt 短路）其 sessions 仍是旧快照，
+                # 若也盖新水位，过期数据就永远看起来有效、再也不会自愈。
+                # 对这类目录写 stats_sync_rowid=-1，下次刷新会继续判过期并重算。
+                _new_stats_rowid = (leaf_row.get("sync_rowid", -1)
+                                    if dir_name in _recomputed else -1)
                 try:
                     _lds.set_leaf_stats(
                         rid, dir_name, leaf_path=str(sub),
                         idx_size=idx_size, idx_mtime=idx_mtime,
                         stats_json=json.dumps(sessions, ensure_ascii=False),
                         stats_threshold=threshold,
+                        stats_sync_rowid=_new_stats_rowid,
                     )
                 except Exception:
                     pass
@@ -792,6 +837,112 @@ def _build_rows(cache: dict, threshold: int, include_rows: bool = True) -> dict:
     return result
 
 
+def build_stats_from_leaf_db(threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
+                             roots: Optional[List[str]] = None,
+                             active_env_dir: Optional[str] = None,
+                             include_rows: bool = True) -> Optional[dict]:
+    """直接用 leaf_status.stats_json 重建 build_stats_multi 的返回结构。
+
+    返回 None 表示「不适合走这条快路径」（调用方回退到 build_stats_multi）：
+      - log_dir.db 未初始化 / 没有任何可用的 stats_json
+      - 存在 threshold 不符的叶子（口径不一致，混用会得到错的 qualified）
+      - 存在快照内容与 sessions 矛盾的叶子（裸计数近似等脏数据）
+
+    为什么快：build_stats_multi 的 4.89s 里有 4.29s 是 refresh_index 扫盘
+    （逐叶 stat index.jsonl + 解析 index.jsonl），而同样的聚合结果在同步阶段
+    已经算好落库了。这里只读 4709 行本地行 + 解析 JSON，实测 0.24s。
+
+    结构与 build_stats_multi 完全一致（total_sessions / qualified_sessions /
+    threshold / dates / rows），其中 rows[].mtime_cells 的 key 同样带
+    ``<root_id>/`` 前缀（多 root 时）。
+    """
+    import utils.logdir_store as _lds
+    from utils.logs_config import get_root_id
+
+    if not _lds._ready():
+        return None
+    root_list = roots or []
+    if not root_list:
+        return None
+
+    multi = len(root_list) > 1
+    table: Dict[str, Dict[str, Dict[str, int]]] = {}
+    mtime_table: Dict[str, Dict[str, Dict[str, int]]] = {}
+    total_sessions = 0
+    qualified_sessions = 0
+    dates: set = set()
+    leaves = 0
+
+    for root in root_list:
+        rid = get_root_id(root, active_env_dir)
+        for row in _lds.bulk_get_stats(rid):
+            raw = row.get("stats_json") or ""
+            if not raw:
+                return None        # 有叶子没快照：结果会偏小，回退
+            if row.get("stats_threshold") != threshold:
+                return None        # 口径不符：qualified 不可比，回退
+            try:
+                buckets = _json_loads(raw)
+            except (ValueError, TypeError):
+                return None
+            if not isinstance(buckets, dict):
+                return None
+            dk = row.get("dir_key") or ""
+            mt = f"{rid}/{dk}" if multi else dk
+            leaf_total = 0
+            for bucket_key, counts in buckets.items():
+                api_key, _, date_str = bucket_key.rpartition("|")
+                if not api_key:
+                    continue
+                t = counts.get("total", 0)
+                q = counts.get("qualified", 0)
+                leaf_total += t
+                total_sessions += t
+                qualified_sessions += q
+                dates.add(date_str)
+                cell = table.setdefault(api_key, {}).setdefault(date_str, {"total": 0, "qualified": 0})
+                cell["total"] += t
+                cell["qualified"] += q
+                mtcell = mtime_table.setdefault(api_key, {}).setdefault(mt, {"total": 0, "qualified": 0})
+                mtcell["total"] += t
+                mtcell["qualified"] += q
+            # 内容校验：快照总量必须等于库里记录的会话数。不等说明这份快照是
+            # 「index.db 未构建时的裸计数近似」，偏大 5~9 倍（实测 1672 个叶子）。
+            if leaf_total != (row.get("sessions") or 0):
+                return None
+            leaves += 1
+
+    if not leaves:
+        return None
+
+    result = {
+        "total_sessions": total_sessions,
+        "qualified_sessions": qualified_sessions,
+        "threshold": threshold,
+        "dates": sorted(dates),
+    }
+    if include_rows:
+        rows = []
+        for api_key, cells in table.items():
+            row_total = sum(c["total"] for c in cells.values())
+            rows.append({
+                "api_key": api_key,
+                "cells": {d: dict(c) for d, c in cells.items() if c["total"] > 0},
+                "mtime_cells": {m: dict(c) for m, c in mtime_table.get(api_key, {}).items()
+                                if c["total"] > 0},
+                "row_total": row_total,
+                "row_qualified": sum(c["qualified"] for c in cells.values()),
+            })
+        rows.sort(key=lambda r: r["row_total"], reverse=True)
+        result["rows"] = rows
+    return result
+
+
+def _json_loads(raw: str):
+    import json as _j
+    return _j.loads(raw)
+
+
 def build_stats_multi(roots: List[str], threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
                       force: bool = False, active_env_dir: Optional[str] = None,
                       bust_ttl: bool = False, include_rows: bool = True) -> dict:
@@ -806,6 +957,14 @@ def build_stats_multi(roots: List[str], threshold: int = QUALIFIED_THRESHOLD_DEF
     include_rows=False 时不下传 rows 构建（见 _build_rows），只返回标量 +
     dates；供只需要总数/达标数的页面使用，省掉每请求 ~0.45s 的重建。
     """
+    # 快路径：直接读 leaf_status 里同步阶段算好的聚合结果（实测 4.89s → 0.24s）。
+    # 仅当全部叶子都通过「threshold 一致 + 快照总量与 sessions 相符」校验时采用；
+    # 任何一个叶子不可信就整体回退到扫盘路径 —— 宁可慢，也不给导出页错的数字。
+    if not force and not bust_ttl:
+        fast = build_stats_from_leaf_db(threshold, roots, active_env_dir, include_rows)
+        if fast is not None:
+            return fast
+
     merged_rows: Dict[str, dict] = {}
     all_dates: set = set()
     total_sessions = 0

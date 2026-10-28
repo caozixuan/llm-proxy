@@ -10,7 +10,8 @@
 {% endblock %}
 
 {% block page_styles %}
-        .main-content { display: flex; flex-direction: column; justify-content: center; min-height: 100vh; }
+        /* 概览页：高密度卡片大盘。不要给 .main-content 加 flex 垂直居中——
+           那会让整页内容悬浮在视口中央，与顶部对齐的密集网格冲突。 */
         .dashboard-panel h5 { color: var(--primary); font-size: .85rem; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .05em; }
         .dash-divider { border-left: 1px solid var(--border); }
         .blink { animation: blink 1.5s infinite; }
@@ -54,7 +55,6 @@
         .fail-search-input { flex: 1; min-width: 140px; }
 
 
-    <!-- ===== 统计总览 (merged from overview_stat.html) ===== -->
         /* query.html 复用 */
         .arrow { font-size: .8rem; margin-left: 4px; }
         .summary-total { background: var(--muted); border-radius: var(--radius); padding: 14px 16px; }
@@ -80,19 +80,31 @@
         }
         .chart-grid .card { margin-bottom: 0; }
 
-        /* 热力图(由 sessions.html 移植) */
-        .heatmap-wrap { width: 100%; overflow-x: auto; }
+        /* 热力图(由 sessions.html 移植)
+           固定 7 天窗口：格子不再用 aspect-ratio:1/1 —— 143 天历史下正方形格子会把
+           每列撑到 ~20px，总宽 2700px+ 溢出成横向滚动条。改为固定行高，列宽 1fr 自适应。 */
+        .heatmap-wrap { width: 100%; }
         .heatmap-grid {
             display: grid;
-            grid-template-columns: repeat(var(--n-days, 1), 1fr);
-            gap: 1px;
-            min-width: 100%;
+            grid-template-columns: repeat(var(--n-days, 7), 1fr);
+            gap: 2px;
         }
         .heatmap-cell {
-            aspect-ratio: 1 / 1; min-height: 0; border-radius: 2px;
+            height: 20px; border-radius: 2px;
             border: 1px solid transparent; cursor: pointer;
         }
         .heatmap-cell:hover { border-color: var(--primary); }
+        /* 横轴刻度：日期标签 */
+        .heatmap-axis {
+            display: grid;
+            grid-template-columns: repeat(var(--n-days, 7), 1fr);
+            gap: 2px; margin-top: 6px;
+            font-size: .7rem; color: var(--muted-foreground); text-align: center;
+        }
+        .heatmap-rowlabel {
+            font-size: .68rem; color: var(--muted-foreground);
+            display: flex; align-items: center; height: 20px; white-space: nowrap;
+        }
         /* 归一化 5 档 + 0 值(用 CSS 变量,亮/暗各一组)。tier 越低颜色越浅 */
         .tier-0 { background: color-mix(in srgb, var(--muted) 55%, var(--card)); }
         .tier-1 { background: color-mix(in srgb, var(--primary) 22%, var(--card)); }
@@ -182,210 +194,210 @@
             .chart-grid { grid-template-columns: 1fr; }
             .summary-cards { grid-template-columns: repeat(2, 1fr); }
         }
+
+        /* ===== 概览页专用：KPI 卡 / 三列网格 / 排名行 ===== */
+        .kpi-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin-bottom: 16px; }
+        .kpi-card {
+            background: var(--card); border: 1px solid var(--card-border);
+            border-radius: var(--radius-lg); padding: 14px 16px 10px;
+            box-shadow: var(--shadow-sm); min-width: 0;
+        }
+        .kpi-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+        .kpi-icon {
+            width: 22px; height: 22px; border-radius: 6px; flex-shrink: 0;
+            display: inline-flex; align-items: center; justify-content: center;
+            background: color-mix(in srgb, var(--primary) 14%, transparent);
+            color: var(--primary); font-size: 12px;
+        }
+        .kpi-label { font-size: .78rem; color: var(--muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .kpi-value { font-size: 1.32rem; font-weight: 700; line-height: 1.15; font-variant-numeric: tabular-nums; }
+        .kpi-sub { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: .74rem; min-height: 16px; }
+        .kpi-delta { font-weight: 600; }
+        .kpi-spark { height: 30px; margin-top: 6px; position: relative; }
+        .kpi-spark canvas { position: absolute; inset: 0; }
+
+        .ov-grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; align-items: start; }
+        .ov-grid-3 > .card { margin-bottom: 0; min-width: 0; }
+
+        /* 排名行：名次 + 名称 + 数值 + 占比条 */
+        .rank-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: .8rem; }
+        .rank-no {
+            width: 18px; flex-shrink: 0; text-align: center; font-weight: 700;
+            font-size: .72rem; color: var(--muted-foreground);
+        }
+        .rank-no.top3 { color: var(--primary); }
+        .rank-name {
+            width: 96px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis;
+            white-space: nowrap; font-weight: 500;
+        }
+        .rank-val { width: 78px; flex-shrink: 0; text-align: right; font-variant-numeric: tabular-nums; }
+        .rank-track { flex: 1; height: 12px; background: var(--muted); border-radius: 3px; overflow: hidden; min-width: 30px; }
+        .rank-fill {
+            height: 100%; border-radius: 3px; min-width: 2px;
+            background: linear-gradient(90deg, color-mix(in srgb, var(--primary) 55%, var(--card)), var(--primary));
+            transition: width .3s;
+        }
+        .rank-pct { width: 42px; flex-shrink: 0; text-align: right; color: var(--muted-foreground); font-size: .74rem; }
+
+        .dash-empty {
+            display: flex; align-items: center; justify-content: center;
+            color: var(--muted-foreground); font-size: .8rem;
+            border: 1px dashed var(--border); border-radius: var(--radius);
+            background: var(--muted); padding: 18px 12px; text-align: center;
+        }
+        .dash-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+        .dash-head .card-title { margin: 0; }
+
+        @media (max-width: 1280px) {
+            .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+            .ov-grid-3 { grid-template-columns: 1fr 1fr; }
+        }
+        @media (max-width: 760px) {
+            .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+            .ov-grid-3 { grid-template-columns: 1fr; }
+        }
 {% endblock %}
 
 {% block content %}
 {% raw %}
 <div id="app">
-    <div class="grid grid-2" style="align-items:stretch">
-        <div class="card stat-panel">
-            <div class="stat-panel-head">
-                <div class="font-semibold">累计指标</div>
-                <div class="text-muted text-sm">自服务启动以来</div>
-            </div>
-            <div class="stat-list">
-                <div class="stat-item">
-                    <span class="stat-label">首次请求</span>
-                    <span class="stat-num">{{ indexStats.first_count }}</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">有效请求</span>
-                    <span class="stat-num">{{ indexStats.valid_count }}</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">重试次数</span>
-                    <span class="stat-num">{{ totalRetries }}</span>
-                    <span class="stat-note">总上游 {{ indexStats.total_count }}</span>
-                </div>
-            </div>
-            <div class="stat-list" style="margin-top:10px">
-                <div class="stat-item">
-                    <span class="stat-label">当前 RPM</span>
-                    <span class="stat-num">{{ latestRpm }}</span>
-                    <span class="stat-note">本分钟</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">TPM 输入</span>
-                    <span class="stat-num">{{ latestTpmIn }}</span>
-                    <span class="stat-note">本分钟</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">有效率</span>
-                    <span class="stat-num" :class="'text-' + rateLevel">{{ successRatePct }}%</span>
-                    <span class="stat-note blink" :class="'text-' + rateLevel">
-                        {{ rateLevel === 'good' ? '● 正常' : rateLevel === 'warn' ? '● 偏低' : '● 异常' }}
-                    </span>
-                </div>
-            </div>
+    <!-- ===== 页面头：标题 + 时间范围 + 自动刷新 ===== -->
+    <div class="page-header flex items-center justify-between flex-wrap gap-3" style="gap:12px;">
+        <div>
+            <h1 class="page-title">概览</h1>
+            <div class="page-subtitle">实时监控 API 调用情况、Token 消耗、性能指标与关键会话</div>
         </div>
-
-        <div class="card stat-panel">
-            <div class="stat-panel-head">
-                <div class="font-semibold">实时在途请求</div>
-                <span class="blink text-good" title="实时">● LIVE</span>
-                <div class="text-muted text-sm">每 {{ refreshInterval }} 秒刷新<span v-if="live.uptime_sec"> · 已运行 {{ liveUptime }}</span></div>
-            </div>
-            <div class="stat-list">
-                <div class="stat-item">
-                    <span class="stat-label">在途总数</span>
-                    <span class="stat-num" :class="'text-' + inflightLevel">{{ live.in_flight }}</span>
-                    <span class="stat-note">当前并发</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">等待厂商</span>
-                    <span class="stat-num" :class="{ 'text-warn': live.stages.waiting_upstream > 0 }">{{ live.stages.waiting_upstream }}</span>
-                    <span class="stat-note">已连上</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">建连中</span>
-                    <span class="stat-num">{{ live.stages.connecting }}</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">回传中</span>
-                    <span class="stat-num">{{ live.stages.streaming }}</span>
-                    <span class="stat-note">透传中</span>
-                </div>
-            </div>
-            <div class="text-muted text-sm" style="margin-top:10px">
-                阻塞提示：<span v-if="live.stages.waiting_upstream > live.stages.streaming && live.stages.waiting_upstream > 5" class="text-warn">大量请求卡在「等待厂商」，瓶颈在上游生成</span>
-                <span v-else-if="live.stages.streaming > 5" class="text-warn">较多请求卡在「回传」，可能客户端接收慢</span>
-                <span v-else class="text-good">链路通畅</span>
-            </div>
+        <div class="flex items-center gap-2 flex-wrap">
+            <span v-for="r in RANGE_PRESETS" :key="r.key"
+                  class="source-tab" :class="{ active: rangePreset === r.key }"
+                  @click="applyRangePreset(r.key)">{{ r.label }}</span>
+            <select class="input input-sm" style="width:auto" v-model.number="selectedHours" @change="fetchRealtime">
+                <option :value="1">最近 1 小时</option>
+                <option :value="2">最近 2 小时</option>
+                <option :value="4">最近 4 小时</option>
+                <option :value="6">最近 6 小时</option>
+                <option :value="12">最近 12 小时</option>
+                <option :value="24">最近 24 小时</option>
+            </select>
+            <button class="btn btn-outline btn-sm" @click="toggleAutoRefresh">
+                {{ autoRefresh ? '● 自动刷新 15s' : '○ 已暂停' }}
+            </button>
         </div>
     </div>
 
-        <div class="dash-divider" style="border-left:none;border-top:1px solid var(--border);"></div>
-        <div class="card stat-panel" style="margin-top:8px">
-            <div class="stat-panel-head">
-                <div class="font-semibold">统计总览</div>
-                <div class="text-muted text-sm">历史统计与分析</div>
-                <div style="flex:1"></div>
-                <span v-if="syncedAt || lastRefreshTs" class="text-muted text-sm" style="font-size:12px;">
-                    <span v-if="syncedAt">同步 {{ syncedAt }}</span>
-                    <span v-if="syncedAt && lastRefreshTs" style="margin:0 6px;">·</span>
-                    <span v-if="lastRefreshTs">会话 {{ lastRefreshTime }}</span>
+    <!-- ===== KPI 卡 ×6 ===== -->
+    <div class="kpi-grid">
+        <div class="kpi-card">
+            <div class="kpi-head"><span class="kpi-icon">⇄</span><span class="kpi-label">调用次数</span></div>
+            <div class="kpi-value">{{ fmtNum(indexStats.first_count) }}</div>
+            <div class="kpi-sub">
+                <span v-if="delta.first" class="kpi-delta" :class="delta.first >= 0 ? 'text-good' : 'text-danger'">
+                    {{ delta.first >= 0 ? '↑' : '↓' }} {{ Math.abs(delta.first).toFixed(1) }}%
                 </span>
-                <button class="page-btn" @click="filterModal = true">统计范围</button>
+                <span v-else class="text-muted">较昨日</span>
             </div>
-
-            <!-- 顶部紧凑数字(累计指标样式) -->
-            <div class="stat-list" v-if="hasAnyData">
-                <div class="stat-item">
-                    <span class="stat-label">请求次数</span>
-                    <span class="stat-num">{{ totalCount }}</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">Token 总量</span>
-                    <span class="stat-num">{{ totalTokens }}</span>
-                    <span class="stat-note">入 {{ totalInput }} / 出 {{ totalOutput }}</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">有效率</span>
-                    <span class="stat-num">{{ successRate }}</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">总 Session</span>
-                    <span class="stat-num">{{ stats ? stats.total_sessions : '—' }}</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">达标 Session</span>
-                    <span class="stat-num">{{ stats ? stats.qualified_sessions : '—' }}</span>
-                    <span class="stat-note">&gt;= {{ threshold }} 轮</span>
-                </div>
-                <div class="stat-item">
-                    <span class="stat-label">达标率</span>
-                    <span class="stat-num">{{ qualifiedRate }}</span>
-                </div>
-            </div>
-            <div v-else-if="loaded && !error && !loading" class="text-muted text-sm">暂无统计数据</div>
-
-            <!-- 统计范围弹窗:筛选 + 刷新/重置 -->
-            <div class="modal-overlay" v-if="filterModal" @click.self="filterModal = false">
-                <div class="modal" style="max-width:660px;">
-                    <div class="modal-head">
-                        <h6>统计范围</h6>
-                        <button class="modal-close" @click="filterModal = false">×</button>
-                    </div>
-                    <div class="modal-body">
-                        <div style="display:flex; flex-wrap:wrap; gap:12px;">
-                            <div style="min-width:150px; flex:1;">
-                                <label class="form-label text-sm">开始日期</label>
-                                <input type="date" class="input input-sm" v-model="startDate">
-                            </div>
-                            <div style="min-width:150px; flex:1;">
-                                <label class="form-label text-sm">结束日期</label>
-                                <input type="date" class="input input-sm" v-model="endDate">
-                            </div>
-                            <div style="min-width:150px; flex:1;">
-                                <label class="form-label text-sm">模型</label>
-                                <input type="text" class="input input-sm" v-model="histModel" placeholder="多个用 , 分隔">
-                            </div>
-                            <div style="min-width:110px; flex:1;">
-                                <label class="form-label text-sm">状态</label>
-                                <select class="input input-sm" v-model="statusFilter">
-                                    <option value="">全部</option>
-                                    <option value="success">成功</option>
-                                    <option value="error">失败</option>
-                                </select>
-                            </div>
-                            <div style="min-width:140px; flex:1;">
-                                <label class="form-label text-sm">渠道</label>
-                                <select class="input input-sm" v-model="channelKeyFilter">
-                                    <option value="">全部渠道</option>
-                                    <option v-for="ck in channelKeyList" :key="ck" :value="ck">{{ maskKey(ck) }}</option>
-                                </select>
-                            </div>
-                            <div style="min-width:140px; flex:1;">
-                                <label class="form-label text-sm">API Key</label>
-                                <select class="input input-sm" v-model="apiKeyFilter">
-                                    <option value="">全部 Key</option>
-                                    <option v-for="ak in apiKeyList" :key="ak" :value="ak">{{ maskKey(ak) }}</option>
-                                </select>
-                            </div>
-                            <div style="min-width:120px; flex:1;">
-                                <label class="form-label text-sm">达标阈值</label>
-                                <input type="number" class="input input-sm" v-model.number="threshold" min="1">
-                            </div>
-                        </div>
-                        <div class="flex gap-2" style="margin-top:14px;">
-                            <button class="btn btn-primary btn-sm flex-1" @click="filterModal = false; fetchData(false)" :disabled="loading">
-                                {{ loading ? '查询中…' : '刷新' }}
-                            </button>
-                            <button class="btn btn-outline btn-sm" @click="resetFilter(); filterModal = false" :disabled="loading">重置</button>
-                        </div>
-                        <div class="text-muted text-sm" style="margin-top:10px;font-size:12px;color:var(--muted-foreground);">
-                            数据按 10 分钟缓存复用,统计范围未变化时不重复扫描。
-                            <span v-if="syncedAt">数据同步时间：{{ syncedAt }}</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
+            <div class="kpi-spark"><canvas id="spark0" ref="spark0"></canvas></div>
         </div>
+
+        <div class="kpi-card">
+            <div class="kpi-head"><span class="kpi-icon">◎</span><span class="kpi-label">Token 总量</span></div>
+            <div class="kpi-value">{{ fmtNum(totalTokens) }}</div>
+            <div class="kpi-sub">
+                <span v-if="delta.tokens" class="kpi-delta" :class="delta.tokens >= 0 ? 'text-good' : 'text-danger'">
+                    {{ delta.tokens >= 0 ? '↑' : '↓' }} {{ Math.abs(delta.tokens).toFixed(1) }}%
+                </span>
+                <span v-else class="text-muted">入 {{ fmtNum(totalInput) }} / 出 {{ fmtNum(totalOutput) }}</span>
+            </div>
+            <div class="kpi-spark"><canvas id="spark1" ref="spark1"></canvas></div>
+        </div>
+
+        <div class="kpi-card">
+            <div class="kpi-head"><span class="kpi-icon">✓</span><span class="kpi-label">成功率</span></div>
+            <div class="kpi-value" :class="'text-' + rateLevel">{{ successRatePct }}%</div>
+            <div class="kpi-sub">
+                <span class="kpi-delta" :class="'text-' + rateLevel">
+                    {{ rateLevel === 'good' ? '● 正常' : rateLevel === 'warn' ? '● 偏低' : '● 异常' }}
+                </span>
+            </div>
+            <div class="kpi-spark"><canvas id="spark2" ref="spark2"></canvas></div>
+        </div>
+
+        <div class="kpi-card">
+            <div class="kpi-head"><span class="kpi-icon">◈</span><span class="kpi-label">平均 Session Token</span></div>
+            <div class="kpi-value">{{ avgSessionTokens }}</div>
+            <div class="kpi-sub"><span class="text-muted">Token 总量 ÷ 总 Session</span></div>
+            <div class="kpi-spark"><canvas id="spark3" ref="spark3"></canvas></div>
+        </div>
+
+        <div class="kpi-card">
+            <div class="kpi-head"><span class="kpi-icon">▤</span><span class="kpi-label">总 Session 数</span></div>
+            <div class="kpi-value">{{ stats ? fmtNum(stats.total_sessions) : '—' }}</div>
+            <div class="kpi-sub">
+                <span class="text-muted">达标 {{ stats ? fmtNum(stats.qualified_sessions) : '—' }}</span>
+                <span class="kpi-delta text-muted">达标率 {{ qualifiedRate }}</span>
+            </div>
+            <div class="kpi-spark"><canvas id="spark4" ref="spark4"></canvas></div>
+        </div>
+
+        <div class="kpi-card">
+            <div class="kpi-head"><span class="kpi-icon">!</span><span class="kpi-label">错误率</span></div>
+            <div class="kpi-value" :class="errorRateLevel">{{ errorRatePct }}%</div>
+            <div class="kpi-sub">
+                <span class="text-muted">失败 {{ fmtNum(errorCount) }} 次</span>
+            </div>
+            <div class="kpi-spark"><canvas id="spark5" ref="spark5"></canvas></div>
+        </div>
+    </div>
+
+    <!-- ===== 实时在途请求（紧凑条） ===== -->
+    <div class="card" style="padding:12px 16px;margin-bottom:16px;">
+        <div class="flex items-center gap-4 flex-wrap" style="font-size:.82rem;">
+            <span class="font-semibold">实时在途</span>
+            <span class="blink text-good" title="实时">● LIVE</span>
+            <span class="text-muted">在途总数</span>
+            <span class="font-semibold" :class="'text-' + inflightLevel">{{ live.in_flight }}</span>
+            <span class="text-muted">等待厂商</span>
+            <span class="font-semibold" :class="{ 'text-warn': live.stages.waiting_upstream > 0 }">{{ live.stages.waiting_upstream }}</span>
+            <span class="text-muted">建连中</span>
+            <span class="font-semibold">{{ live.stages.connecting }}</span>
+            <span class="text-muted">回传中</span>
+            <span class="font-semibold">{{ live.stages.streaming }}</span>
+            <span class="text-muted" style="margin-left:auto;">
+                当前 RPM <b>{{ latestRpm }}</b> · TPM 入 <b>{{ fmtNum(latestTpmIn) }}</b>
+                <span v-if="live.uptime_sec"> · 已运行 {{ liveUptime }}</span>
+            </span>
+        </div>
+    </div>
 
         <div class="dash-divider" style="border-left:none;border-top:1px solid var(--border);"></div>
         <!-- Session 热力图(整段由 sessions.html 移植) -->
         <div class="card" v-if="sources.length">
             <div class="flex items-center gap-2 mb-3" style="flex-wrap:wrap;justify-content:space-between;">
-                <span class="font-semibold" style="font-size:.9rem;">Session 热力图</span>
-                <div class="heatmap-legend" v-if="activeSource">
-                    <span style="color:var(--muted-foreground);">0</span>
-                    <span class="swatch tier-0"></span>
-                    <span class="swatch tier-1"></span>
-                    <span class="swatch tier-2"></span>
-                    <span class="swatch tier-3"></span>
-                    <span class="swatch tier-4"></span>
-                    <span class="swatch tier-5"></span>
-                    <span style="color:var(--muted-foreground);">max {{ activeSource.max }}</span>
+                <div class="flex items-center gap-2">
+                    <span class="font-semibold" style="font-size:.9rem;">Session 热力图</span>
+                    <span class="text-muted text-sm" v-if="heatmapDates.length">
+                        {{ heatmapStart }} ~ {{ heatmapEnd }}（最近 {{ heatmapDates.length }} 天）
+                    </span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <div class="flex items-center gap-1" v-if="heatmapAllDates.length > HEATMAP_DAYS">
+                        <button class="page-btn" :disabled="heatmapWeekOffset >= heatmapMaxPage"
+                                @click="heatmapWeekOffset++" title="更早">‹</button>
+                        <button class="page-btn" :disabled="heatmapWeekOffset <= 0"
+                                @click="heatmapWeekOffset--" title="更近">›</button>
+                        <button class="page-btn" :disabled="heatmapWeekOffset <= 0"
+                                @click="heatmapWeekOffset = 0" title="回到最近一周">最新</button>
+                    </div>
+                    <div class="heatmap-legend" v-if="activeSource">
+                        <span style="color:var(--muted-foreground);">0</span>
+                        <span class="swatch tier-0"></span>
+                        <span class="swatch tier-1"></span>
+                        <span class="swatch tier-2"></span>
+                        <span class="swatch tier-3"></span>
+                        <span class="swatch tier-4"></span>
+                        <span class="swatch tier-5"></span>
+                        <span style="color:var(--muted-foreground);">max {{ fmtNum(heatmapMax) }}</span>
+                    </div>
                 </div>
             </div>
 
@@ -394,22 +406,33 @@
                 <span v-for="s in sources" :key="s.root_id"
                       class="source-tab"
                       :class="{ active: isActiveSource(s) }"
-                      @click="activeSourceId = s.root_id">
+                      @click="activeSourceId = s.root_id; heatmapWeekOffset = 0">
                     {{ s.name }}
                 </span>
             </div>
 
-            <!-- 热力图本体 -->
-            <div class="heatmap-wrap" v-if="activeSource && activeSource.dates.length">
-                <div class="heatmap-grid" :style="{ '--n-days': activeSource.dates.length }">
-                    <template v-for="bin in 12" :key="'b' + bin">
-                        <div v-for="d in activeSource.dates" :key="d + '-' + bin"
-                             class="heatmap-cell"
-                             :class="tierClass(cellVal(d, bin - 1), activeSource.max)"
-                             @click="selectCell(d, bin - 1)"
-                             :title="cellTitle(d, bin - 1)">
+            <!-- 热力图本体：固定 7 列 × 12 个 2 小时档 -->
+            <div class="heatmap-wrap" v-if="activeSource && heatmapDates.length">
+                <div style="display:flex;gap:8px;align-items:flex-start;">
+                    <div style="flex-shrink:0;">
+                        <div class="heatmap-rowlabel" style="height:20px;margin-bottom:2px;"></div>
+                        <div v-for="bin in 12" :key="'lb' + bin" class="heatmap-rowlabel">{{ hourLabel(bin - 1) }}</div>
+                    </div>
+                    <div style="flex:1;min-width:0;">
+                        <div class="heatmap-axis" :style="{ '--n-days': heatmapDates.length }">
+                            <span v-for="d in heatmapDates" :key="'ax' + d">{{ d.slice(5) }}</span>
                         </div>
-                    </template>
+                        <div class="heatmap-grid" :style="{ '--n-days': heatmapDates.length }">
+                            <template v-for="bin in 12" :key="'b' + bin">
+                                <div v-for="d in heatmapDates" :key="d + '-' + bin"
+                                     class="heatmap-cell"
+                                     :class="tierClass(cellVal(d, bin - 1), heatmapMax)"
+                                     @click="selectCell(d, bin - 1)"
+                                     :title="cellTitle(d, bin - 1)">
+                                </div>
+                            </template>
+                        </div>
+                    </div>
                 </div>
                 <div v-if="selectedCell" class="text-sm mt-2" style="color:var(--muted-foreground);">
                     点击:{{ selectedCell.date }} {{ selectedCell.label }} · {{ selectedCell.val }} sessions
@@ -424,82 +447,163 @@
              class="card text-muted text-sm p-3"
              style="background:var(--muted);border-radius:var(--radius);">暂无 Session 热力图数据</div>
 
-        <div class="dash-divider" style="border-left:none;border-top:1px solid var(--border);"></div>
-    <div class="grid grid-2" style="align-items:start;margin-top:16px">
-        <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
+    <!-- ===== 第二行：实时监控 / 模型分布 / Top 排名 ===== -->
+    <div class="ov-grid-3">
         <div class="card">
-            <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+            <div class="dash-head">
                 <div>
-                    <div class="font-semibold">实时监控</div>
-                    <div class="text-muted text-sm">RPM 随时间流式刷新，默认展示最近 2 小时</div>
+                    <div class="card-title">实时监控</div>
+                    <div class="text-muted text-sm">RPM 随时间流式刷新</div>
                 </div>
-                <div class="flex items-center gap-3 flex-wrap">
-                    <label class="control-label">时间范围</label>
-                    <select class="input input-sm" style="width:auto" v-model.number="selectedHours" @change="fetchRealtime">
-                        <option :value="1">最近 1 小时</option>
-                        <option :value="2">最近 2 小时</option>
-                        <option :value="4">最近 4 小时</option>
-                        <option :value="6">最近 6 小时</option>
-                        <option :value="12">最近 12 小时</option>
-                        <option :value="24">最近 24 小时</option>
-                    </select>
-                    <label class="control-label" style="margin-left: 8px">模型</label>
-                    <div class="flex gap-3 flex-wrap">
-                        <span class="pill" :class="{ active: selectedModel === '__all__' }" @click="setModel('__all__')">全部</span>
-                        <span v-for="m in modelList" :key="m" class="pill" :class="{ active: selectedModel === m }" @click="setModel(m)">
-                            {{ m }}
-                        </span>
-                    </div>
-                    <button class="btn btn-outline btn-sm" style="margin-left: 8px" @click="toggleAutoRefresh">
-                        {{ autoRefresh ? '暂停刷新' : '恢复刷新' }}
-                    </button>
-                </div>
+                <select class="input input-sm" style="width:auto" v-model.number="granularity" @change="applyModelFilter">
+                    <option :value="1">1 分钟</option>
+                    <option :value="5">5 分钟</option>
+                    <option :value="15">15 分钟</option>
+                    <option :value="60">1 小时</option>
+                </select>
             </div>
-
-            <div class="chart-tabs">
-                <div class="chart-tab" :class="{ active: chartTab === 'rpm' }" @click="switchChartTab('rpm')">RPM 每分钟请求数</div>
-                <div class="chart-tab" :class="{ active: chartTab === 'tpm' }" @click="switchChartTab('tpm')">TPM 输入 / 输出</div>
-                <div class="chart-tab" :class="{ active: chartTab === 'rate' }" @click="switchChartTab('rate')">有效率趋势</div>
+            <div class="flex gap-2 flex-wrap" style="margin-bottom:8px;">
+                <span v-for="t in CHART_TABS" :key="t.key" class="metric-tab"
+                      :class="{ active: chartTab === t.key }"
+                      @click="switchChartTab(t.key)">{{ t.label }}</span>
             </div>
-
-            <div class="chart-wrap" style="height: 216px"><canvas id="chartMain"></canvas></div>
+            <div class="flex gap-2 flex-wrap" style="margin-bottom:8px;">
+                <span class="pill" :class="{ active: selectedModel === '__all__' }" @click="setModel('__all__')">全部</span>
+                <span v-for="m in modelList" :key="m" class="pill" :class="{ active: selectedModel === m }" @click="setModel(m)">{{ m }}</span>
+            </div>
+            <div class="chart-wrap" style="height: 200px"><canvas id="chartMain"></canvas></div>
         </div>
-            <div class="dash-divider" style="border-left:none;border-top:1px solid var(--border);margin:0;"></div>
+
         <div class="card">
-            <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+            <div class="dash-head">
                 <div>
-                    <div class="font-semibold">调用失败记录</div>
-                    <div class="text-muted text-sm">实时失败日志，按时间目录查看</div>
+                    <div class="card-title">模型调用分布</div>
+                    <div class="text-muted text-sm">按模型聚合</div>
                 </div>
-                <div class="flex items-center gap-3 flex-wrap">
-                    <label class="control-label">时间目录</label>
-                    <select class="input input-sm" style="width:auto" v-model="failEnv" @change="failSwitchEnv">
-                        <option v-for="e in failEnvList" :key="e.name" :value="e.name">{{ e.label }} ({{ e.count }})
-                            {{ e.mtime }}{{ e.current ? ' ★' : '' }}</option>
-                    </select>
-                    <button class="btn btn-sm" @click="failOpenSearch">搜索</button>
+                <div class="flex gap-2 flex-wrap">
+                    <span v-for="t in DONUT_TABS" :key="t.key" class="metric-tab"
+                          :class="{ active: donutMetric === t.key }"
+                          @click="donutMetric = t.key; renderDonut()">{{ t.label }}</span>
                 </div>
             </div>
-            <div class="fails-list" style="max-height:240px;border:1px solid var(--border);border-radius:var(--radius-sm);overflow-y:auto" ref="failRecentList">
-                <div v-if="!failRecentItems.length" class="empty-box" style="border:none;border-radius:0">暂无失败日志</div>
-                <div v-for="item in failRecentItems" :key="item.filename" class="log-item" @click="failBrowse(item)">
-                    <div class="font-semibold">{{ item.reason || 'unknown' }} <span style="font-weight:400;color:var(--muted-foreground);font-size:.82rem">· {{ item.model || '?' }}</span></div>
-                    <div class="log-meta">{{ item.created_at }} · <span v-if="item.attempt_count > 1" class="badge badge-warning" style="font-size:.7rem;padding:1px 6px;">{{ item.attempt_count }} 次重试</span><span v-else>attempt {{ item.attempt || '-' }}</span></div>
+            <div style="position:relative;height:200px;">
+                <canvas id="chartDonut"></canvas>
+                <div v-if="!donutHasData" class="dash-empty" style="position:absolute;inset:0;border:0;background:transparent;">
+                    暂无模型数据
                 </div>
+            </div>
+            <div class="flex flex-wrap gap-2" style="margin-top:8px;font-size:.74rem;">
+                <span v-for="(d, i) in donutLegend" :key="i" class="flex items-center gap-2">
+                    <span :style="{ width:'8px', height:'8px', borderRadius:'2px', background:d.color, display:'inline-block' }"></span>
+                    <span class="text-muted">{{ d.label }}</span>
+                    <b>{{ d.pct }}%</b>
+                </span>
             </div>
         </div>
-        </div>
-        <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
-        <!-- 使用量统计(渠道 Key / Key / 模型,同一卡片 + 上层 tab 切换) -->
-        <div class="card" v-if="hasChartData">
-            <div class="card-head">
-                <div class="chart-tabs" style="margin-bottom:0;flex:1;border-bottom:none;">
-                    <div class="chart-tab" :class="{ active: usageTab === 'channel' }" @click="usageTab = 'channel'">渠道 Key</div>
-                    <div class="chart-tab" :class="{ active: usageTab === 'key' }" @click="usageTab = 'key'">API Key</div>
-                    <div class="chart-tab" :class="{ active: usageTab === 'item' }" @click="usageTab = 'item'">模型</div>
+
+        <div class="card">
+            <div class="dash-head">
+                <div class="card-title">Top 模型 / Key</div>
+                <div class="flex gap-2 flex-wrap">
+                    <span v-for="t in RANK_TABS" :key="t.key" class="metric-tab"
+                          :class="{ active: rankTab === t.key }"
+                          @click="rankTab = t.key">{{ t.label }}</span>
                 </div>
-                <button class="page-btn" @click="openUsageModal">更多</button>
             </div>
+            <div v-if="rankRows.length">
+                <div v-for="(r, i) in rankRows" :key="i" class="rank-row">
+                    <span class="rank-no" :class="{ top3: i < 3 }">{{ i + 1 }}</span>
+                    <span class="rank-name" :title="r.name">{{ r.name }}</span>
+                    <span class="rank-val">{{ fmtNum(r.value) }}</span>
+                    <span class="rank-track"><span class="rank-fill" :style="{ width: r.pct + '%' }"></span></span>
+                    <span class="rank-pct">{{ r.pct }}%</span>
+                </div>
+            </div>
+            <div v-else class="dash-empty">暂无排名数据</div>
+        </div>
+    </div>
+
+    <!-- ===== 第三行：失败告警 / 最近异常 / Key 使用 ===== -->
+    <div class="ov-grid-3">
+        <div class="card">
+            <div class="dash-head">
+                <div>
+                    <div class="card-title">调用失败与告警</div>
+                    <div class="text-muted text-sm">按原因分组</div>
+                </div>
+                <button class="btn btn-sm btn-outline" @click="failOpenSearch">搜索</button>
+            </div>
+            <div v-if="errTypeRows.length">
+                <div v-for="(r, i) in errTypeRows" :key="i" class="rank-row">
+                    <span class="rank-no" :class="{ top3: i < 3 }">{{ i + 1 }}</span>
+                    <span class="rank-name" :title="r.name">
+                        <span class="badge" :class="r.badge">{{ r.name }}</span>
+                    </span>
+                    <span class="rank-val">{{ fmtNum(r.count) }}</span>
+                    <span class="rank-track"><span class="rank-fill" :style="{ width: r.pct + '%' }"></span></span>
+                    <span class="rank-pct">{{ r.pct }}%</span>
+                </div>
+            </div>
+            <div v-else class="dash-empty">暂无失败记录</div>
+        </div>
+
+        <div class="card">
+            <div class="dash-head">
+                <div>
+                    <div class="card-title">最近异常请求</div>
+                    <div class="text-muted text-sm">来自失败日志</div>
+                </div>
+                <button class="btn btn-sm btn-outline" @click="failOpenSearch">查看更多</button>
+            </div>
+            <div v-if="failRecentItems.length" style="overflow-x:auto;">
+                <table class="data-table" style="width:100%;">
+                    <thead>
+                        <tr><th>时间</th><th>模型</th><th>原因</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="item in failRecentItems.slice(0, 8)" :key="item.filename"
+                            style="cursor:pointer" @click="failBrowse(item)">
+                            <td style="white-space:nowrap;font-size:.76rem;">{{ (item.created_at || '').slice(5, 16) }}</td>
+                            <td style="font-size:.76rem;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" :title="item.model">{{ item.model || '?' }}</td>
+                            <td><span class="badge" :class="reasonBadge(item.reason)">{{ item.reason || 'unknown' }}</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+            <div v-else class="dash-empty">暂无异常请求</div>
+        </div>
+
+        <div class="card">
+            <div class="dash-head">
+                <div>
+                    <div class="card-title">Key 使用情况</div>
+                    <div class="text-muted text-sm">按调用次数排序</div>
+                </div>
+                <button class="btn btn-sm btn-outline" @click="openKeyModal">更多</button>
+            </div>
+            <div v-if="keyUsageRows.length">
+                <div v-for="(r, i) in keyUsageRows" :key="i" class="rank-row">
+                    <span class="rank-no" :class="{ top3: i < 3 }">{{ i + 1 }}</span>
+                    <span class="rank-name" :title="r.name">{{ r.name }}</span>
+                    <span class="rank-val">{{ fmtNum(r.count) }}</span>
+                    <span class="rank-track"><span class="rank-fill" :style="{ width: r.pct + '%' }"></span></span>
+                    <span class="rank-pct">{{ r.pct }}%</span>
+                </div>
+            </div>
+            <div v-else class="dash-empty">暂无 Key 数据</div>
+        </div>
+    </div>
+
+    <!-- ===== 使用量统计（渠道 Key / API Key / 模型） ===== -->
+    <div class="card" v-if="hasChartData" style="margin-bottom:16px;">
+        <div class="card-head">
+            <div class="chart-tabs" style="margin-bottom:0;flex:1;border-bottom:none;">
+                <div class="chart-tab" :class="{ active: usageTab === 'channel' }" @click="usageTab = 'channel'">渠道 Key</div>
+                <div class="chart-tab" :class="{ active: usageTab === 'key' }" @click="usageTab = 'key'">API Key</div>
+                <div class="chart-tab" :class="{ active: usageTab === 'item' }" @click="usageTab = 'item'">模型</div>
+            </div>
+            <button class="page-btn" @click="openUsageModal">更多</button>
+        </div>
 
             <!-- 二级指标 tab -->
             <div class="metric-tabs mb-3">
@@ -706,8 +810,115 @@
         </div>
         <div v-else-if="!loading && loaded" class="card text-muted text-sm p-3"
              style="background:var(--muted);border-radius:var(--radius);">暂无使用量统计</div>
+
+    <!-- ===== 统计总览 + 统计范围弹窗 ===== -->
+    <div class="card stat-panel" style="margin-top:8px">
+        <div class="stat-panel-head">
+            <div class="font-semibold">统计总览</div>
+            <div class="text-muted text-sm">历史统计与分析</div>
+            <div style="flex:1"></div>
+            <span v-if="syncedAt || lastRefreshTs" class="text-muted text-sm" style="font-size:12px;">
+                <span v-if="syncedAt">同步 {{ syncedAt }}</span>
+                <span v-if="syncedAt && lastRefreshTs" style="margin:0 6px;">·</span>
+                <span v-if="lastRefreshTs">会话 {{ lastRefreshTime }}</span>
+            </span>
+            <button class="page-btn" @click="filterModal = true">统计范围</button>
+        </div>
+
+        <!-- 顶部紧凑数字(累计指标样式) -->
+        <div class="stat-list" v-if="hasAnyData">
+            <div class="stat-item">
+                <span class="stat-label">请求次数</span>
+                <span class="stat-num">{{ totalCount }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">Token 总量</span>
+                <span class="stat-num">{{ totalTokens }}</span>
+                <span class="stat-note">入 {{ totalInput }} / 出 {{ totalOutput }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">有效率</span>
+                <span class="stat-num">{{ successRate }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">总 Session</span>
+                <span class="stat-num">{{ stats ? stats.total_sessions : '—' }}</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">达标 Session</span>
+                <span class="stat-num">{{ stats ? stats.qualified_sessions : '—' }}</span>
+                <span class="stat-note">&gt;= {{ threshold }} 轮</span>
+            </div>
+            <div class="stat-item">
+                <span class="stat-label">达标率</span>
+                <span class="stat-num">{{ qualifiedRate }}</span>
+            </div>
+        </div>
+        <div v-else-if="loaded && !error && !loading" class="text-muted text-sm">暂无统计数据</div>
+
+        <!-- 统计范围弹窗:筛选 + 刷新/重置 -->
+        <div class="modal-overlay" v-if="filterModal" @click.self="filterModal = false">
+            <div class="modal" style="max-width:660px;">
+                <div class="modal-head">
+                    <h6>统计范围</h6>
+                    <button class="modal-close" @click="filterModal = false">×</button>
+                </div>
+                <div class="modal-body">
+                    <div style="display:flex; flex-wrap:wrap; gap:12px;">
+                        <div style="min-width:150px; flex:1;">
+                            <label class="form-label text-sm">开始日期</label>
+                            <input type="date" class="input input-sm" v-model="startDate">
+                        </div>
+                        <div style="min-width:150px; flex:1;">
+                            <label class="form-label text-sm">结束日期</label>
+                            <input type="date" class="input input-sm" v-model="endDate">
+                        </div>
+                        <div style="min-width:150px; flex:1;">
+                            <label class="form-label text-sm">模型</label>
+                            <input type="text" class="input input-sm" v-model="histModel" placeholder="多个用 , 分隔">
+                        </div>
+                        <div style="min-width:110px; flex:1;">
+                            <label class="form-label text-sm">状态</label>
+                            <select class="input input-sm" v-model="statusFilter">
+                                <option value="">全部</option>
+                                <option value="success">成功</option>
+                                <option value="error">失败</option>
+                            </select>
+                        </div>
+                        <div style="min-width:140px; flex:1;">
+                            <label class="form-label text-sm">渠道</label>
+                            <select class="input input-sm" v-model="channelKeyFilter">
+                                <option value="">全部渠道</option>
+                                <option v-for="ck in channelKeyList" :key="ck" :value="ck">{{ maskKey(ck) }}</option>
+                            </select>
+                        </div>
+                        <div style="min-width:140px; flex:1;">
+                            <label class="form-label text-sm">API Key</label>
+                            <select class="input input-sm" v-model="apiKeyFilter">
+                                <option value="">全部 Key</option>
+                                <option v-for="ak in apiKeyList" :key="ak" :value="ak">{{ maskKey(ak) }}</option>
+                            </select>
+                        </div>
+                        <div style="min-width:120px; flex:1;">
+                            <label class="form-label text-sm">达标阈值</label>
+                            <input type="number" class="input input-sm" v-model.number="threshold" min="1">
+                        </div>
+                    </div>
+                    <div class="flex gap-2" style="margin-top:14px;">
+                        <button class="btn btn-primary btn-sm flex-1" @click="filterModal = false; fetchData(false)" :disabled="loading">
+                            {{ loading ? '查询中…' : '刷新' }}
+                        </button>
+                        <button class="btn btn-outline btn-sm" @click="resetFilter(); filterModal = false" :disabled="loading">重置</button>
+                    </div>
+                    <div class="text-muted text-sm" style="margin-top:10px;font-size:12px;color:var(--muted-foreground);">
+                        数据按 10 分钟缓存复用,统计范围未变化时不重复扫描。
+                        <span v-if="syncedAt">数据同步时间：{{ syncedAt }}</span>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
+
 
     <!-- 搜索弹窗：列表(左) | 浏览(右) -->
     <div v-if="failSearchVisible" class="fail-modal-bg" @click="failCloseSearch"></div>
@@ -763,6 +974,36 @@ const app = new Vue({
             selectedModel: '__all__', modelList: [],
             indexStats: { first_count: 0, total_count: 0, valid_count: 0, success_rate: 0 },
             live: { in_flight: 0, stages: { connecting: 0, waiting_upstream: 0, streaming: 0 }, uptime_sec: 0 },
+            // ---- 概览页新增状态 ----
+            rangePreset: '24h', granularity: 1,
+            RANGE_PRESETS: [
+                { key: '2h', label: '实时', hours: 2 },
+                { key: '1h', label: '过去1小时', hours: 1 },
+                { key: '6h', label: '过去6小时', hours: 6 },
+                { key: '24h', label: '过去24小时', hours: 24 },
+            ],
+            CHART_TABS: [
+                { key: 'rpm', label: 'RPM' },
+                { key: 'tpm', label: 'TPM' },
+                { key: 'rate', label: '成功率' },
+                { key: 'err', label: '错误率' },
+            ],
+            DONUT_TABS: [
+                { key: 'count', label: '按调用次数' },
+                { key: 'token', label: '按 Token' },
+            ],
+            RANK_TABS: [
+                { key: 'model_count', label: '模型·次数' },
+                { key: 'model_token', label: '模型·Token' },
+                { key: 'model_error', label: '模型·错误' },
+                { key: 'key_count', label: 'Key·次数' },
+            ],
+            donutMetric: 'count', rankTab: 'model_count',
+            _chartDonut: null, _sparks: [],
+            donutHasData: false, donutLegend: [],
+            delta: { first: 0, tokens: 0 },
+            // 热力图固定窗口：一次只显示 7 天，可用 ‹ › 翻到任意一周
+            HEATMAP_DAYS: 7, heatmapWeekOffset: 0,
             failEnv: '', failEnvList: [], failItems: [], failSelected: null, failContent: '', failOffset: 0, failTotal: 0, failLoading: false,
             failSearchVisible: false, failKeyword: '', failModel: '', failModelList: [],
             failSearchApplied: { keyword: '', model: '' },
@@ -843,6 +1084,72 @@ const app = new Vue({
                     totalInput() { return this.summaryList.reduce((a, c) => a + (c.total_input || 0), 0); },
                     totalOutput() { return this.summaryList.reduce((a, c) => a + (c.total_output || 0), 0); },
                     totalTokens() { return this.totalInput + this.totalOutput; },
+                    errorCount() {
+                        const e = this.summaryList.find(c => c.status === 'error');
+                        return e ? (e.count || 0) : 0;
+                    },
+                    errorRatePct() {
+                        if (!this.totalCount) return '0.0';
+                        return (this.errorCount / this.totalCount * 100).toFixed(1);
+                    },
+                    errorRateLevel() {
+                        const r = parseFloat(this.errorRatePct);
+                        return r <= 1 ? 'text-good' : r <= 5 ? 'text-warn' : 'text-danger';
+                    },
+                    avgSessionTokens() {
+                        const n = this.stats && this.stats.total_sessions;
+                        if (!n || !this.totalTokens) return '—';
+                        return this.fmtNum(Math.round(this.totalTokens / n));
+                    },
+                    // ---- 排名表：模型 / Key ----
+                    rankRows() {
+                        const tab = this.rankTab;
+                        if (tab.startsWith('key_')) {
+                            const rows = (this.keyStats || []).map(k => ({
+                                name: this.maskKey(k.key),
+                                value: tab === 'key_token' ? ((k.tok_in || 0) + (k.tok_out || 0)) : (k.count || 0),
+                            }));
+                            return this._topRows(rows);
+                        }
+                        // 模型维度：items 里每个 model 有 success/error 两种 status 行
+                        const byModel = {};
+                        (this.items || []).forEach(it => {
+                            const m = it.model || '?';
+                            if (!byModel[m]) byModel[m] = { count: 0, token: 0, error: 0 };
+                            byModel[m].count += it.count || 0;
+                            byModel[m].token += (it.input_token_num || 0) + (it.output_token_num || 0);
+                            if (it.status === 'error') byModel[m].error += it.count || 0;
+                        });
+                        const rows = Object.keys(byModel).map(m => ({
+                            name: m,
+                            value: tab === 'model_token' ? byModel[m].token
+                                 : tab === 'model_error' ? byModel[m].error
+                                 : byModel[m].count,
+                        }));
+                        return this._topRows(rows);
+                    },
+                    keyUsageRows() {
+                        const rows = (this.keyStats || []).map(k => ({
+                            name: this.maskKey(k.key), count: k.count || 0,
+                        }));
+                        return this._topRows(rows, 8);
+                    },
+                    errTypeRows() {
+                        const cnt = {};
+                        (this.failRecentItems || []).forEach(it => {
+                            const r = it.reason || 'unknown';
+                            cnt[r] = (cnt[r] || 0) + 1;
+                        });
+                        const rows = Object.keys(cnt).map(k => ({ name: k, count: cnt[k] }));
+                        rows.sort((a, b) => b.count - a.count);
+                        const total = rows.reduce((a, c) => a + c.count, 0) || 1;
+                        return rows.slice(0, 8).map(r => ({
+                            name: r.name,
+                            count: r.count,
+                            pct: Math.max(1, Math.round(r.count / total * 100)),
+                            badge: this.reasonBadge(r.name),
+                        }));
+                    },
                     successRate() {
                         if (!this.totalCount) return '—';
                         const ok = this.summaryList.reduce((a, c) => a + ((c.status === 'success') ? (c.count || 0) : 0), 0);
@@ -871,6 +1178,39 @@ const app = new Vue({
                             if (this.sources[i].root_id === id) return this.sources[i];
                         }
                         return this.sources.length ? this.sources[0] : null;
+                    },
+                    // ---- 热力图固定 7 天窗口 ----
+                    heatmapAllDates() {
+                        return (this.activeSource && this.activeSource.dates) ? this.activeSource.dates : [];
+                    },
+                    // 当前窗口的 7 个日期（不足 7 天时取实际天数）
+                    heatmapDates() {
+                        var all = this.heatmapAllDates;
+                        if (!all.length) return [];
+                        var n = this.HEATMAP_DAYS;
+                        var off = Math.min(Math.max(0, this.heatmapWeekOffset || 0),
+                                           Math.max(0, Math.ceil(all.length / n) - 1));
+                        var end = all.length - off * n;
+                        var start = Math.max(0, end - n);
+                        end = Math.max(start, Math.min(all.length, end));
+                        return all.slice(start, end);
+                    },
+                    heatmapStart() { var d = this.heatmapDates; return d.length ? d[0] : ''; },
+                    heatmapEnd()   { var d = this.heatmapDates; return d.length ? d[d.length - 1] : ''; },
+                    heatmapMaxPage() {
+                        var n = this.heatmapAllDates.length;
+                        return n ? Math.max(0, Math.ceil(n / this.HEATMAP_DAYS) - 1) : 0;
+                    },
+                    // 当前窗口内的最大值（按窗口重算档位，避免历史高峰把本周压成一片浅色）
+                    heatmapMax() {
+                        var src = this.activeSource;
+                        if (!src) return 0;
+                        var mx = 0, self = this;
+                        this.heatmapDates.forEach(function(d) {
+                            var arr = src.cells[d] || [];
+                            for (var i = 0; i < arr.length; i++) if (arr[i] > mx) mx = arr[i];
+                        });
+                        return mx;
                     },
                     hasAnyData() {
                         return this.summaryList.length > 0 || this.stats !== null;
@@ -983,6 +1323,151 @@ const app = new Vue({
                     data: { labels: [], datasets: [] },
                     options: base,
                 });
+                this.initDonut();
+                this.initSparklines();
+            },
+            // ---- 环形图：模型调用分布 ----
+            initDonut() {
+                var el = document.getElementById('chartDonut');
+                if (!el) return;
+                this._chartDonut = new Chart(el, {
+                    type: 'doughnut',
+                    data: { labels: [], datasets: [{ data: [], backgroundColor: [], borderWidth: 0 }] },
+                    options: {
+                        responsive: true, maintainAspectRatio: false, animation: false,
+                        cutout: '62%',
+                        plugins: { legend: { display: false } },
+                    },
+                });
+            },
+            renderDonut() {
+                var chart = this._chartDonut;
+                if (!chart) return;
+                var byModel = {};
+                (this.items || []).forEach(function(it) {
+                    var m = it.model || '?';
+                    if (!byModel[m]) byModel[m] = { count: 0, token: 0 };
+                    byModel[m].count += it.count || 0;
+                    byModel[m].token += (it.input_token_num || 0) + (it.output_token_num || 0);
+                });
+                var metric = this.donutMetric;
+                var rows = Object.keys(byModel).map(function(m) {
+                    return { name: m, value: metric === 'token' ? byModel[m].token : byModel[m].count };
+                }).filter(function(r) { return r.value > 0; });
+                rows.sort(function(a, b) { return b.value - a.value; });
+
+                var palette = ['#3b8ff5', '#f59e0b', '#8b5cf6', '#06b6d4', '#22c55e', '#ef4444', '#64748b'];
+                var top = rows.slice(0, 7);
+                var rest = rows.slice(7).reduce(function(a, c) { return a + c.value; }, 0);
+                var total = rows.reduce(function(a, c) { return a + c.value; }, 0);
+
+                var labels = [], data = [], colors = [];
+                top.forEach(function(r, i) {
+                    labels.push(r.name); data.push(r.value); colors.push(palette[i % palette.length]);
+                });
+                if (rest > 0) { labels.push('其他'); data.push(rest); colors.push(palette[6]); }
+
+                chart.data.labels = labels;
+                chart.data.datasets[0].data = data;
+                chart.data.datasets[0].backgroundColor = colors;
+                chart.update('none');
+
+                this.donutHasData = data.length > 0;
+                var self = this;
+                this.donutLegend = labels.slice(0, 7).map(function(l, i) {
+                    return {
+                        label: l, color: colors[i],
+                        pct: total ? (data[i] / total * 100).toFixed(1) : '0.0',
+                    };
+                });
+            },
+            // ---- KPI 迷你趋势线：无数据不绘制 ----
+            initSparklines() {
+                var self = this;
+                this._sparks = [];
+                for (var i = 0; i < 6; i++) {
+                    var el = document.getElementById('spark' + i);
+                    if (!el) { this._sparks.push(null); continue; }
+                    this._sparks.push(new Chart(el, {
+                        type: 'line',
+                        data: { labels: [], datasets: [{ data: [], borderWidth: 1.5, pointRadius: 0, tension: .35, fill: false }] },
+                        options: {
+                            responsive: true, maintainAspectRatio: false, animation: false,
+                            plugins: { legend: { display: false }, tooltip: { enabled: false } },
+                            scales: { x: { display: false }, y: { display: false } },
+                            elements: { line: { borderWidth: 1.5 } },
+                        },
+                    }));
+                }
+            },
+            updateSparklines() {
+                var rt = this._realtimeRaw || [];
+                if (!rt.length) return;   // 无数据保持空白占位
+                var colors = ['#3b8ff5', '#8b5cf6', '#22c55e', '#f59e0b', '#06b6d4', '#ef4444'];
+                var series = [
+                    rt.map(function(d) { return d.rpm || 0; }),
+                    rt.map(function(d) { return (d.tpm_in || 0) + (d.tpm_out || 0); }),
+                    rt.map(function(d) { return d.rpm ? (1 - (d.errors || 0) / d.rpm) * 100 : 100; }),
+                    rt.map(function(d) { return d.rpm ? ((d.tpm_in || 0) + (d.tpm_out || 0)) / d.rpm : 0; }),
+                    [],   // 总 Session 无分时数据
+                    rt.map(function(d) { return d.rpm ? (d.errors || 0) / d.rpm * 100 : 0; }),
+                ];
+                var self = this;
+                series.forEach(function(vals, i) {
+                    var c = self._sparks[i];
+                    if (!c) return;
+                    if (!vals.length) { c.data.labels = []; c.data.datasets[0].data = []; c.update('none'); return; }
+                    c.data.labels = vals.map(function(_, k) { return k; });
+                    c.data.datasets[0].data = vals;
+                    c.data.datasets[0].borderColor = colors[i];
+                    c.data.datasets[0].backgroundColor = 'transparent';
+                    c.update('none');
+                });
+            },
+            // 按粒度聚合 1 分钟桶
+            bucketSeries(arr) {
+                var g = this.granularity || 1;
+                if (g <= 1 || !arr.length) return arr;
+                var out = [];
+                for (var i = 0; i < arr.length; i += g) {
+                    var slice = arr.slice(i, i + g);
+                    var agg = { ts: slice[0].ts, rpm: 0, tpm_in: 0, tpm_out: 0, errors: 0, first: 0, valid: 0, models: {} };
+                    slice.forEach(function(d) {
+                        agg.rpm += d.rpm || 0;
+                        agg.tpm_in += d.tpm_in || 0;
+                        agg.tpm_out += d.tpm_out || 0;
+                        agg.errors += d.errors || 0;
+                        agg.first += d.first || 0;
+                        agg.valid += d.valid || 0;
+                    });
+                    out.push(agg);
+                }
+                return out;
+            },
+            // ---- Top 排名辅助 ----
+            _topRows(rows, limit) {
+                rows = (rows || []).filter(function(r) { return r.value > 0; });
+                rows.sort(function(a, b) { return b.value - a.value; });
+                var total = rows.reduce(function(a, c) { return a + c.value; }, 0) || 1;
+                return rows.slice(0, limit || 8).map(function(r) {
+                    return { name: r.name, value: r.value, pct: Math.max(1, Math.round(r.value / total * 100)) };
+                });
+            },
+            reasonBadge(reason) {
+                var m = /^http_(\d{3})$/.exec(reason || '');
+                if (!m) return 'badge-muted';
+                var code = +m[1];
+                if (code === 429) return 'badge-warning';
+                if (code >= 500) return 'badge-danger';
+                if (code >= 400) return 'badge-info';
+                return 'badge-muted';
+            },
+            applyRangePreset(key) {
+                this.rangePreset = key;
+                var p = this.RANGE_PRESETS.filter(function(r) { return r.key === key; })[0];
+                if (!p) return;
+                this.selectedHours = p.hours;
+                this.fetchRealtime();
             },
             switchChartTab(tab) {
                 this.chartTab = tab;
@@ -993,13 +1478,14 @@ const app = new Vue({
                 this.applyModelFilter();
             },
             applyModelFilter() {
-                const rt = this._realtimeRaw;
-                const rd = this._rateRaw;
+                // 先按选定粒度把 1 分钟桶聚合，再画
+                const rt = this.bucketSeries(this._realtimeRaw || []);
+                const rd = this.bucketSeries(this._rateRaw || []);
                 const m = this.selectedModel;
                 const all = m === '__all__';
                 const chart = this._chartMain;
                 if (!chart) return;
-    
+
                 let labels, datasets;
                 if (this.chartTab === 'tpm') {
                     labels = rt.map(d => d.ts.slice(5).replace('T', ' '));
@@ -1020,6 +1506,16 @@ const app = new Vue({
                         { label: '警戒 70%', data: rd.map(() => 70), borderColor: '#f59e0b', borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, fill: false },
                         { label: '正常 90%', data: rd.map(() => 90), borderColor: '#16a34a', borderDash: [4, 4], borderWidth: 1.5, pointRadius: 0, fill: false },
                     ];
+                } else if (this.chartTab === 'err') {
+                    labels = rt.map(d => d.ts.slice(5).replace('T', ' '));
+                    const errs = rt.map(d => {
+                        const rpm = all ? (d.rpm || 0) : ((d.models && d.models[m] && d.models[m].rpm) || 0);
+                        const e = all ? (d.errors || 0) : 0;
+                        return rpm ? +(e / rpm * 100).toFixed(2) : 0;
+                    });
+                    datasets = [
+                        { label: '错误率%', data: errs, borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,.08)', fill: true, tension: .3, pointRadius: 2 },
+                    ];
                 } else {
                     labels = rt.map(d => d.ts.slice(5).replace('T', ' '));
                     datasets = [
@@ -1027,7 +1523,7 @@ const app = new Vue({
                         { label: '错误/分', data: rt.map(d => d.errors || 0), borderColor: '#dc2626', backgroundColor: 'rgba(220,38,38,.08)', fill: true, tension: .3, pointRadius: 2 },
                     ];
                 }
-    
+
                 chart.data.labels = labels;
                 chart.data.datasets = datasets;
                 chart.options.scales.y.beginAtZero = true;
@@ -1035,13 +1531,17 @@ const app = new Vue({
                     chart.options.scales.y.min = 0;
                     chart.options.scales.y.max = 100;
                     chart.options.scales.y.ticks.callback = v => v + '%';
+                } else if (this.chartTab === 'err') {
+                    chart.options.scales.y.min = 0;
+                    chart.options.scales.y.max = undefined;
+                    chart.options.scales.y.ticks.callback = v => v + '%';
                 } else {
                     chart.options.scales.y.min = undefined;
                     chart.options.scales.y.max = undefined;
                     chart.options.scales.y.ticks.callback = undefined;
                 }
                 chart.update('none');
-    
+
                 if (rt.length) {
                     const last = rt[rt.length - 1];
                     this.latestRpm = all ? last.rpm : ((last.models && last.models[m] && last.models[m].rpm) || 0);
@@ -1049,6 +1549,7 @@ const app = new Vue({
                     this.latestTpmOut = all ? last.tpm_out : ((last.models && last.models[m] && last.models[m].tpm_out) || 0);
                     this.latestErrors = last.errors || 0;
                 }
+                this.updateSparklines();
             },
             fetchRealtime() {
                 const hours = this.selectedHours;
@@ -1074,6 +1575,30 @@ const app = new Vue({
                         this.modelList = [...models].sort();
                         this.applyModelFilter();
                     }).catch(() => {});
+            },
+            // KPI 环比：拿昨日同口径数据对比。走 /api/statistic 的日期过滤，
+            // 复用 _combined_index 的 600s 缓存，不会触发冷重建。
+            fetchDailyDelta() {
+                var d = new Date();
+                d.setDate(d.getDate() - 1);
+                var ymd = d.toISOString().slice(0, 10);
+                var self = this;
+                fetch('/api/statistic?date_start=' + ymd + '&date_end=' + ymd)
+                    .then(function(r) { return r.json(); })
+                    .then(function(res) {
+                        var sum = res.summary || [];
+                        var yCount = 0, yTokens = 0;
+                        sum.forEach(function(s) {
+                            if (s.status === 'success') {
+                                yCount += s.count || 0;
+                                yTokens += (s.total_input || 0) + (s.total_output || 0);
+                            }
+                        });
+                        self.delta.first = yCount
+                            ? Math.round((self.totalCount - yCount) / yCount * 1000) / 10 : 0;
+                        self.delta.tokens = yTokens
+                            ? Math.round((self.totalTokens - yTokens) / yTokens * 1000) / 10 : 0;
+                    }).catch(function() { /* 取不到就隐藏环比 */ });
             },
             fetchLive() {
                 fetch('/metrics/live')
@@ -1396,6 +1921,7 @@ const app = new Vue({
                                 self.channelPage = 0;
                             }
                             self.applySort();
+                            self.renderDonut();
                             tokenCache = {
                                 items: self.items, summary: self.summaryList,
                                 keyStats: self.keyStats, channelStats: self.channelStats,
@@ -1463,7 +1989,7 @@ const app = new Vue({
                         this.startAutoRefresh();
                         this.failLoadEnvs();
                     });
-    
+
             // 默认时间范围:过去一个月到今天
                     const now = new Date();
                     const oneMonthAgo = new Date(now.getFullYear(), now.getMonth() - 1, now.getDate());
@@ -1472,6 +1998,7 @@ const app = new Vue({
                     this.fetchChannelKeys();
                     this.fetchApiKeys();
                     this.fetchData(false);
+                    this.fetchDailyDelta();
                     // 自动预刷新:每 ~9.5 分钟静默刷新一次,提前于 10min(600s)后端缓存过期,
                     // 这样下一次打开/刷新时命中缓存,统计保持连续,不出现加载等待。
                     var self = this;

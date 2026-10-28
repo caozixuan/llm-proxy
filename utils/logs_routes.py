@@ -653,6 +653,17 @@ def register_logs_routes(app: FastAPI, templates: Jinja2Templates, active_env_di
         totals["leaves"] = sum(s.get("leaf_total", 0) for s in sources)
         totals["built"] = sum(s.get("leaf_built", 0) for s in sources)
 
+        # 逐叶同步明细：哪些叶子还没同步、同步后能多出多少 session / 新 key。
+        # 全部读 leaf_status（本地库），0.17s 左右；与上面的 watch 队列口径互补 ——
+        # 队列看「正在跑的字节进度」，这里看「数据层面的欠账」。
+        try:
+            leaf_summary = lds.sync_leaf_summary()
+            leaf_rows = lds.sync_leaf_detail(limit=200)
+        except Exception:  # noqa: BLE001
+            leaf_summary, leaf_rows = {}, []
+        for lr in leaf_rows:
+            lr["name"] = name_by_rid.get(lr.get("root_id") or "") or ""
+
         from utils.watch_state import worker_alive
         alive, pid, uptime = worker_alive()
 
@@ -664,5 +675,7 @@ def register_logs_routes(app: FastAPI, templates: Jinja2Templates, active_env_di
             "current": current,
             "queue": queue,
             "window_minutes": minutes,
+            "leaf_summary": leaf_summary,
+            "leaves": leaf_rows,
         })
 

@@ -217,6 +217,31 @@ def _collect_log_keys(roots: list, env_dir: str, *, limit: int = 200000) -> set:
                 return all_keys
     except Exception:
         pass
+    # 并上 leaf_status.token_stats_json 里的 key。
+    # stats_json 是 /sessions 统计的缓存，它的失效签名只校验 index.jsonl 的
+    # size+mtime；而 watcher 补进 index.db 的 session 不会改 index.jsonl，于是
+    # 那份快照会「名义有效」却落后于 index.db（实测某叶 sessions 有 26 个 key、
+    # stats_json 只有 24 个）。token_stats_json 由 watcher/回填在写库时刷新，
+    # 覆盖更全 —— 实测两者并集比单用 stats_json 多 51 个 key，且读本地库约 0.02s。
+    try:
+        import json as _json
+        import utils.logdir_store as _lds
+        if _lds._ready():
+            with _lds._lock:
+                rows = _lds._conn.execute(
+                    "SELECT token_stats_json FROM leaf_status WHERE token_stats_json != ''"
+                ).fetchall()
+            for (raw,) in rows:
+                try:
+                    tj = _json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                for bk in (tj.get("keys") or {}):
+                    k = bk.split("|", 1)[0]
+                    if k:
+                        all_keys.add(k)
+    except Exception:  # noqa: BLE001
+        pass
     _EXPORT_KEY_CACHE["ts"] = _now
     _EXPORT_KEY_CACHE["data"] = all_keys
     return all_keys

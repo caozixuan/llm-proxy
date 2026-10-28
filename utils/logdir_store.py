@@ -145,6 +145,22 @@ def init_db(db_dir: str):
             _conn.execute(
                 "ALTER TABLE leaf_status ADD COLUMN token_stats_json TEXT NOT NULL DEFAULT ''"
             )
+        # 迁移：记录「stats_json 快照是基于哪个同步水位算出来的」。
+        # stats_json 的失效签名只校验 index.jsonl 的 size+mtime，而 watcher 把新
+        # session 折叠进 index.db 时并不改 index.jsonl —— 快照会「名义有效」却
+        # 落后于 index.db（实测某叶 sessions 26 个 key、stats_json 只有 24 个）。
+        # 在**写侧**（watcher 已打开叶子库，读 meta 近乎免费）记下当时的
+        # sessions_synced_rowid，读侧只需比对本地库里的两个整数即可判过期。
+        # 读侧若自己去叶子库读 meta，每叶约 73ms（NFS 打开 SQLite），4600 叶
+        # 要 5 分钟，不可接受。
+        if "stats_sync_rowid" not in cols:
+            _conn.execute(
+                "ALTER TABLE leaf_status ADD COLUMN stats_sync_rowid INTEGER NOT NULL DEFAULT -1"
+            )
+        if "sync_rowid" not in cols:
+            _conn.execute(
+                "ALTER TABLE leaf_status ADD COLUMN sync_rowid INTEGER NOT NULL DEFAULT -1"
+            )
         _conn.commit()
 
 
@@ -164,7 +180,9 @@ def upsert_leaf(root_id: str, dir_key: str, root_path: str = "", *,
                 idx_size: Optional[int] = None, idx_mtime: Optional[float] = None,
                 stats_json: Optional[str] = None, stats_threshold: Optional[int] = None,
                 stats_built_at: Optional[str] = None,
-                token_stats_json: Optional[str] = None) -> str:
+                token_stats_json: Optional[str] = None,
+                stats_sync_rowid: Optional[int] = None,
+                sync_rowid: Optional[int] = None) -> str:
     """新增或更新一个叶子。返回 'added' | 'updated'。仅传入的字段被更新。
 
     leaf_path: 折叠层已补回的真实叶子绝对路径（含 index.jsonl 的那一层）。传入非空
@@ -210,6 +228,10 @@ def upsert_leaf(root_id: str, dir_key: str, root_path: str = "", *,
                 fields.append("stats_built_at = ?"); params.append(stats_built_at)
             if token_stats_json is not None:
                 fields.append("token_stats_json = ?"); params.append(token_stats_json)
+            if stats_sync_rowid is not None:
+                fields.append("stats_sync_rowid = ?"); params.append(stats_sync_rowid)
+            if sync_rowid is not None:
+                fields.append("sync_rowid = ?"); params.append(sync_rowid)
             fields.append("last_error = ?"); params.append(last_error)
             params.extend([root_id, dir_key])
             _conn.execute(
@@ -224,8 +246,8 @@ def upsert_leaf(root_id: str, dir_key: str, root_path: str = "", *,
                     (root_id, dir_key, root_path, leaf_path, built, ingested, pending, sessions,
                      state, last_error, synced_at, created_at,
                      idx_size, idx_mtime, stats_json, stats_threshold, stats_built_at,
-                     token_stats_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     token_stats_json, stats_sync_rowid, sync_rowid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (root_id, dir_key, root_path, leaf_path, int(bool(built)),
                   ingested or 0, pending or 0, sessions or 0,
                   state or "pending", last_error, _now(), _now(),
@@ -234,7 +256,9 @@ def upsert_leaf(root_id: str, dir_key: str, root_path: str = "", *,
                   stats_json or "",
                   stats_threshold or 0,
                   stats_built_at or "",
-                  token_stats_json or ""))
+                  token_stats_json or "",
+                  -1 if stats_sync_rowid is None else stats_sync_rowid,
+                  -1 if sync_rowid is None else sync_rowid))
             _conn.commit()
             return "added"
 
@@ -471,25 +495,130 @@ def bulk_get_stats(root_id: str) -> List[dict]:
     with _lock:
         rows = _conn.execute(
             "SELECT dir_key, leaf_path, idx_size, idx_mtime, stats_json, stats_threshold, "
-            "token_stats_json FROM leaf_status WHERE root_id = ? ORDER BY dir_key", (root_id,)
+            "sessions, token_stats_json, stats_sync_rowid, sync_rowid "
+            "FROM leaf_status WHERE root_id = ? ORDER BY dir_key", (root_id,)
         ).fetchall()
     return [dict(r) for r in rows]
 
 
+def stale_stats_leaves(limit: int = 100) -> List[dict]:
+    """列出「统计快照不可信」的叶子，供 session_worker 后台补算。
+
+    两种判定，任一成立即算：
+      1) stats_sync_rowid != sync_rowid —— 快照对应的 index.db 同步水位落后于
+         最新水位（watcher 又折叠进了新 session）。
+      2) stats_json 的 total 之和 != leaf_status.sessions —— 快照内容与库里的
+         真实会话数矛盾。
+
+    第 2 条是必要的：`sync_rowid` 在引入水位之前同步过的叶子上恒为 -1，而
+    `stats_sync_rowid` 默认也是 -1，两个 -1 相等会让判定 1 永远不成立。这类叶子
+    里混着 index.db 尚未构建时写入的「裸计数近似」（每请求算 1 session，偏大
+    5~9 倍，实测 1672 个叶子中招），只靠水位永远发现不了。
+
+    代价：全表读 4709 行 + 解析 JSON 约 0.03s（本地库），每轮只做一次。
+
+    排序：水位差距大的优先，其次按会话数规模。
+    """
+    if not _ready():
+        return []
+    with _lock:
+        rows = _conn.execute(
+            "SELECT root_id, dir_key, leaf_path, idx_size, idx_mtime, sessions, "
+            "stats_json, stats_sync_rowid, sync_rowid "
+            "FROM leaf_status WHERE leaf_path != ''"
+        ).fetchall()
+
+    out: List[dict] = []
+    for r in rows:
+        row = dict(r)
+        raw = row.pop("stats_json", "") or ""
+        stale = row.get("stats_sync_rowid", -1) != row.get("sync_rowid", -1)
+        if not stale and raw:
+            # 内容一致性：stats_json 的 total 之和应等于 sessions。
+            try:
+                d = _json.loads(raw)
+                total = sum(v.get("total", 0) for v in d.values()) if isinstance(d, dict) else -1
+            except (ValueError, TypeError):
+                total = -1
+            if total != (row.get("sessions") or 0):
+                stale = True
+        elif not raw:
+            stale = True          # 没有快照，必须算一次
+        if stale:
+            out.append(row)
+
+    out.sort(key=lambda x: (x.get("sync_rowid", -1) - x.get("stats_sync_rowid", -1)), reverse=True)
+    return out[:int(limit)]
+
+
+def count_stale_stats_leaves() -> int:
+    """需补算叶子的总数，供 worker 启动日志/进度展示。"""
+    if not _ready():
+        return 0
+    with _lock:
+        rows = _conn.execute(
+            "SELECT sessions, stats_json, stats_sync_rowid, sync_rowid "
+            "FROM leaf_status WHERE leaf_path != ''"
+        ).fetchall()
+    n = 0
+    for r in rows:
+        if r["stats_sync_rowid"] != r["sync_rowid"]:
+            n += 1
+            continue
+        raw = r["stats_json"] or ""
+        if not raw:
+            n += 1
+            continue
+        try:
+            d = _json.loads(raw)
+            total = sum(v.get("total", 0) for v in d.values()) if isinstance(d, dict) else -1
+        except (ValueError, TypeError):
+            total = -1
+        if total != (r["sessions"] or 0):
+            n += 1
+    return n
+
+
+def update_sync_rowid(leaf_path: str, rowid: int) -> int:
+    """按叶子绝对路径更新 sync_rowid，返回受影响行数。
+
+    写侧（watcher/回填）调用：它已经打开了叶子库，这里只是本地库里的一条
+    UPDATE（4685 行全表约 5ms）。读侧 stats_index 用它判断 stats_json 快照是否
+    落后于 index.db —— 若让读侧自己去叶子库读 meta，每叶约 73ms（NFS 打开
+    SQLite），4600 叶要 5 分钟。
+    """
+    if not _ready() or not leaf_path:
+        return 0
+    key = os.path.normpath(leaf_path)
+    with _lock:
+        cur = _conn.execute(
+            "UPDATE leaf_status SET sync_rowid = ? WHERE leaf_path = ?",
+            (int(rowid or 0), key),
+        )
+        _conn.commit()
+        return cur.rowcount or 0
+
+
 def set_leaf_stats(root_id: str, dir_key: str, *, leaf_path: str = "",
                    idx_size: int, idx_mtime: float,
-                   stats_json: str, stats_threshold: int) -> None:
+                   stats_json: str, stats_threshold: int,
+                   stats_sync_rowid: Optional[int] = None) -> None:
     """写单叶 /sessions 统计缓存：index.jsonl 签名 + 聚合结果 + threshold。
 
     薄封装 upsert_leaf（叶子不存在则插入），一并盖 stats_built_at=now。不触碰
     built/state/sessions 等叶子管理字段（只写统计缓存列）。
+
+    stats_sync_rowid: 这份快照对应的 index.db 同步水位（来自 leaf_status.sync_rowid）。
+        读侧据此判断快照是否已落后于 index.db —— 只靠 index.jsonl 的 size+mtime
+        判断不出来，因为 watcher 折叠新 session 不改 index.jsonl。
     """
     if not _ready():
         return
     upsert_leaf(root_id, dir_key, leaf_path=leaf_path,
                 idx_size=idx_size, idx_mtime=idx_mtime,
                 stats_json=stats_json, stats_threshold=stats_threshold,
-                stats_built_at=_now())
+                stats_built_at=_now(),
+                stats_sync_rowid=stats_sync_rowid)
 
 
 def set_leaf_token_stats(root_id: str, dir_key: str, *, leaf_path: str = "",
@@ -1147,23 +1276,118 @@ def watch_throughput_buckets(minutes: int = 60, bucket_sec: int = 300) -> List[d
     return out
 
 
-def watch_leaf_backlog() -> dict:
-    """按 root 汇总 leaf_status：{root_id: {total, built, pending, building, error}}。
+def sync_leaf_detail(limit: int = 200, only_pending: bool = True) -> List[dict]:
+    """看板用：逐叶列出「还需同步 / 刚同步完」的明细。
 
-    一次 GROUP BY 拿全，避免前端为每个源循环调 count_summary。
+    每行返回：
+      root_id / dir_key / leaf_path
+      state          leaf_status.state（pending|building|done|error）
+      built          是否已建 index.db
+      sessions       已折叠进 index.db 的会话数
+      ingested       已摄取到 requests 表的行数
+      pending_rows   尚未补 meta 的行数（requests.q1_hash IS NULL）
+      new_rows       index.jsonl 已摄取、但还没折叠成 session 的行数
+                     = entry_count(来自 token_stats_json) - ingested
+      new_keys       该叶 index.jsonl 里出现过、但还没进 sessions 聚合的 key 数
+                     （token_stats_json.api_keys_set 减 stats_json 已覆盖的 key）
+      idx_size       本叶日志原始大小
+      synced_at      最近一次同步时间
+
+    only_pending=True 时只返回「还需要同步」的叶子：未构建、有 pending 行、
+    或还有没折叠成 session 的新行。这类叶子正是看板上该被关注的对象。
     """
     if not _ready():
-        return {}
+        return []
     with _lock:
-        rows = _conn.execute("""
-            SELECT root_id,
-                COUNT(*)                            AS total,
-                COALESCE(SUM(built), 0)             AS built,
-                COALESCE(SUM(state = 'pending'), 0) AS pending,
-                COALESCE(SUM(state = 'building'), 0) AS building,
-                COALESCE(SUM(state = 'error'), 0)   AS error
-            FROM leaf_status GROUP BY root_id
-        """).fetchall()
-    return {r["root_id"]: {k: (r[k] or 0)
-                           for k in ("total", "built", "pending", "building", "error")}
-            for r in rows}
+        rows = _conn.execute(
+            "SELECT root_id, dir_key, leaf_path, state, built, sessions, ingested, "
+            "pending, idx_size, synced_at, stats_json, token_stats_json "
+            "FROM leaf_status WHERE leaf_path != '' ORDER BY dir_key DESC"
+        ).fetchall()
+        # native 源（本项目格式）不走 newapi 的 ingest/enrich 流程，
+        # leaf_status.ingested 对它们恒为 0。若照 newapi 口径算
+        # new_rows = entry_count - ingested，会把整叶行数都当成「待同步」
+        # （实测 native 源每叶虚报 30~60 万行，汇总后 3330 万）。
+        try:
+            fmt_by_root = {r[0]: (r[1] or "") for r in _conn.execute(
+                "SELECT root_id, format FROM sources").fetchall()}
+        except Exception:  # noqa: BLE001
+            fmt_by_root = {}
+
+    out: List[dict] = []
+    for r in rows:
+        ingested = int(r["ingested"] or 0)
+        entry_count = None
+        key_set: set = set()
+        raw_t = r["token_stats_json"] or ""
+        if raw_t:
+            try:
+                tj = _json.loads(raw_t)
+                if isinstance(tj, dict):
+                    ec = tj.get("entry_count")
+                    if isinstance(ec, int):
+                        entry_count = ec
+                    ks = tj.get("api_keys_set")
+                    if isinstance(ks, list):
+                        key_set = {k for k in ks if k}
+            except (ValueError, TypeError):
+                pass
+
+        known_keys: set = set()
+        raw_s = r["stats_json"] or ""
+        if raw_s:
+            try:
+                sj = _json.loads(raw_s)
+                if isinstance(sj, dict):
+                    for bk in sj:
+                        k = bk.split("|", 1)[0]
+                        if k:
+                            known_keys.add(k)
+            except (ValueError, TypeError):
+                pass
+
+        pending_rows = int(r["pending"] or 0)
+        # entry_count 是 index.jsonl 的总行数；ingested 是已落 requests 的行数。
+        # 差值为正说明还有没摄取的新行。仅对 newapi 源成立 —— native 源不经这条路。
+        is_newapi = (fmt_by_root.get(r["root_id"]) == "newapi")
+        if is_newapi and entry_count is not None:
+            new_rows = max(0, entry_count - ingested)
+        else:
+            new_rows = 0
+        new_keys = len(key_set - known_keys) if key_set else 0
+
+        needs = (not r["built"]) or pending_rows > 0 or new_rows > 0
+        if only_pending and not needs:
+            continue
+
+        out.append({
+            "root_id": r["root_id"],
+            "dir_key": r["dir_key"],
+            "leaf_path": r["leaf_path"],
+            "state": r["state"] or "",
+            "built": bool(r["built"]),
+            "sessions": int(r["sessions"] or 0),
+            "ingested": ingested,
+            "pending_rows": pending_rows,
+            "new_rows": new_rows,
+            "new_keys": new_keys,
+            "idx_size": int(r["idx_size"] or 0),
+            "synced_at": r["synced_at"] or "",
+        })
+    out.sort(key=lambda x: (x["new_rows"] + x["pending_rows"]), reverse=True)
+    return out[:int(limit)]
+
+
+def sync_leaf_summary() -> dict:
+    """看板 KPI：全局「待同步叶子数 / 待摄取行数 / 待新增 key 数」。
+
+    与 sync_leaf_detail 同口径，但不返回明细，只给总量。
+    """
+    rows = sync_leaf_detail(limit=10 ** 9, only_pending=True)
+    return {
+        "pending_leaves": len(rows),
+        "pending_rows": sum(r["new_rows"] + r["pending_rows"] for r in rows),
+        "pending_keys": sum(r["new_keys"] for r in rows),
+        "pending_sessions": sum(r["sessions"] for r in rows),
+    }
+

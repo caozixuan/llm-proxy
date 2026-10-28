@@ -303,6 +303,66 @@
             </div>
         </div>
 
+        <!-- 待同步叶子明细：哪些叶子还没同步、同步后能多出多少 session / 新 key -->
+        <div class="panel">
+            <div class="toolbar" style="margin-bottom:12px;">
+                <h6 style="margin:0;">待同步叶子明细</h6>
+                <span class="muted" style="font-size:.76rem;">
+                    {{ fmtNum(ov.leaf_summary.pending_leaves) }} 个叶子待同步 ·
+                    待摄取 {{ fmtNum(ov.leaf_summary.pending_rows) }} 行 ·
+                    将新增 {{ fmtNum(ov.leaf_summary.pending_keys) }} 个 key
+                </span>
+            </div>
+            <div class="dash-scroll">
+            <table class="data-table">
+                <thead>
+                <tr>
+                    <th>来源</th>
+                    <th>叶子目录</th>
+                    <th>状态</th>
+                    <th>已有会话</th>
+                    <th>待摄取行</th>
+                    <th>待补 meta</th>
+                    <th>新增 key</th>
+                    <th>最近同步</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr v-for="lf in pagedLeaves" :key="lf.root_id + '/' + lf.dir_key">
+                    <td>{{ lf.name || lf.root_id }}</td>
+                    <td class="mono-sm" :title="lf.leaf_path">{{ lf.dir_key }}</td>
+                    <td>
+                        <span class="badge" :class="lf.built ? 'badge-active' : 'badge-warn'">
+                            {{ lf.state || (lf.built ? 'done' : 'pending') }}
+                        </span>
+                    </td>
+                    <td>{{ fmtNum(lf.sessions) }}</td>
+                    <td><span :class="lf.new_rows > 0 ? 'msg-err' : ''">{{ fmtNum(lf.new_rows) }}</span></td>
+                    <td>{{ fmtNum(lf.pending_rows) }}</td>
+                    <td><span :class="lf.new_keys > 0 ? 'msg-err' : ''">{{ fmtNum(lf.new_keys) }}</span></td>
+                    <td class="mono-sm">{{ lf.synced_at }}</td>
+                </tr>
+                <tr v-if="ov.leaves.length === 0">
+                    <td colspan="8" style="text-align:center; color:var(--muted-foreground); padding:24px;">
+                        所有叶子都已同步完毕
+                    </td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+            <!-- 分页：待同步叶子可能上百条，每页 10 条 -->
+            <div class="toolbar" style="margin-top:10px; margin-bottom:0; justify-content:flex-end; gap:8px;"
+                 v-if="ov.leaves.length > leafPageSize">
+                <span class="muted" style="font-size:.76rem;">
+                    第 {{ leafPage }} / {{ leafPageCount }} 页 · 共 {{ fmtNum(ov.leaves.length) }} 条
+                </span>
+                <button class="btn btn-outline btn-sm" @click="leafPrev()"
+                        :disabled="leafPage <= 1">上一页</button>
+                <button class="btn btn-outline btn-sm" @click="leafNext()"
+                        :disabled="leafPage >= leafPageCount">下一页</button>
+            </div>
+        </div>
+
         <!-- 来源运行概览 -->
         <div class="panel">
             <div class="toolbar" style="margin-bottom:12px;">
@@ -686,9 +746,14 @@ new Vue({
             current: [],
             queue: [],
             window_minutes: 60,
+            leaf_summary: {},
+            leaves: [],
         },
         qSearch: '',
         qStatus: '',
+        // 待同步叶子明细分页：每页 10 条
+        leafPage: 1,
+        leafPageSize: 10,
         _ovTimer: null,
         rows: [],
         newPath: '',
@@ -765,6 +830,16 @@ new Vue({
                 if (q && (x.dir_key || '').toLowerCase().indexOf(q) === -1) return false;
                 return true;
             });
+        },
+        leafPageCount: function() {
+            var n = (this.ov.leaves || []).length;
+            return Math.max(1, Math.ceil(n / this.leafPageSize));
+        },
+        pagedLeaves: function() {
+            // 待同步叶子可能上百条，每页 10 条。后端已按待处理量倒序返回，
+            // 这里只做窗口切片，排序不再改动。
+            var start = (this.leafPage - 1) * this.leafPageSize;
+            return (this.ov.leaves || []).slice(start, start + this.leafPageSize);
         },
     },
     methods: {
@@ -845,6 +920,12 @@ new Vue({
             try { history.replaceState(null, '', '#' + t); } catch (e) {}
             // 只有看板 Tab 才轮询，切走就停
             if (t === 'sync') this.startOvPoll(); else this.stopOvPoll();
+        },
+        leafPrev: function() {
+            if (this.leafPage > 1) this.leafPage -= 1;
+        },
+        leafNext: function() {
+            if (this.leafPage < this.leafPageCount) this.leafPage += 1;
         },
         gotoSource: function(s) {
             // 跳到「来源与路径」Tab，并展开该源的叶子详情

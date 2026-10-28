@@ -124,6 +124,25 @@ class _LeafFileLock:
         return False
 
 
+def _record_sync_rowid(leaf_dir: str, watermark: int) -> None:
+    """把本次同步到达的 rowid 水位写进本地 leaf_status.sync_rowid。
+
+    写侧调用（watcher/回填已经打开过叶子库），只是往本地 log_dir.db 更新一个整数，
+    微秒级。stats_index 读侧据此判断 stats_json 快照是否落后于 index.db ——
+    若让读侧自己去叶子库读 meta，每叶约 73ms（NFS 打开 SQLite），4600 叶要 5 分钟。
+    """
+    try:
+        import utils.logdir_store as _lds
+        if not _lds._ready():
+            return
+        # 按 leaf_path 直接命中：叶子的 root_id/dir_key 由同步流程登记，
+        # 这里再推算一次反而容易因目录层级不同而算错。
+        if _lds.update_sync_rowid(leaf_dir, int(watermark or 0)) == 0:
+            logger.debug("sync_rowid 未写入（叶子未登记）：%s", leaf_dir)
+    except Exception as ex:  # noqa: BLE001
+        logger.debug("记录 sync_rowid 失败 %s: %s", leaf_dir, ex)
+
+
 def flush_leaf(leaf_dir: str, enrich_workers: int = 0,
                workers_fn=None) -> Dict[str, object]:
     """对单个叶子跑一轮增量同步。返回统计；失败只记日志不外抛。
@@ -165,9 +184,17 @@ def flush_leaf(leaf_dir: str, enrich_workers: int = 0,
             try:
                 sy = nidb.sync_sessions(leaf_dir)
                 out["synced"] = sy.get("synced", 0)
+                out["watermark"] = sy.get("watermark", 0)
             except Exception as ex:  # noqa: BLE001
                 logger.warning("watcher sync_sessions 失败 %s: %s", leaf_dir, ex)
+                sy = {}
         out["ok"] = True
+        # 记录本次同步到达的 rowid 水位（写侧已经打开过叶子库，几乎零成本）。
+        # 读侧（stats_index）用它判断 stats_json 快照是否已经落后于 index.db：
+        # stats_json 的失效签名只看 index.jsonl 的 size+mtime，而 watcher 折叠
+        # 新 session 并不改 index.jsonl，快照会「名义有效」却过期。
+        if out["synced"]:
+            _record_sync_rowid(leaf_dir, out.get("watermark") or 0)
         # 有新会话真的落进 index.db 时，让导出浏览的聚合结果缓存失效，
         # 否则前端最长还要再吃 900s 的旧快照（用户点「刷新列表」也看不到）。
         if out["synced"]:
