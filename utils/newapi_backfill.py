@@ -25,6 +25,11 @@ from utils.log_scan import (
     detect_format, dir_key_for,
 )
 import utils.newapi_index_db as nidb
+from utils.leaf_lock import LeafLockBusy, leaf_lock
+
+# 回填取叶子锁的等待时间（秒）。回填是整 root 的串行队列，为一片被 watcher
+# 占着的叶子长时间等待会拖垮整条队列 —— 拿不到就跳到下一片。
+_LEAF_LOCK_WAIT = 5.0
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +343,10 @@ def _run(root: str, workers: int, force: bool = False):
         leaves = [lf for lf in all_leaves if nidb.needs_build(lf)]
         skipped = len(all_leaves) - len(leaves)
 
+    # 新的先建：叶子目录名是 YYMMDDHH，「当前小时」的数据决定页面可不可用。
+    # 顺序不影响正确性（每叶独立、幂等），只影响用户多久能看见最新数据。
+    leaves.sort(key=lambda lf: os.path.basename(lf.rstrip("/")), reverse=True)
+
     total = len(all_leaves)
     _set(root, status="running", total_leaves=total, done_leaves=skipped,
          skipped_leaves=skipped, force=force, started_at=time.time(), error="",
@@ -356,6 +365,7 @@ def _run(root: str, workers: int, force: bool = False):
     stuck = 0
     failed = 0
     ok = 0
+    locked_skipped = 0
     try:
         for leaf in leaves:
             _set(root, current_leaf=os.path.basename(leaf.rstrip("/")),
@@ -368,15 +378,32 @@ def _run(root: str, workers: int, force: bool = False):
 
             t0 = time.time()
             try:
-                if force:
-                    nidb.remove_db(leaf)
-                nidb.build_leaf(leaf, workers=workers, progress_cb=_progress,
-                                stall_timeout=_STALL_TIMEOUT)
-                # 构建后读事实源，逐叶落盘（重启后据此显示，无需再全盘 stat）
+                # 跨进程互斥：watcher（src/watch/worker.py）可能正在同步同一片叶子。
+                # 拿不到锁就跳过它，下一轮（或被 watcher 追平后）再说——不标 error，
+                # 因为这不是失败，只是「这块地现在有别人在种」。短超时：回填不该为了
+                # 一片叶子堵住整条串行队列，它后面还有几十片。
                 try:
-                    st = nidb.status(leaf)
-                except Exception:
-                    st = {"built": False, "ingested": 0, "pending": 0, "sessions": 0}
+                    lock = leaf_lock(leaf, timeout=_LEAF_LOCK_WAIT).__enter__()
+                except LeafLockBusy:
+                    locked_skipped += 1
+                    bf_logger.info("LEAF LOCKED root=%s leaf=%s (watcher 正在同步，本轮跳过)",
+                                   root, dir_key)
+                    lds.set_leaf_state(rid, dir_key, "pending")
+                    done += 1
+                    _set(root, done_leaves=done, current_leaf="", leaf_total=0, leaf_done=0)
+                    continue
+                try:
+                    if force:
+                        nidb.remove_db(leaf)
+                    nidb.build_leaf(leaf, workers=workers, progress_cb=_progress,
+                                    stall_timeout=_STALL_TIMEOUT)
+                    # 构建后读事实源，逐叶落盘（重启后据此显示，无需再全盘 stat）
+                    try:
+                        st = nidb.status(leaf)
+                    except Exception:
+                        st = {"built": False, "ingested": 0, "pending": 0, "sessions": 0}
+                finally:
+                    lock.__exit__(None, None, None)
                 is_built = bool(st.get("built"))
                 lds.set_leaf_state(
                     rid, dir_key, "done" if is_built else "pending",
@@ -425,8 +452,8 @@ def _run(root: str, workers: int, force: bool = False):
             _set(root, done_leaves=done, current_leaf="", leaf_total=0, leaf_done=0)
         _set(root, status="done", finished_at=time.time())
         bf_logger.info(
-            "ROOT DONE root=%s ok=%d failed=%d stalled=%d skipped=%d total=%d",
-            root, ok, failed, stuck, skipped, total)
+            "ROOT DONE root=%s ok=%d failed=%d stalled=%d locked_skipped=%d skipped=%d total=%d",
+            root, ok, failed, stuck, locked_skipped, skipped, total)
     except Exception as e:  # noqa: BLE001
         _set(root, status="error", error=str(e), finished_at=time.time())
         # root 级崩溃（如 needs_build 遍历撞上损坏 db）：既落专用构建日志，也打一份到 app.log，

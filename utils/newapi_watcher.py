@@ -22,13 +22,12 @@ utils/newapi_watcher.py — new-api 叶子 index.db 的近实时增量同步
 可用环境变量关闭：NEWAPI_WATCHER=0
 """
 
-import fcntl
 import logging
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Dict, Set
 
 logger = logging.getLogger("newapi-watcher")
 
@@ -41,8 +40,6 @@ POLL_INTERVAL = float(os.getenv("NEWAPI_WATCHER_POLL", "5.0"))
 # workers=1 会走 enrich 的进程内快路径（不起 spawn 进程池，省 ~100ms 启动开销），
 # 这对「写入到可见」的延迟是决定性的。突发大批量时才值得调大。
 ENRICH_WORKERS = int(os.getenv("NEWAPI_WATCHER_WORKERS", "1"))
-
-_LOCK_NAME = ".indexer.lock"
 
 # 兜底轮询每个根只看最新的这几个 day/hour 目录（新数据只会落在最新的 hour 里）。
 # 加大只会让每轮 readdir 变多，并不会让老叶子更新更快（老叶子由小时级回填补）。
@@ -84,44 +81,13 @@ def register_root(env_dir: str) -> None:
             _roots.add(os.path.normpath(env_dir))
 
 
-class _LeafLockError(Exception):
-    pass
-
-
-class _LeafFileLock:
-    """跨进程叶子写锁（fcntl.flock，非阻塞探测 + 超时）。
-
-    用独立锁文件而不是锁 index.db 本身：SQLite 自己会持有文件锁，
-    再对同一文件 flock 语义会与之纠缠。
-    """
-
-    def __init__(self, leaf_dir: str, timeout: float = 30.0):
-        self.path = os.path.join(leaf_dir, _LOCK_NAME)
-        self.timeout = timeout
-        self.fd: Optional[int] = None
-
-    def __enter__(self):
-        deadline = time.monotonic() + self.timeout
-        self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
-        while True:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return self
-            except OSError:
-                if time.monotonic() >= deadline:
-                    os.close(self.fd)
-                    self.fd = None
-                    raise _LeafLockError(f"leaf locked: {self.path}")
-                time.sleep(0.05)
-
-    def __exit__(self, *exc):
-        if self.fd is not None:
-            try:
-                fcntl.flock(self.fd, fcntl.LOCK_UN)
-            finally:
-                os.close(self.fd)
-                self.fd = None
-        return False
+# 跨进程叶子写锁已迁到 utils/leaf_lock.py（回填 worker 也要用同一把锁）。
+# 这里保留旧名，历史调用点与测试不受影响。
+from utils.leaf_lock import (  # noqa: E402
+    LOCK_NAME as _LOCK_NAME,
+    LeafLockBusy as _LeafLockError,
+    _LeafFileLock,
+)
 
 
 def _record_sync_rowid(leaf_dir: str, watermark: int) -> None:
@@ -144,13 +110,18 @@ def _record_sync_rowid(leaf_dir: str, watermark: int) -> None:
 
 
 def flush_leaf(leaf_dir: str, enrich_workers: int = 0,
-               workers_fn=None) -> Dict[str, object]:
+               workers_fn=None, cold_build: bool = True) -> Dict[str, object]:
     """对单个叶子跑一轮增量同步。返回统计；失败只记日志不外抛。
 
     enrich_workers: enrich 的并发数；0 表示用模块默认 ENRICH_WORKERS。
     workers_fn:    可选回调，在 **ingest 之后** 调用并返回本次 enrich 并发数。
                    新叶子的积压行只有 ingest 之后才可见——若在 ingest 前按
                    pending 决策，会永远读到 0 而误走单进程慢路径。
+    cold_build:    是否允许「冷建」——叶子还没有 index.db 时由本函数建立。
+                   实时路径（src/watch/worker.py）传 False：全新叶子的首建动辄
+                   200k 行、10 分钟量级，应当交给回填 worker 的增量构建（有整 root
+                   的进程池与进度展示），watcher 只负责「已建好 + 持续增长」的尾巴。
+                   此时返回 out["deferred"]=True，调用方据此转交回填。
     """
     from utils import newapi_index_db as nidb
 
@@ -160,6 +131,13 @@ def flush_leaf(leaf_dir: str, enrich_workers: int = 0,
     if not os.path.isfile(os.path.join(leaf_dir, "index.jsonl")):
         return out
     t0 = time.monotonic()
+    if not cold_build and not nidb._db_exists(leaf_dir):
+        # 全新叶子：本进程不建，交回填。ok=True 表示「按策略处理完毕」，
+        # deferred=True 让调用方去入队增量构建。
+        out["ok"] = True
+        out["deferred"] = True
+        out["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+        return out
     if not nidb.needs_build(leaf_dir) and nidb._db_exists(leaf_dir):
         out["ok"] = True
         out["elapsed_ms"] = int((time.monotonic() - t0) * 1000)

@@ -49,6 +49,34 @@ src/watch/worker.py            （独立进程，由 ./app watch start 拉起）
 构建全部落到同步池，再慢也慢不到发现。这样即使某个叶子有 10 万行积压要跑几分钟，
 其他来源的新数据依然能在 5 秒内被发现并入队。
 
+### 发现线程是动态的
+
+`DiscoverSupervisor`（`src/watch/discover.py`）每 `WATCH_POLL_SEC` 秒对比一次
+`sources` 表：新增的源起线程、被删/路径失效的源停线程、模板改了的源重建线程。
+worker 常驻运行时登记的新数据源**无需重启**就有发现线程。
+
+（早先是启动时注册一次的快照。后果是此后登记的新源永远没有发现线程，
+`watch_queue` 里一条它们的记录都没有，叶子只能等回填偶然碰到。）
+
+### 与增量构建（回填）的分工
+
+同一片叶子的两条写入路径，按下面的判据分工：
+
+| 情形 | 谁处理 |
+|---|---|
+| 叶子有 `index.jsonl` 但**没有** `index.db`（全新叶子） | 回填的「增量构建」 |
+| 有 `index.db` 且 `ingest_offset < index.jsonl` 大小（已建 + 增长） | watcher |
+| 该 root 有 `pending`/`running` 的回填请求 | watcher 让路（`LEAF DEFER`） |
+| watcher 持锁期间被回填碰到 | 回填跳过该叶（`LEAF LOCKED`），下轮再来 |
+
+- **watcher 不冷建**：`flush_leaf(..., cold_build=False)`。新叶首建动辄 20 万行、
+  10 分钟量级，8 个同步槽位一旦被几片首建占满，正在实时写入的叶子就排不上。
+  转交方式是按 root 入队一条回填请求；同一 root 在
+  `WATCH_BACKFILL_REQUEST_COOLDOWN`（默认 300s）内已跑完/失败过就不重复入队。
+- **互斥靠 `utils/leaf_lock.py`**：`<leaf>/.indexer.lock` 上的 `fcntl.flock`，
+  进程内 `newapi_index_db._leaf_lock` 只挡得住同进程线程，挡不住回填 worker。
+- **回填侧从新到旧**：`_run` 把待建叶子按目录名倒序，当前小时的数据最先可查。
+
 ### 为什么不能把 watcher 塞进 app 进程
 
 曾经试过在主应用里开 daemon 线程，实测失败：
@@ -261,7 +289,9 @@ curl -s http://127.0.0.1:8084/api/watch/status -H "x-requested-with: XMLHttpRequ
 | 某叶子反复 `failed` | 单独跑一次 `./app watch logs -f` 看 traceback；常见是合并文件损坏或孤立代理字符（已在 enrich 写回路径清洗） |
 | 数据始终不更新 | 该叶子的 `ingest_offset` 是否追上文件大小；`pending` 是否长期 >0 |
 | 看板 ETA 不准 | `watch_source_stats` 样本太少（新源/刚重启），跑几分钟后自动收敛 |
-| 与回填 worker 抢锁 | 检查 `BACKFILL_AUTO_SYNC_INTERVAL` 是否为 0；`.indexer.lock` 是否会长期被持有 |
+| 叶子一直 `LEAF DEFER` 不建 | 该 root 有跑不完的回填请求：查 `backfill_requests` 里 `pending`/`running` 的行，或回填 worker 是否活着 |
+| `LEAF LOCKED` 反复出现 | watcher 与该叶子的单轮同步时间重叠；看 `WATCH_ENRICH_STALL_TIMEOUT` / `.indexer.lock` 是否被长期持有 |
+| 新登记的源在 `watch_queue` 里一条记录都没有 | 看 `watch_worker.log` 有无该 root 的「发现线程已启动」；没有则是 supervisor 维护失败，重启 worker |
 
 ### 手工清空队列
 

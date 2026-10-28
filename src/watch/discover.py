@@ -63,6 +63,9 @@ class SourceWatcher:
         # {leaf_path: (idx_size, mtime)}  内存缓存
         self._known: Dict[str, Tuple[int, float]] = {}
         self._last_full_scan = 0.0
+        # 本轮扫描时该 root 是否有活跃回填（在 run_once 开头刷新一次，
+        # 避免逐叶查一次 backfill_requests）。
+        self._backfill_active = False
 
     def _enqueue(self, leaf_path: str, dir_key: str, reason: str,
                  idx_size: int, offset_at: int) -> bool:
@@ -186,8 +189,25 @@ class SourceWatcher:
             except Exception as ex:  # noqa: BLE001
                 logger.warning("全量扫描失败 %s: %s", self.root_path, ex)
 
+    def _refresh_backfill_active(self) -> None:
+        """本轮扫描前刷新「该 root 是否有活跃回填」一次。"""
+        try:
+            import utils.logdir_store as lds
+            self._backfill_active = bool(lds.has_active_backfill(self.root_path))
+        except Exception:  # noqa: BLE001
+            self._backfill_active = False
+
     def run_once(self) -> None:
         """运行一轮扫描。"""
+        # 该 root 正在跑整源回填：本轮整轮让路。
+        # 为什么不只是「不入队」：让路的语义是「这片地现在归回填」。若照常扫描
+        # 并推进 _known，回填跳过的叶子（拿不到锁/NFS 卡住）就再也不会被发现；
+        # 若照常入队，worker 侧每个叶子都会 DEFER 一次，watch_queue 每 5 秒堆
+        # 一批重复的 done 行。整轮让路则回填一结束，下一轮扫描自然重新判定。
+        self._refresh_backfill_active()
+        if self._backfill_active:
+            return
+
         now = time.monotonic()
         do_full = (now - self._last_full_scan) >= _FULL_SCAN_EVERY
         if do_full:
@@ -212,38 +232,145 @@ class SourceWatcher:
         logger.info("发现线程退出：%s", self.root_path)
 
 
-def start_discover_threads(stop_evt: threading.Event,
-                           poll_sec: float = 5.0) -> list:
-    """为所有已注册的 newapi 源启动发现线程，返回线程列表。"""
-    import utils.logdir_store as lds
+def _load_sources() -> list:
+    """读 sources 表，返回可起发现线程的 newapi 源 [(root_id, root_path, templates)]。
+
+    目录不存在/格式非 newapi/root_id 为空的都跳过：起一个永远空转的线程没意义，
+    而且 root_id 是线程命名与去重的键。
+    """
+    import json
     import utils.logs_config as lc
 
-    sources = lc._list_sources()
-    threads = []
-    for src in sources:
+    out = []
+    for src in lc._list_sources():
         if src.get("format") != "newapi":
             continue
         root_path = (src.get("root_path") or "").strip()
-        if not root_path or not os.path.isdir(root_path):
-            continue
         root_id = src.get("root_id") or ""
+        if not root_id or not root_path or not os.path.isdir(root_path):
+            continue
         try:
-            templates_raw = src.get("templates") or ""
-            import json
-            templates = json.loads(templates_raw) if templates_raw else []
-        except Exception:
+            raw = src.get("templates") or ""
+            templates = json.loads(raw) if raw else []
+        except Exception:  # noqa: BLE001
             templates = []
+        out.append((root_id, root_path, tuple(templates)))
+    return out
 
-        watcher = SourceWatcher(root_id, root_path, templates, poll_sec, stop_evt)
+
+class DiscoverSupervisor:
+    """按 sources 表的当前内容动态维护「每源一个发现线程」。
+
+    为什么需要动态：app 侧新增数据源只写 sources 表，watcher 是独立常驻进程。
+    早先只有 Worker 启动那一刻注册一次，之后新登记的源**永远没有发现线程**，
+    它们的叶子只能等回填碰运气 —— 而回填跑完又不复扫，于是新叶永久挂在 pending。
+
+    线程按 root_id 去重；模板变了（用户改了层级模板）也重建，因为
+    SourceWatcher.templates 在构造时就固定了。
+    """
+
+    def __init__(self, stop_evt: threading.Event, poll_sec: float = 5.0):
+        self.stop_evt = stop_evt
+        self.poll_sec = poll_sec
+        # root_id -> {"thread", "stop", "root_path", "templates"}
+        self._threads: Dict[str, dict] = {}
+        self._guard = threading.Lock()
+
+    def _stop_entry(self, root_id: str) -> None:
+        e = self._threads.pop(root_id, None)
+        if not e:
+            return
+        e["stop"].set()
+        logger.info("发现线程停止 root_id=%s path=%s", root_id, e["root_path"])
+
+    def _start_entry(self, root_id: str, root_path: str, templates) -> None:
+        stop = threading.Event()
+        watcher = SourceWatcher(root_id, root_path, list(templates),
+                               self.poll_sec, stop)
         t = threading.Thread(
             target=watcher.run_forever,
             name=f"watch-discover-{root_id[:8]}",
             daemon=True,
         )
         t.start()
-        threads.append(t)
+        self._threads[root_id] = {
+            "thread": t, "stop": stop,
+            "root_path": root_path, "templates": tuple(templates),
+        }
         logger.info("发现线程已启动 root_id=%s path=%s", root_id, root_path)
 
+    def sync_sources(self) -> int:
+        """按 sources 表当前内容增/删/重建发现线程。返回本次新建的线程数。
+
+        幂等：已在跑且模板未变的源不做任何事；挂掉的线程会被重建。
+        """
+        try:
+            wanted = {rid: (path, tpls) for rid, path, tpls in _load_sources()}
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("读取数据源失败，本轮跳过发现线程维护: %s", ex)
+            return 0
+
+        started = 0
+        with self._guard:
+            # 移除：源被删、路径失效，或模板变了需要重建
+            for rid in list(self._threads):
+                cur = self._threads[rid]
+                want = wanted.get(rid)
+                if want is None:
+                    self._stop_entry(rid)
+                    continue
+                path, tpls = want
+                if path != cur["root_path"] or tpls != cur["templates"]:
+                    self._stop_entry(rid)
+
+            # 新增 / 重建 / 健康检查
+            for rid, (path, tpls) in wanted.items():
+                cur = self._threads.get(rid)
+                if cur is not None:
+                    if not cur["thread"].is_alive():
+                        logger.warning("发现线程已退出，重建 root_id=%s", rid)
+                        self._threads.pop(rid, None)
+                    else:
+                        continue
+                self._start_entry(rid, path, tpls)
+                started += 1
+        return started
+
+    def stop_all(self) -> None:
+        with self._guard:
+            for rid in list(self._threads):
+                self._stop_entry(rid)
+
+    def thread_count(self) -> int:
+        with self._guard:
+            return len(self._threads)
+
+
+_supervisor: Optional[DiscoverSupervisor] = None
+_supervisor_guard = threading.Lock()
+
+
+def get_supervisor(stop_evt: threading.Event,
+                   poll_sec: float = 5.0) -> DiscoverSupervisor:
+    """进程级单例 supervisor（worker 主循环与启动路径共用同一份线程表）。"""
+    global _supervisor
+    with _supervisor_guard:
+        if _supervisor is None:
+            _supervisor = DiscoverSupervisor(stop_evt, poll_sec=poll_sec)
+        return _supervisor
+
+
+def start_discover_threads(stop_evt: threading.Event,
+                           poll_sec: float = 5.0) -> list:
+    """为所有已注册的 newapi 源启动发现线程，返回线程列表。
+
+    首次调用会立即按 sources 表启动；之后由 worker 主循环周期调
+    DiscoverSupervisor.sync_sources() 跟进新增/删除/模板变更的源。
+    """
+    sup = get_supervisor(stop_evt, poll_sec=poll_sec)
+    sup.sync_sources()
+    with sup._guard:
+        threads = [e["thread"] for e in sup._threads.values()]
     if not threads:
         logger.warning("未找到 newapi 格式的已注册数据源，发现线程为零")
     return threads

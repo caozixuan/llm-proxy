@@ -39,6 +39,7 @@ WATCH_POLL_SEC = _cfg.POLL_SEC
 WATCH_ENRICH_WORKERS = _cfg.ENRICH_WORKERS
 WATCH_ENRICH_INLINE_THRESHOLD = _cfg.ENRICH_INLINE_THRESHOLD
 WATCH_ENRICH_BUDGET = _cfg.ENRICH_BUDGET
+WATCH_BACKFILL_REQUEST_COOLDOWN = _cfg.BACKFILL_REQUEST_COOLDOWN
 
 
 class _EnrichBudget:
@@ -106,6 +107,37 @@ def _handle_signal(signum, frame):
     _logger.info("收到信号 %s，准备退出", signum)
 
 
+def _request_backfill(rec: dict) -> None:
+    """全新叶子（无 index.db）交给回填的「增量构建」，watcher 不冷建。
+
+    为什么不让 watcher 自己建：一片新叶子首建动辄 200k 行、10 分钟量级，
+    8 个同步槽位一旦被几片首建占满，正在实时写入的叶子就排不上了。而且回填
+    有整 root 的进程池、进度与日志，用户点「增量构建」看到的也是那条路径。
+
+    去重与冷却：
+      - 该 root 已有 pending/running 请求 → 什么都不做（回填正在/即将建它）；
+      - 该 root 冷却窗口内有 done/failed 请求 → 不入队。构建失败时 watcher 每轮
+        扫描都会走到这里，没有冷却就会每 5s 追加一条请求。
+    """
+    root_path = (rec.get("root_path") or "").strip()
+    if not root_path:
+        return
+    try:
+        import utils.logdir_store as lds
+        if lds.has_active_backfill(root_path):
+            _logger.debug("叶子待首建，但该 root 已有回填在跑：%s", rec.get("dir_key"))
+            return
+        if lds.has_recent_backfill(root_path, seconds=WATCH_BACKFILL_REQUEST_COOLDOWN):
+            _logger.debug("叶子待首建，回填冷却中：%s", rec.get("dir_key"))
+            return
+        from utils.newapi_backfill import _DEFAULT_WORKERS
+        req_id = lds.enqueue_backfill(root_path, workers=_DEFAULT_WORKERS, force=False)
+        _logger.info("新叶子转交增量构建 req=%s root=%s dir_key=%s",
+                     req_id, root_path, rec.get("dir_key"))
+    except Exception as ex:  # noqa: BLE001
+        _logger.warning("转交回填失败 %s: %s", rec.get("dir_key"), ex)
+
+
 def _sync_one(rec: dict) -> None:
     """同步池任务：处理一条 watch_queue 记录。"""
     wq_id = rec["id"]
@@ -115,10 +147,26 @@ def _sync_one(rec: dict) -> None:
     dir_key = rec.get("dir_key", "")
     t0 = time.time()
 
+    # 该 root 正在跑整源回填：让路。回填是整 root 的批量构建，watcher 再并行
+    # 8 个任务只会抢 NFS 带宽；叶子会在回填结束后的收尾复核/下轮发现里重新入队。
+    # （注意：先于 _active_leaves 登记，避免看板把「让路」显示成「处理中」。）
+    if root_path:
+        try:
+            import utils.logdir_store as lds
+            if lds.has_active_backfill(root_path):
+                logdir_store.finish_watch(
+                    wq_id, True, 0, int((time.time() - t0) * 1000),
+                    "deferred: root backfill running")
+                _logger.info("LEAF DEFER %s root 正在回填，让路", dir_key)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
     with _active_lock:
         _active_leaves[wq_id] = leaf_path
 
     ok = False
+    deferred = False
     error = ""
     bytes_done = 0
     rows_done = 0
@@ -145,7 +193,14 @@ def _sync_one(rec: dict) -> None:
                 return 1
             return _ENRICH_BUDGET.try_acquire(WATCH_ENRICH_WORKERS)
 
-        result = flush_leaf(leaf_path, workers_fn=_decide_workers)
+        result = flush_leaf(leaf_path, workers_fn=_decide_workers, cold_build=False)
+        if result.get("deferred"):
+            # 全新叶子：本次不建，转交回填的增量构建。leaf_status 保持 pending
+            # （回填建成后自己会写 done），这里不覆盖它。走 finally 收尾。
+            _request_backfill(rec)
+            ok = True
+            deferred = True
+            return
         ok = result.get("ok", False)
         if not ok and result.get("enriched", 0) == 0 and result.get("ingested", 0) == 0:
             # 空叶或无需构建也算 ok
@@ -198,12 +253,14 @@ def _sync_one(rec: dict) -> None:
             except Exception:
                 pass
         _logger.info("LEAF %s %s took=%dms bytes=%d err=%s",
-                     "OK" if ok else "FAIL", leaf_path, took_ms, bytes_done, error[:80])
+                     "DEFER" if deferred else ("OK" if ok else "FAIL"),
+                     leaf_path, took_ms, bytes_done, error[:80])
         # 收尾权威复核：ingest 读的是「开始那一刻的 EOF」，读完到任务结束之间
         # 文件往往又长了。发现线程此时也会看到增长，但它的入队会被唯一索引忽略
         # （本行还是 running）——所以必须在这里补一条，否则那几行要等下次增长。
         # 这一步不依赖任何内存状态，是漏唤醒的最终兜底。
-        if ok:
+        # 转交回填的叶子跳过：它还没建库，补入队只会让下一轮再转交一次。
+        if ok and not deferred:
             try:
                 _requeue_if_lagging(leaf_path, root_id, root_path, dir_key)
             except Exception as ex:  # noqa: BLE001
@@ -301,9 +358,10 @@ def main():
     stop_evt = threading.Event()
 
     # 启动每源发现线程
-    from src.watch.discover import start_discover_threads
+    from src.watch.discover import start_discover_threads, get_supervisor
     discover_threads = start_discover_threads(stop_evt, poll_sec=WATCH_POLL_SEC)
     _logger.info("已启动 %d 个发现线程", len(discover_threads))
+    supervisor = get_supervisor(stop_evt, poll_sec=WATCH_POLL_SEC)
 
     # 启动同步池 + dispatcher
     with ThreadPoolExecutor(max_workers=WATCH_CONCURRENCY,
@@ -314,8 +372,20 @@ def main():
         )
         disp.start()
 
+        # 主循环：每轮跟进 sources 表的变化（新增源/删源/改模板），
+        # 让后发现线程不必等 worker 重启就有。
+        last_sync = time.monotonic()
         while not _shutdown_requested:
             time.sleep(1)
+            if time.monotonic() - last_sync >= WATCH_POLL_SEC:
+                last_sync = time.monotonic()
+                try:
+                    n = supervisor.sync_sources()
+                    if n:
+                        _logger.info("发现线程表已更新，新建 %d 个（共 %d 个）",
+                                     n, supervisor.thread_count())
+                except Exception as ex:  # noqa: BLE001
+                    _logger.warning("发现线程维护失败: %s", ex)
 
         _logger.info("收到关停信号，通知所有线程退出…")
         stop_evt.set()

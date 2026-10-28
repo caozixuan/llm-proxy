@@ -58,6 +58,13 @@ ENRICH_INLINE_THRESHOLD = _env_int("WATCH_ENRICH_INLINE_THRESHOLD", 1000)
 # 8 个任务 × 4 worker = 32 个 spawn 进程会压垮 NFS，这里兜底。
 ENRICH_BUDGET = _env_int("WATCH_ENRICH_BUDGET", 12)
 
+# ── 与回填的分工 ─────────────────────────────────────────────────────────
+
+# 全新叶子（无 index.db）watcher 不冷建，转交回填的增量构建。若该 root 在这么多秒内
+# 已经有过一次已结束的回填请求（done/failed），就不再重复入队——否则构建失败时
+# watcher 每轮扫描都会追加一条请求，把 backfill_requests 刷成噪音。
+BACKFILL_REQUEST_COOLDOWN = _env_int("WATCH_BACKFILL_REQUEST_COOLDOWN", 300, minimum=0)
+
 # ── 发现范围 / 优先级 ────────────────────────────────────────────────────
 
 # 快扫只看最近 N 天的最近 M 小时叶子；其余靠全量扫描兜底。
@@ -92,6 +99,7 @@ def summary() -> dict:
         "enrich_workers": ENRICH_WORKERS,
         "enrich_inline_threshold": ENRICH_INLINE_THRESHOLD,
         "enrich_budget": ENRICH_BUDGET,
+        "backfill_request_cooldown": BACKFILL_REQUEST_COOLDOWN,
         "fast_scan_days": FAST_SCAN_DAYS,
         "fast_scan_hours": FAST_SCAN_HOURS,
         "full_scan_every": FULL_SCAN_EVERY,

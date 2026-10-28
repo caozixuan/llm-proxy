@@ -876,6 +876,29 @@ def has_active_backfill(root: str) -> bool:
     return row is not None
 
 
+def has_recent_backfill(root: str, seconds: int = 300) -> bool:
+    """该 root 最近 seconds 秒内是否有已结束(pending/running 除外)的回填请求。
+
+    供 watcher 决定「要不要替这个 root 再入队一次增量构建」：全新叶子会被 watcher
+    转交回填，但若该 root 刚失败/刚跑完，立即重入队只会每 5s 刷一条请求，把
+    backfill_requests 变成噪音。冷却窗口内一律不再入队。
+    """
+    if not _ready():
+        return False
+    root = os.path.normpath(root)
+    seconds = max(0, int(seconds or 0))
+    with _lock:
+        row = _conn.execute(
+            "SELECT 1 FROM backfill_requests WHERE root = ? "
+            "AND status IN ('done','failed') "
+            "AND finished_at IS NOT NULL "
+            "AND finished_at >= datetime('now','localtime', ?) "
+            "LIMIT 1",
+            (root, f"-{seconds} seconds"),
+        ).fetchone()
+    return row is not None
+
+
 def get_active_backfill_request(root: str) -> Optional[dict]:
     """返回该 root 的活跃请求详情(pending/running),供构建状态判断 status。"""
     if not _ready():
