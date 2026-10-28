@@ -69,6 +69,7 @@ def persist_params(
     env_key_name: str,
     workers: int = 0,
     dir_workers: int = 0,
+    merge_hours: bool = False,
 ) -> None:
     """把导出/eval/retry 任务的执行参数序列化写入 export_records.task_json。
 
@@ -91,6 +92,9 @@ def persist_params(
         "env_key_name": str(env_key_name),
         "workers": int(workers or 0),
         "dir_workers": int(dir_workers or 0),
+        # 跨小时节点聚合：把同一条对话在多个小时目录里的段拼成一条产物。
+        # 默认关（产物结构会变，下游读取方需先确认兼容）。
+        "merge_hours": bool(merge_hours),
     }
     set_task_json(record_id, json.dumps(payload, ensure_ascii=False))
 
@@ -132,4 +136,5 @@ def load_params(record_id: int) -> Optional[dict]:
         "env_key_name": data.get("env_key_name", "") or "",
         "workers": int(data.get("workers", 0) or 0),
         "dir_workers": int(data.get("dir_workers", 0) or 0),
+        "merge_hours": bool(data.get("merge_hours", False)),
     }

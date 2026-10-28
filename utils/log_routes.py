@@ -3,7 +3,6 @@
 优先使用 index.jsonl 的最近窗口；缺失时降级为目录扫描。
 """
 
-import datetime
 import json
 import logging
 import os
@@ -1028,18 +1027,26 @@ def export_view_aggregate_payload(roots, env_dir: str, min_messages: int = 1, of
             items = merged_all[offset:]
 
     # total 语义随合并改变：以前是「session 段数」，现在是「逻辑对话数」。
-    # 分页下推时只收了每叶子前 need 段，未收集的段绝大多数会并进已有对话，
-    # 因此用合并后的条数作为 total 下界，再加未收集的段数作上界估计。
+    #
+    # 分页下推时只收了每叶子前 need 段，没收集到的段里有一部分会并进已收集的对话里，
+    # 所以「已合并条数 + 未收集段数」只会偏大，永远收敛不了——前端据此显示的总数
+    # 会一直比实际多。这里改成诚实的表达：
+    #   全部收集到（无未收集段）→ 精确值
+    #   没收集全 → 标 total_approx，前端显示「约 N 条」
+    total_approx = False
     if not has_search:
         uncovered = max(0, total - len(all_sessions))
         total = len(merged_all) + uncovered
+        total_approx = uncovered > 0
 
     _export_view_logger.info(
-        "export-view aggregate key=%s model=%s 叶子=%d 命中=%d 合并后=%d %s",
+        "export-view aggregate key=%s model=%s 叶子=%d 命中=%d 合并后=%d%s %s",
         api_key[-8:] if api_key else "", model, len(leaves), total, len(merged_all),
+        "（约）" if total_approx else "",
         _ptm.summary_line("aggregate 耗时"))
 
-    return {"items": items, "total": total, "known_keys": sorted(known_keys), "known_models": sorted(known_models)}
+    return {"items": items, "total": total, "total_approx": total_approx,
+            "known_keys": sorted(known_keys), "known_models": sorted(known_models)}
 
 
 def _build_agg_items(preloaded: List[Tuple[dict, str]], with_traces: bool = False) -> List[Dict[str, Any]]:
@@ -1124,109 +1131,29 @@ _MERGE_MAX_GAP_SEC = 90 * 60
 _MERGE_SLACK = 200
 
 
-def _parse_agg_time(s: str) -> Optional[float]:
-    """把 item 里的 'YYYY:MM:DDTHH:MM:SS.mmm+08:00' 还原成 epoch 秒。"""
-    if not s:
-        return None
-    raw = s.strip()
-    if raw[:4].isdigit() and raw[4] == ":":
-        # _format_time 出来的展示格式：日期部分的 '-' 被换成了 ':'，还原回来
-        head, sep, tail = raw.partition("T")
-        head = head.replace(":", "-")
-        raw = head + sep + tail
-    try:
-        return datetime.datetime.fromisoformat(raw).timestamp()
-    except (ValueError, TypeError):
-        return None
-
-
 def _merge_chain_segments(items: List[Dict[str, Any]],
                           max_gap_sec: float = _MERGE_MAX_GAP_SEC) -> List[Dict[str, Any]]:
-    """把同一段逻辑对话跨小时叶子的多个 segment 合并成一条。
+    """把同一段逻辑对话跨小时叶子的多个 segment 合并成一条（浏览页封装）。
 
-    newapi 叶子按小时切库，chain_index 只在叶子内部有效，于是同一段对话在每小时目录
-    都会新开一条 session，列表里表现为「同一条对话出现好几次，各自带着自己那一小时的
-    首末时间」——用户看到的是「这条对话停在 15:59」，其实它一直持续到 17 点以后。
+    实际算法在 utils/session_merge.py，导出的 reformat/copy 链路复用同一份实现。
 
-    合并键优先用 chain_lookup（api_key||q1_hash，同 q1 被判新会话时带 ##session_N 后缀，
-    正好区分压测里重复的同一 prompt）；老数据没有该字段时回退 (api_key, q1_preview)。
-
-    两种键的可信度不同，间隔判定也不同：
-      - chain_lookup 是同步阶段算出的哈希链标识，同一 key 同一会话跨叶必然一致，
-        属于强身份，直接合并，不受时间间隔限制（实测某会话 15:41 结束、17:21 才续上，
-        间隔 1h40m，用间隔卡就会把它错切成两条）。
-      - (api_key, q1_preview) 是文本回退键，压测回放会重复同一 prompt，必须靠
-        时间连续性（max_gap_sec）把关，否则会把多次独立运行并成一条。
-
-    合并语义：
-      first_time   = 最早段的 first_time
-      last_time    = 最晚段的 last_time
-      file_count   = 各段求和（每个文件都是真实存在的一段记录）
-      message_count= 取最大（msg_count 是会话累计消息数，不是增量，求和会翻倍）
-      models       = 并集
-      has_failure  = 任一段有失败
-      latest_file  = 最晚段的 latest_file
+    **只按 chain_lookup（强身份）合并**，没有该字段的记录原样保留、不参与分组。
+    早先版本在没有 chain_lookup 时会退回按 (api_key, q1_preview) 文本分组，这是错的：
+    实测单叶子内同一段 q1 文本最多对应 5749 条不同 session（压测/agent 的固定系统提示词），
+    按文本分组会把这几千条并成一条。宁可少合并，也不能错并。
     """
-    if not items:
-        return []
-    items = [dict(it) for it in items]
-
-    def _key(it: Dict[str, Any]) -> Tuple[str, str]:
-        cl = (it.get("chain_lookup") or "").strip()
-        if cl:
-            return ("L", cl)
-        return ("Q", "%s|%s" % (it.get("api_key") or "", it.get("q1_preview") or ""))
-
-    groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for it in items:
-        groups.setdefault(_key(it), []).append(it)
-
-    merged: List[Dict[str, Any]] = []
-    for gkey, segs in groups.items():
-        if len(segs) == 1:
-            merged.append(segs[0])
-            continue
-        segs.sort(key=lambda x: _parse_agg_time(x.get("first_time", "")) or 0.0)
-        # 强身份（哈希链标识）直接合并；文本回退键才按时间间隔切簇。
-        strong = gkey[0] == "L"
-        clusters: List[List[Dict[str, Any]]] = []
-        for seg in segs:
-            if clusters and strong:
-                clusters[-1].append(seg)
-                continue
-            if clusters:
-                prev = clusters[-1]
-                prev_end = _parse_agg_time(prev[-1].get("last_time", "")) or 0.0
-                cur_start = _parse_agg_time(seg.get("first_time", "")) or 0.0
-                if prev_end and cur_start and cur_start - prev_end <= max_gap_sec:
-                    prev.append(seg)
-                    continue
-            clusters.append([seg])
-
-        for cl in clusters:
-            if len(cl) == 1:
-                merged.append(cl[0])
-                continue
-            base = dict(cl[0])
-            base["last_time"] = cl[-1].get("last_time", "") or base.get("last_time", "")
-            base["latest_file"] = cl[-1].get("latest_file", "") or base.get("latest_file", "")
-            base["file_count"] = sum(int(s.get("file_count") or 0) for s in cl)
-            base["message_count"] = max(int(s.get("message_count") or 0) for s in cl)
-            models: List[str] = []
-            for s in cl:
-                for m in (s.get("models") or []):
-                    if m and m not in models:
-                        models.append(m)
-            base["models"] = models
-            if any(s.get("has_failure") for s in cl):
-                base["has_failure"] = True
-            else:
-                base.pop("has_failure", None)
-            base["segment_count"] = len(cl)
-            merged.append(base)
-
-    merged.sort(key=lambda x: x.get("last_time", "") or x.get("first_time", ""), reverse=True)
-    return merged
+    from utils.session_merge import merge_segments
+    return merge_segments(
+        items,
+        first_field="first_time",
+        last_field="last_time",
+        count_field="message_count",
+        file_count_field="file_count",
+        models_field="models",
+        identity_field="chain_lookup",
+        latest_file_field="latest_file",
+        max_gap_sec=max_gap_sec,
+    )
 
 
 def _stamp_chain_lookup(pairs: List[Tuple[dict, str]]) -> None:
@@ -1255,11 +1182,17 @@ def _stamp_chain_lookup(pairs: List[Tuple[dict, str]]) -> None:
                     s["chain_lookup"] = hit
 
 
-def session_traces_payload(roots, env_dir: str, api_key: str, filename: str) -> Dict[str, Any]:
+def session_traces_payload(roots, env_dir: str, api_key: str, filename: str,
+                           chain_lookup: str = "") -> Dict[str, Any]:
     """返回某个会话（由其某个请求文件名定位）的完整 trace 明细列表。
 
     列表接口只回 file_count；前端点击会话后调这里取「关联列表」，避免每次列表
     都把全部明细（单叶实测 17.2s / 92MB）搬一遍。
+
+    chain_lookup 非空时做跨叶扇出：newapi 叶子按小时分库，同一条对话在每小时目录里
+    各有一条 session 行（同一个 chain_lookup）。只按 filename 定位到的那一个叶子取，
+    合并行的「关联列表」就只列出最后一个小时的文件，与 file_count 对不上。这里再拿
+    该 key 落到过的其它叶子，用同一个 chain_lookup 把各段的 trace 都取回来合并。
     """
     path = _export_view_find_file(roots, env_dir, filename, api_key=api_key)
     if not path:
@@ -1273,11 +1206,57 @@ def session_traces_payload(roots, env_dir: str, api_key: str, filename: str) -> 
         session_key = None
     if not session_key:
         return {"items": [], "error": "session not found"}
+
+    def _traces_in(leaf_dir: str, sk: str) -> List[Dict[str, Any]]:
+        try:
+            return nidb.get_traces_for_session(leaf_dir, sk)
+        except Exception:  # noqa: BLE001
+            return []
+
+    traces = _traces_in(leaf, session_key)
+    if not chain_lookup:
+        return {"items": traces, "session_key": session_key}
+
+    # 跨叶扇出：只看该 key 落到过的叶子，不做全量扫盘。
+    leaves: List[str] = []
     try:
-        traces = nidb.get_traces_for_session(leaf, session_key)
+        leaves = _export_key_leaves(roots, env_dir, api_key) if api_key else []
     except Exception:  # noqa: BLE001
-        traces = []
-    return {"items": traces, "session_key": session_key}
+        leaves = []
+    if leaf not in leaves:
+        leaves = [leaf] + list(leaves)
+
+    def _seg(leaf_dir: str):
+        if os.path.normpath(leaf_dir) == os.path.normpath(leaf):
+            return []           # 已取过
+        try:
+            if _root_format(leaf_dir) != "newapi":
+                return []
+        except Exception:  # noqa: BLE001
+            return []
+        out: List[Dict[str, Any]] = []
+        for sk in nidb.get_session_keys_by_chain(leaf_dir, chain_lookup):
+            out.extend(_traces_in(leaf_dir, sk))
+        return out
+
+    if len(leaves) > 1:
+        with ThreadPoolExecutor(max_workers=min(_AGG_LEAF_WORKERS, len(leaves))) as ex:
+            for part in ex.map(_seg, leaves):
+                if part:
+                    traces.extend(part)
+
+    # 按文件名去重后按时间升序，与单叶内的排序口径一致。
+    seen = set()
+    uniq: List[Dict[str, Any]] = []
+    for t in traces:
+        fn = t.get("filename") or ""
+        if fn and fn in seen:
+            continue
+        if fn:
+            seen.add(fn)
+        uniq.append(t)
+    uniq.sort(key=lambda t: str(t.get("ts") or ""))
+    return {"items": uniq, "session_key": session_key}
 
 
 # ---------------------------------------------------------------------------
@@ -2269,7 +2248,8 @@ def register_log_routes(app: FastAPI) -> None:
         return JSONResponse(export_view_aggregate_stream_poll(task_id))
 
     @app.get("/logs/session-traces")
-    def logs_session_traces(filename: str = "", api_key: str = "", log_dir: str = ""):
+    def logs_session_traces(filename: str = "", api_key: str = "", log_dir: str = "",
+                           chain_lookup: str = ""):
         """按会话的某个请求文件名取该会话的 trace 明细（「关联列表」）。
 
         列表接口只回 file_count；前端点开会话后才调这里，避免每次列表都把全部
@@ -2286,7 +2266,8 @@ def register_log_routes(app: FastAPI) -> None:
                         "items": nidb.get_traces_for_session(target, sk),
                         "session_key": sk,
                     })
-        return JSONResponse(session_traces_payload(_all_roots(), _env_dir, api_key, filename))
+        return JSONResponse(session_traces_payload(_all_roots(), _env_dir, api_key, filename,
+                                                   chain_lookup=chain_lookup))
 
     # --- 旧路由（别名，向后兼容） ---
 

@@ -595,6 +595,233 @@ def _default_mode() -> str:
     return cfg.ids()[0] if cfg.ids() else "export"
 
 
+def _run_merged_hours(mtime_dirs, _env_dir, local_base, api_key, force, workers,
+                      processor, _mcfg, _log, _tm, errors, warnings, _should_cancel,
+                      _progress_lock, _progress_done, _progress_total, _progress_phase,
+                      _progress_reporter):
+    """跨小时节点聚合导出：先全收集、再合并、最后统一产出。
+
+    为什么要分三阶段：newapi 的数据按小时分叶子库，同一段对话跨整点会被切成多个
+    session。逐叶导出（原有路径）会把它们导出成 N 条独立产物。要合并就必须先把手
+    所有叶子里的会话都读出来，才能知道哪几段属于同一段对话。
+
+    与逐叶路径的差异只在「怎么组织 work」，产出格式与 processor 完全一致：
+      - gather：每个小时目录只做 export_session_index 拿 sessions，并给每个 trace
+        标注它实际所在的叶子目录（_src_dir）
+      - merge：按 chain_lookup 把同一段对话的多个小时段合并成一条
+      - process：把合并后的 session 交给 processor，用 file_dirs 让它跨目录取源文件
+
+    返回 (all_results, all_entries, total_sessions)，与逐叶路径的累加量同义。
+    """
+    from utils.session_merge import merge_segments
+    from utils.export_sync import export_session_index
+
+    all_results = []
+    all_entries = []
+    gathered = []          # [(session_entry, leaf_dir), ...]
+    leaf_of_session = {}   # id(session_entry) -> leaf_dir
+
+    # ── 阶段 1：收集 ──────────────────────────────────────────────────
+    with _tm.stage("收集会话（跨小时）"):
+        for mt in mtime_dirs:
+            if _should_cancel():
+                _log("任务已终止（用户取消）")
+                return all_results, all_entries, 0
+            mt_src = _resolve_mt_for(_env_dir, mt) or str(_env_dir / mt)
+            try:
+                from utils.log_scan import detect_format as _df
+                _fmt = _df(mt_src)
+                if not _mcfg.supports_format(_fmt):
+                    warnings.append(f"{mt}: 非 {'/'.join(_mcfg.formats)} 格式（{_fmt}），已跳过")
+                    continue
+                if _fmt == "newapi":
+                    import utils.newapi_index_db as _nidb
+                    if _nidb.needs_build(mt_src):
+                        warnings.append(f"{mt}: 索引未构建/不完整，已跳过（请先手动构建索引）")
+                        continue
+            except Exception as _pe:  # noqa: BLE001
+                warnings.append(f"{mt}: 索引未构建/不完整，已跳过（检查异常: {_pe}）")
+                continue
+
+            try:
+                exp = export_session_index(mt_src, force=force, with_sessions=True,
+                                           api_key=api_key)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{mt}: {e}")
+                logger.exception("跨小时收集失败 %s", mt_src)
+                continue
+
+            sessions = exp.get("sessions")
+            if sessions is None:
+                # 不带 api_key 且索引未变更时会走 skipped 分支，不返回 sessions，
+                # 必须回落到读 session_index.jsonl，否则这一小时的数据会被静默丢掉。
+                from utils.export_sync import _load_session_index
+                sessions = _load_session_index(mt_src)
+            _log(f"[{mt}] 收集 {len(sessions)} sessions")
+            for s in sessions:
+                if api_key and s.get("api_key") != api_key:
+                    continue
+                gathered.append((s, mt_src))
+
+    if not gathered:
+        _log("跨小时聚合：没有收集到任何 session")
+        return all_results, all_entries, 0
+
+    # ── 阶段 2：合并 ──────────────────────────────────────────────────
+    with _tm.stage("跨小时合并"):
+        # 给每个 trace 标上它真实所在的叶子目录，合并后 processor 靠它取源文件。
+        for sess, leaf in gathered:
+            for tr in (sess.get("trace_list") or []):
+                if isinstance(tr, dict):
+                    tr.setdefault("_src_dir", leaf)
+        entries = [s for s, _ in gathered]
+        before = len(entries)
+        merged = merge_segments(
+            entries,
+            first_field="first_ts", last_field="last_ts",
+            count_field="msg_count", file_count_field=None,
+            models_field="models", identity_field="chain_lookup",
+            trace_field="trace_list", trace_ts_field="ts", trace_name_field="filename",
+            latest_file_field="latest_file",
+        )
+        _log(f"跨小时合并：{before} 段 → {len(merged)} 条会话"
+             + (f"（合并掉 {before - len(merged)} 段）" if before > len(merged) else ""))
+
+    total = len(merged)
+    if not total:
+        return all_results, all_entries, 0
+
+    with _progress_lock:
+        _progress_total[0] += total
+        _progress_phase[0] = _mcfg.step or "重构合并"
+        _progress_reporter.set_progress(_progress_done[0], _progress_total[0],
+                                       _progress_phase[0])
+
+    def _on_done():
+        with _progress_lock:
+            _progress_done[0] += 1
+            done, tot = _progress_done[0], _progress_total[0]
+        _progress_reporter.set_progress(done, tot)
+
+    # ── 阶段 3：产出 ──────────────────────────────────────────────────
+    # file_dirs: filename -> 叶子目录。processor 用它跨叶子取源文件。
+    file_dirs = {}
+    for sess in merged:
+        for tr in (sess.get("trace_list") or []):
+            fn = tr.get("filename") if isinstance(tr, dict) else None
+            src = tr.get("_src_dir") if isinstance(tr, dict) else None
+            if fn and src:
+                file_dirs.setdefault(fn, src)
+        lf = sess.get("latest_file")
+        if lf and file_dirs.get(lf) is None and sess.get("trace_list"):
+            first = next((t for t in sess["trace_list"]
+                          if isinstance(t, dict) and t.get("_src_dir")), None)
+            if first:
+                file_dirs[lf] = first["_src_dir"]
+
+    with _tm.stage(_mcfg.step or "重构合并"):
+        if _mcfg.pipeline == "copy":            # copy 模式只按 trace 逐个复制源文件；合并的意义在于清单只写一份
+            # （逐叶路径下每叶都覆盖同一份 session_index.jsonl，最终只剩最后一小时）。
+            copied, failed = _copy_merged_files(merged, file_dirs, local_base, workers)
+            _log(f"跨小时复制完成：{copied} 个文件" + (f"，失败 {failed}" if failed else ""))
+            if failed:
+                warnings.append(f"跨小时复制有 {failed} 个文件失败")
+            # 逐叶路径里每个叶子都会写一份 session_index.jsonl 且用 "w" 覆盖同一个
+            # local_base，多目录时最终只剩最后一小时的内容。合并路径在这里**统一写一次**，
+            # 清单与已复制的文件才对得上。
+            try:
+                with open(Path(local_base) / "session_index.jsonl", "w", encoding="utf-8") as f:
+                    for e in merged:
+                        f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            except OSError as e:
+                warnings.append(f"跨小时写 session_index.jsonl 失败: {e}")
+            all_entries = merged
+            all_results = merged
+            return all_results, all_entries, total
+
+        _log(f"进入 {_mcfg.step}: {total} sessions（跨小时合并后）, workers={workers}...")
+        # src_dir 用第一个叶子的绝对路径：合并后的会话绝大多数靠 file_dirs 定位，
+        # 这里只作为「找不到时的兜底」，用 env_dir 会让兜底路径完全错误。
+        _fallback_src = (_resolve_mt_for(_env_dir, mtime_dirs[0])
+                         or str(_env_dir / mtime_dirs[0]))
+        kw = dict(
+            src_dir=_fallback_src, out_dir=str(local_base),
+            session_entries=merged, api_key=api_key or None, workers=workers,
+            progress_cb=lambda msg: _log(f"[merged] {msg}"),
+            log_dir=_env_dir.name,
+            should_cancel=_should_cancel,
+            on_session_done=_on_done,
+            file_dirs=file_dirs,
+        )
+        if _mcfg.analyze is not None:
+            kw["analyze"] = _mcfg.analyze
+        ra_result = processor(**kw)
+
+    all_results = ra_result.get("results", []) or []
+    all_entries = merged
+    for e in ra_result.get("errors", []) or []:
+        errors.append(f"merged: {e}")
+    _log(f"跨小时聚合完成：成功 {ra_result.get('total_files', 0)} 个 session"
+         + (f"，失败 {len(ra_result.get('errors', []) or [])}" if ra_result.get("errors") else ""))
+    return all_results, all_entries, total
+
+
+def _copy_merged_files(merged, file_dirs, local_base, workers):
+    """copy 模式跨小时聚合：按 trace 的源目录复制文件到共享 local_base。
+
+    逐叶路径的复制由 sync_session_index 做，它绑定在「一个叶子目录」上；
+    合并后一条会话的文件可能来自多个叶子，只能按 filename 逐个定位。
+
+    定位复用 export_sync._collect_triplet_files：newapi 是「单个合并 .json」，
+    native 才是 req/headers/res 三元组，两者后缀规则不同，不能在这里硬编码后缀，
+    否则 newapi 会把 3 个不存在的三元组文件当成复制失败。
+    """
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    from utils.export_sync import _collect_triplet_files
+
+    targets = []
+    for sess in merged:
+        files = [tr.get("filename") for tr in (sess.get("trace_list") or [])
+                 if isinstance(tr, dict) and tr.get("filename")]
+        if not files and sess.get("latest_file"):
+            files = [sess["latest_file"]]
+        for fn in files:
+            src_dir = file_dirs.get(fn)
+            if not src_dir:
+                continue
+            # 该文件名可能对应 1 个文件（newapi）或 3 个文件（native 三元组）
+            targets.extend(_collect_triplet_files(src_dir, fn))
+
+    # 并发落地到同一个目录，按文件名去重（同一文件可能被多条会话引用）
+    seen = set()
+    uniq = []
+    for p in targets:
+        if p.name in seen:
+            continue
+        seen.add(p.name)
+        uniq.append(p)
+
+    copied = 0
+    failed = 0
+
+    def _one(p):
+        try:
+            shutil.copy2(p, Path(local_base) / p.name)
+            return True
+        except Exception:  # noqa: BLE001
+            logger.warning("跨小时复制失败: %s", p)
+            return False
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers or 4))) as ex:
+        for ok in ex.map(_one, uniq):
+            if ok:
+                copied += 1
+            else:
+                failed += 1
+    return copied, failed
+
+
 def _eval_mode() -> str:
     """注册表里 pipeline=eval 的模式 id（「从导出记录发起质检」用它）。"""
     for m in get_export_modes().all():
@@ -603,7 +830,8 @@ def _eval_mode() -> str:
     return "eval"
 
 
-def _run_task(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force=False):
+def _run_task(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force=False,
+              merge_hours: bool = False):
     from utils.eval.eval import evaluate_sessions
     from utils.obs_sync import _run_upload_cmd
 
@@ -627,7 +855,8 @@ def _run_task(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, for
             if processor is None:
                 raise RuntimeError(f"导出模式 '{mode}' 未配置可用处理器（检查 settings/export_modes.yaml）")
         _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force,
-                        processor, evaluate_sessions, _run_upload_cmd, _log)
+                        processor, evaluate_sessions, _run_upload_cmd, _log,
+                        merge_hours=merge_hours)
     except Exception as exc:
         logger.exception("_run_task crashed (record=%s)", record_id)
         try:
@@ -660,11 +889,13 @@ def _run_task_from_record(record_id: int, params: dict) -> None:
         env_key_name = env_dir.name
     _run_task(record_id, env_dir, env_key_name,
               params.get("obs_prefix", ""), params.get("now_tag", ""),
-              params.get("mode") or _default_mode(), force=bool(params.get("force", False)))
+              params.get("mode") or _default_mode(), force=bool(params.get("force", False)),
+              merge_hours=bool(params.get("merge_hours", False)))
 
 
 def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mode, force,
-                    processor, evaluate_sessions, _run_upload_cmd, _log):
+                    processor, evaluate_sessions, _run_upload_cmd, _log,
+                    merge_hours: bool = False):
     """逐 mtime 目录并行导出。processor 与 analyze 形参由 settings/export_modes.yaml
     的 processor / analyze 字段决定：reformat/eval 用 reformat_and_analyze（analyze
     显式传 true/false）；reconstruct 用 reconstruct_and_export（无 analyze 形参，
@@ -901,7 +1132,41 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
         update_status(record_id, "cancelled", error_message="用户终止")
         return
 
-    if dir_workers <= 1 or len(mtime_dirs) <= 1:
+    # ── 跨小时节点聚合路径 ──────────────────────────────────────────────
+    # newapi 的 index.db 按「日/时」分叶子，chain_index 只在叶子内部有效，新建会话的
+    # session_key 就是它的 ts。于是同一段对话跨过整点会被切成 N 段，逐叶导出就变成
+    # N 条独立产物。merge_hours 打开时改成「先全收集 → 合并 → 再统一产出」。
+    #
+    # 只在多目录 + processor 支持 file_dirs 的模式下启用：合并后一条会话的文件可能
+    # 分散在多个叶子目录里，processor 必须能按文件名跨目录取源文件。
+    #
+    # 处理器是否支持用签名探测，而不是硬编码模式名：full_reformat 同样是 reformat
+    # pipeline，但它的处理器不收 file_dirs（它靠 max_mtimes:1 挡在多目录之外）。
+    # 硬编码模式白名单会在以后新增/mode 改名时静默失效，签名探测不会。
+    _fd_supported = False
+    if processor is not None:
+        try:
+            import inspect as _inspect
+            _fd_supported = "file_dirs" in _inspect.signature(processor).parameters
+        except (TypeError, ValueError):
+            _fd_supported = False
+
+    if merge_hours and len(mtime_dirs) > 1 and processor is not None and not _fd_supported:
+        warnings.append(f"{_mcfg.mode_label}的处理器不支持跨目录取文件，已回退逐目录导出")
+        _log(f"[warn] {_mcfg.mode_label}处理器不支持 file_dirs，merge_hours 忽略，按逐目录导出")
+
+    if (merge_hours and len(mtime_dirs) > 1 and _fd_supported
+            and _mcfg.pipeline in ("reformat", "copy")):
+        all_results, all_entries, total_sessions = _run_merged_hours(
+            mtime_dirs=mtime_dirs, _env_dir=_env_dir, local_base=local_base,
+            api_key=api_key, force=force, workers=workers, processor=processor,
+            _mcfg=_mcfg, _log=_log, _tm=_tm, errors=errors, warnings=warnings,
+            _should_cancel=_should_cancel, _progress_lock=_progress_lock,
+            _progress_done=_progress_done, _progress_total=_progress_total,
+            _progress_phase=_progress_phase, _progress_reporter=_progress_reporter,
+        )
+        mt_results = []
+    elif dir_workers <= 1 or len(mtime_dirs) <= 1:
         with _tm.stage("逐目录处理"):
             mt_results = [_process_mtime(mt) for mt in mtime_dirs]
     else:
@@ -1371,6 +1636,9 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             dir_workers = 0
         if dir_workers < 0:
             dir_workers = 0
+        # 跨小时节点聚合：把同一条对话在多个小时目录里的段拼成一条产物。
+        # 默认关——产物结构会变（一条记录可能引用多个源目录），下游需先确认兼容。
+        merge_hours = bool(body.get("merge_hours", False))
         # 默认立即入队执行；start=False 时只建草稿（draft）记录，由前端手动「启动」。
         start = body.get("start", True)
         # mode 取值来自 settings/export_modes.yaml 注册表；非法/缺失回退默认。
@@ -1408,6 +1676,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             key_name=_key_name_snapshot(api_key),
             workers=workers,
             dir_workers=dir_workers,
+            merge_hours=merge_hours,
         )
 
         # 有名字就写入 manage_name；无名字保持默认空串。
@@ -1421,8 +1690,8 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
 
         persist_params(record_id, mode=mode, obs_prefix=obs_prefix, force=force,
                        now_tag=now_tag, env_dir=str(env_dir), env_key_name=env_key_name,
-                       workers=workers, dir_workers=dir_workers)
-        _enqueue_task(record_id, lambda rid=record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode, f=force: _run_task(rid, ed, ek, op, nt, m, force=f))
+                       workers=workers, dir_workers=dir_workers, merge_hours=merge_hours)
+        _enqueue_task(record_id, lambda rid=record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode, f=force, mh=merge_hours: _run_task(rid, ed, ek, op, nt, m, force=f, merge_hours=mh))
 
         return JSONResponse({"record_id": record_id, "status": "queued", "mode": mode})
 
@@ -1456,8 +1725,9 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         persist_params(record_id, mode=mode, obs_prefix=obs_prefix, force=force,
                        now_tag=now_tag, env_dir=str(env_dir), env_key_name=env_key_name,
                        workers=rec.get("workers") or 0,
-                       dir_workers=rec.get("dir_workers") or 0)
-        _enqueue_task(record_id, lambda rid=record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode, f=force: _run_task(rid, ed, ek, op, nt, m, force=f))
+                       dir_workers=rec.get("dir_workers") or 0,
+                       merge_hours=bool(rec.get("merge_hours") or 0))
+        _enqueue_task(record_id, lambda rid=record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode, f=force, mh=bool(rec.get("merge_hours") or 0): _run_task(rid, ed, ek, op, nt, m, force=f, merge_hours=mh))
 
         return JSONResponse({"record_id": record_id, "status": "queued", "mode": mode})
 
@@ -1555,13 +1825,15 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             obs_dst="", local_copy_dir="",
             mode=mode,
             key_name=rec.get("key_name", ""),
+            merge_hours=bool(rec.get("merge_hours") or 0),
         )
 
         persist_params(new_record_id, mode=mode, obs_prefix=obs_prefix, force=False,
                        now_tag=now_tag, env_dir=str(env_dir), env_key_name=env_key_name,
                        workers=rec.get("workers") or 0,
-                       dir_workers=rec.get("dir_workers") or 0)
-        _enqueue_task(new_record_id, lambda rid=new_record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode: _run_task(rid, ed, ek, op, nt, m))
+                       dir_workers=rec.get("dir_workers") or 0,
+                       merge_hours=bool(rec.get("merge_hours") or 0))
+        _enqueue_task(new_record_id, lambda rid=new_record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode, mh=bool(rec.get("merge_hours") or 0): _run_task(rid, ed, ek, op, nt, m, merge_hours=mh))
 
         return JSONResponse({"record_id": new_record_id, "status": "queued", "mode": mode})
 
@@ -1614,6 +1886,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             key_name=rec.get("key_name", ""),
             workers=rec.get("workers") or 0,
             dir_workers=rec.get("dir_workers") or 0,
+            merge_hours=bool(rec.get("merge_hours") or 0),
         )
         if rec.get("manage_name"):
             set_manage_name(new_record_id, f"{rec['manage_name']}（副本）")
@@ -1621,8 +1894,9 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
         persist_params(new_record_id, mode=mode, obs_prefix=obs_prefix, force=False,
                        now_tag=now_tag, env_dir=str(env_dir), env_key_name=env_key_name,
                        workers=rec.get("workers") or 0,
-                       dir_workers=rec.get("dir_workers") or 0)
-        _enqueue_task(new_record_id, lambda rid=new_record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode: _run_task(rid, ed, ek, op, nt, m))
+                       dir_workers=rec.get("dir_workers") or 0,
+                       merge_hours=bool(rec.get("merge_hours") or 0))
+        _enqueue_task(new_record_id, lambda rid=new_record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode, mh=bool(rec.get("merge_hours") or 0): _run_task(rid, ed, ek, op, nt, m, merge_hours=mh))
         logger.info("复制任务 record=%s -> %s (mode=%s)", src_record_id, new_record_id, mode)
 
         return JSONResponse({"record_id": new_record_id, "status": "queued", "mode": mode,
@@ -2025,14 +2299,15 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
             mtime_dirs=json.dumps(mtime_dirs),
             mode=mode,
             key_name=_key_name_snapshot(api_key),
+            merge_hours=merge_hours,
         )
         if export_name:
             set_manage_name(record_id, export_name)
 
         obs_dst = f"{obs_prefix}/{obs_sub}/{env_key_name}/{slot}/ex-{now_tag}/" if obs_prefix else ""
         persist_params(record_id, mode=mode, obs_prefix=obs_prefix, force=False, now_tag=now_tag,
-                       env_dir=str(env_dir), env_key_name=env_key_name)
-        _enqueue_task(record_id, lambda rid=record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode: _run_task(rid, ed, ek, op, nt, m))
+                       env_dir=str(env_dir), env_key_name=env_key_name, merge_hours=merge_hours)
+        _enqueue_task(record_id, lambda rid=record_id, ed=env_dir, ek=env_key_name, op=obs_prefix, nt=now_tag, m=mode, mh=merge_hours: _run_task(rid, ed, ek, op, nt, m, merge_hours=mh))
 
         return JSONResponse({
             "export_id": record_id,

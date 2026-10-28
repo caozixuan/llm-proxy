@@ -42,8 +42,13 @@ from src.export.hermes_traj import (
 logger = logging.getLogger(__name__)
 
 
-def _resolve_trace_paths(src_dir: Path, trace_list: Any) -> List[Path]:
-    """把 trace_list 里的 filename（basename）定位到叶子目录下的合并文件。"""
+def _resolve_trace_paths(src_dir: Path, trace_list: Any,
+                         file_dirs: Optional[Dict[str, Path]] = None) -> List[Path]:
+    """把 trace_list 里的 filename（basename）定位到叶子目录下的合并文件。
+
+    file_dirs 非空时优先按文件名查它：跨小时目录合并导出的 session，trace 文件
+    分散在多个叶子目录里，单靠 src_dir 找不到。
+    """
     paths: List[Path] = []
     if not isinstance(trace_list, list):
         return paths
@@ -53,7 +58,7 @@ def _resolve_trace_paths(src_dir: Path, trace_list: Any) -> List[Path]:
         filename = trace.get("filename", "")
         if not isinstance(filename, str) or not filename.endswith(".json"):
             continue
-        path = src_dir / filename
+        path = (file_dirs.get(filename) if file_dirs else None) or (src_dir / filename)
         if path.is_file():
             paths.append(path)
     return paths
@@ -132,12 +137,13 @@ def _process_one_hermes(args: tuple) -> Optional[dict]:
     无 trace 文件或任一合并文件损坏时返回 None（严格失败，与
     hermes_traj.load_records 的 fail-fast 一致，避免静默产出不完整数据）。
     """
-    src_dir_s, out_dir_s, first_ts, trace_list, api_key, models, log_dir = args
+    src_dir_s, out_dir_s, first_ts, trace_list, api_key, models, log_dir, file_dirs_s = args
 
     src_dir = Path(src_dir_s)
     out_dir = Path(out_dir_s)
+    file_dirs = {k: Path(v) for k, v in file_dirs_s.items() if v} if file_dirs_s else None
 
-    paths = _resolve_trace_paths(src_dir, trace_list)
+    paths = _resolve_trace_paths(src_dir, trace_list, file_dirs)
     if not paths:
         return None
 
@@ -195,6 +201,7 @@ def reconstruct_and_export(
     log_dir: Optional[str] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     on_session_done: Optional[Callable[[], None]] = None,
+    file_dirs: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     线程池并行: 对每个 session 的 trace_list 做 hermes 聚合重构。
@@ -240,7 +247,7 @@ def reconstruct_and_export(
         if not first_ts or not trace_list:
             continue
         tasks.append((src_dir, out_dir, first_ts, trace_list,
-                      s_api_key, s_models, resolved_log_dir))
+                      s_api_key, s_models, resolved_log_dir, file_dirs))
 
     results: List[dict] = []
     errors: List[str] = []

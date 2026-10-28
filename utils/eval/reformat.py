@@ -26,17 +26,45 @@ def _load_json(path: Path) -> Any:
         return json.load(f)
 
 
-def _resolve_triplet(src_dir: Path, stem: str) -> Dict[str, Path]:
+def _as_path_map(file_dirs: Optional[Dict[str, str]]) -> Optional[Dict[str, Path]]:
+    """{filename: 叶子目录字符串} → {filename: Path}。
+
+    用文件名做键（不含目录）——跨小时目录合并导出时，同一个 session 的 trace 文件
+    分散在多个叶子目录里，靠文件名就能唯一定位（index.jsonl 里的 req_file 是 basename）。
+    进程池会把任务元组 pickle 过去，Path 也能序列化，这里统一转好避免 worker 内重复构造。
+    """
+    if not file_dirs:
+        return None
+    return {k: Path(v) for k, v in file_dirs.items() if v}
+
+
+def _file_path(src_dir: Path, name: str, file_dirs: Optional[Dict[str, Path]] = None) -> Path:
+    """定位叶子目录下的一个文件。
+
+    file_dirs 是 {文件名: 它所在的叶子目录}。跨小时目录合并导出的 session，它的
+    trace 文件分散在多个叶子目录里，单靠 src_dir 找不到，要先查这张表再拼上文件名。
+    命中不了再回退 src_dir。
+    """
+    if file_dirs:
+        base = file_dirs.get(name)
+        if base is not None:
+            return base / name
+    return src_dir / name
+
+
+def _resolve_triplet(src_dir: Path, stem: str,
+                     file_dirs: Optional[Dict[str, Path]] = None) -> Dict[str, Path]:
     tri: Dict[str, Path] = {}
     for suffix, key in [("-req.json", "req"), ("-headers.json", "headers"), ("-res.json", "res")]:
-        p = src_dir / f"{stem}{suffix}"
+        p = _file_path(src_dir, f"{stem}{suffix}", file_dirs)
         if p.is_file():
             tri[key] = p
     return tri
 
 
 def _load_merged(src_dir: Path, stem: str, latest_file: str,
-                 tri: Dict[str, Path]) -> Optional[dict]:
+                 tri: Dict[str, Path],
+                 file_dirs: Optional[Dict[str, Path]] = None) -> Optional[dict]:
     """加载并组装 merged（messages + response + header）。
 
     优先三元组（本项目格式）；找不到 req 时回退 new-api 合并单文件
@@ -66,7 +94,7 @@ def _load_merged(src_dir: Path, stem: str, latest_file: str,
 
     # new-api：合并单文件
     if latest_file.endswith(".json") and not latest_file.endswith("-req.json"):
-        combined = src_dir / latest_file
+        combined = _file_path(src_dir, latest_file, file_dirs)
         if combined.is_file():
             try:
                 from utils.newapi_format import build_merged_for_eval
@@ -129,10 +157,11 @@ def _process_one(args: tuple) -> Optional[dict]:
     args 末位 analyze=False 时只合并落盘、跳过 analyze（评估字段占位）。
     返回结果 dict（含 session/start_time 等字段），失败返回 None。
     """
-    src_dir_s, out_dir_s, first_ts, latest_file, trace_list, api_key, models, analyze = args
+    src_dir_s, out_dir_s, first_ts, latest_file, trace_list, api_key, models, analyze, file_dirs_s = args
 
     src_dir = Path(src_dir_s)
     out_dir = Path(out_dir_s)
+    file_dirs = _as_path_map(file_dirs_s)
 
     stem = latest_file
     if stem.endswith("-req.json"):
@@ -140,8 +169,8 @@ def _process_one(args: tuple) -> Optional[dict]:
     elif stem.endswith(".json"):
         stem = stem[:-len(".json")]
 
-    tri = _resolve_triplet(src_dir, stem)
-    merged = _load_merged(src_dir, stem, latest_file, tri)
+    tri = _resolve_triplet(src_dir, stem, file_dirs)
+    merged = _load_merged(src_dir, stem, latest_file, tri, file_dirs)
     if merged is None:
         return None
 
@@ -214,9 +243,10 @@ def _process_one(args: tuple) -> Optional[dict]:
 
 def _copy_session_to_outdir(args: tuple) -> None:
     """缓存命中时，仍需将合并后的 session JSON 写到 out_dir。"""
-    src_dir_s, out_dir_s, first_ts, latest_file, trace_list, api_key, models = args
+    src_dir_s, out_dir_s, first_ts, latest_file, trace_list, api_key, models, file_dirs_s = args
     src_dir = Path(src_dir_s)
     out_dir = Path(out_dir_s)
+    file_dirs = _as_path_map(file_dirs_s)
 
     stem = latest_file
     if stem.endswith("-req.json"):
@@ -224,8 +254,8 @@ def _copy_session_to_outdir(args: tuple) -> None:
     elif stem.endswith(".json"):
         stem = stem[:-len(".json")]
 
-    tri = _resolve_triplet(src_dir, stem)
-    merged = _load_merged(src_dir, stem, latest_file, tri)
+    tri = _resolve_triplet(src_dir, stem, file_dirs)
+    merged = _load_merged(src_dir, stem, latest_file, tri, file_dirs)
     if merged is None:
         return
 
@@ -367,6 +397,7 @@ def reformat_and_analyze(
     analyze: bool = True,
     should_cancel: Optional[Callable[[], bool]] = None,
     on_session_done: Optional[Callable[[], None]] = None,
+    file_dirs: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     线程池并行: 对每个 session 的 latest_file 做 reformat (+ 可选 analyze_best_data)。
@@ -427,9 +458,11 @@ def reformat_and_analyze(
         if cached:
             cached["log_dir"] = resolved_log_dir
             cached_results.append(cached)
-            copy_tasks.append((src_dir, out_dir, first_ts, latest_file, trace_list, s_api_key, s_models))
+            copy_tasks.append((src_dir, out_dir, first_ts, latest_file, trace_list,
+                               s_api_key, s_models, file_dirs))
         else:
-            tasks.append((src_dir, out_dir, first_ts, latest_file, trace_list, s_api_key, s_models, analyze))
+            tasks.append((src_dir, out_dir, first_ts, latest_file, trace_list,
+                          s_api_key, s_models, analyze, file_dirs))
 
     for ct in copy_tasks:
         _copy_session_to_outdir(ct)

@@ -196,6 +196,9 @@ def init_db(db_dir: str):
             "progress_done INTEGER NOT NULL DEFAULT 0",
             "progress_total INTEGER NOT NULL DEFAULT 0",
             "progress_phase TEXT NOT NULL DEFAULT ''",
+            # 跨小时节点聚合开关：把同一条对话在多个小时目录里的段合并成一条产物。
+            # 草稿任务也要记住它——否则「创建草稿 → 再启动」会丢掉这个选择。
+            "merge_hours INTEGER NOT NULL DEFAULT 0",
         ]:
             try:
                 _conn.execute(f"ALTER TABLE export_records ADD COLUMN {col_def}")
@@ -221,14 +224,15 @@ def create_record(
     key_name: str = "",
     workers: int = 0,
     dir_workers: int = 0,
+    merge_hours: bool = False,
 ) -> int:
     conn = _get_conn()
     with _lock:
         cur = conn.execute(
             """INSERT INTO export_records
-               (api_key, key_slot, mtime_dirs, obs_dst, local_copy_dir, mode, source_export_id, key_name, workers, dir_workers)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (api_key, key_slot, mtime_dirs, obs_dst, local_copy_dir, mode, source_export_id, key_name, workers, dir_workers),
+               (api_key, key_slot, mtime_dirs, obs_dst, local_copy_dir, mode, source_export_id, key_name, workers, dir_workers, merge_hours)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (api_key, key_slot, mtime_dirs, obs_dst, local_copy_dir, mode, source_export_id, key_name, workers, dir_workers, 1 if merge_hours else 0),
         )
         conn.commit()
     return cur.lastrowid

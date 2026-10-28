@@ -1358,6 +1358,30 @@ def session_key_for_file(leaf_dir: str, filename: str) -> Optional[str]:
         conn.close()
 
 
+def get_session_keys_by_chain(leaf_dir: str, chain_lookup: str) -> List[str]:
+    """按链标识取出本叶子里属于同一段逻辑对话的 session_key 列表。
+
+    跨小时目录合并后，一条对话在多个叶子里各有自己的 session 行（同一个
+    chain_lookup）。点开合并行要展示「关联列表」时，必须把这些叶子的 trace 都取上，
+    否则详情里只会列出最后一个小时的文件。
+
+    只做精确匹配：lookup_key 带 ##session_N 后缀的是「同 q1 被判成新一轮」的另一段
+    对话，不属于本组。
+    """
+    if not chain_lookup or not _db_exists(leaf_dir):
+        return []
+    conn = _connect(leaf_dir)
+    try:
+        rows = conn.execute(
+            "SELECT session_key FROM chain_index WHERE lookup_key = ?", (chain_lookup,)
+        ).fetchall()
+        return [r["session_key"] for r in rows if r["session_key"]]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
 def get_traces_for_session(leaf_dir: str, session_key: str) -> List[Dict[str, Any]]:
     """取单个会话的 trace 明细（含 debug_file 所需字段），供前端点击会话时按需加载。
 
@@ -1491,6 +1515,9 @@ def export_sessions(leaf_dir: str, api_key: str = "") -> List[Dict[str, Any]]:
             "latest_file": s["latest_file"],
             "msg_count": s["msg_count"],
             "trace_list": traces_by_key.get(sk, []),
+            # 跨小时叶子的链标识（api_key||q1_hash）。索引库里它是唯一的跨叶身份，
+            # 导出的多目录合并要靠它把同一段对话切成的小时段拼回去。
+            "chain_lookup": s.get("chain_lookup", "") or "",
         })
     return result
 

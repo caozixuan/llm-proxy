@@ -1865,14 +1865,19 @@ def export_view_api_file(key: str = "", filename: str = "", log_dir: str = "",
 
 
 @app.get("/export/view/api/session-traces")
-def export_view_api_session_traces(key: str = "", filename: str = "",
+def export_view_api_session_traces(key: str = "", filename: str = "", chain_lookup: str = "",
                                    access_key: str = Query(default="", alias="access-key")):
-    """按会话取 trace 明细（「关联列表」）。列表接口只回 file_count，点开才拉明细。"""
+    """按会话取 trace 明细（「关联列表」）。列表接口只回 file_count，点开才拉明细。
+
+    chain_lookup 由列表项带过来：跨小时合并后的一条对话在多个小时叶子里各有 session 行，
+    带上它才能把各段的 trace 都取回来，否则关联列表只列出最后一个小时的文件。
+    """
     err, resolved_key = _check_public_view(access_key, key)
     if err:
         return err
     from utils.log_routes import session_traces_payload
-    return JSONResponse(session_traces_payload(_stats_roots(), ENV_DIR, resolved_key, filename))
+    return JSONResponse(session_traces_payload(_stats_roots(), ENV_DIR, resolved_key, filename,
+                                               chain_lookup=chain_lookup))
 
 
 @app.get("/export/view/api/file/download")

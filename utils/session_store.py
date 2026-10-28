@@ -635,6 +635,9 @@ def export_sessions(root_dir: str, api_key: str = "") -> List[Dict[str, Any]]:
             "latest_file": s["latest_file"],
             "msg_count": s["msg_count"],
             "trace_list": traces_by_key.get(sk, []),
+            # native 后端没有 chain_index（会话链表），留空。多目录导出合并时
+            # 缺这个字段的会话不参与合并，保持每段一条——文本回退键会误并。
+            "chain_lookup": s.get("chain_lookup", "") or "",
         }
         result.append(out)
     return result
@@ -684,4 +687,6 @@ def to_unified_record(entry: Dict[str, Any]) -> Dict[str, Any]:
         "first_ts": first_ts,
         "last_ts": last_ts,
         "msg_count": msg_count,
+        # 跨小时叶子的链标识，供导出多目录合并识别同一段对话。原生后端为空。
+        "chain_lookup": entry.get("chain_lookup", "") or "",
     }

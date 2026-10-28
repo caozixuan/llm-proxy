@@ -612,6 +612,9 @@ let aggChains = [];
 let offset = 0;
 let renderedCount = 0;  // 已渲染进 DOM 的 aggChains 条数（流式收集全在内存，DOM 只保留 50 的倍数窗口）
 let totalItems = 0;
+// total 是否为估算值：跨小时合并后，若分页下推没把该 key 的全部段收上来，
+// 后端只能给「已合并条数 + 未收集段数」这种偏大的上界，此时标 approx，UI 显示「约 N 条」。
+let totalApprox = false;
 let isLoadingMore = false;
 let knownKeys = new Set();
 let knownModels = new Set();
@@ -958,6 +961,7 @@ function _reloadForTimeChange() {
     _writeUrlState();
     offset = 0;
     totalItems = 0;
+    totalApprox = false;
     aggChains = [];
     renderedCount = 0;
     _searchQuery = '';
@@ -1129,6 +1133,7 @@ function resetAndLoad(skipLoad) {
     _syncLogDirFromSelects();
     offset = 0;
     totalItems = 0;
+    totalApprox = false;
     aggChains = [];
     renderedCount = 0;
     knownKeys = new Set();
@@ -1153,6 +1158,7 @@ function reloadWithKey() {
     _writeUrlState();
     offset = 0;
     totalItems = 0;
+    totalApprox = false;
     aggChains = [];
     renderedCount = 0;
     _searchQuery = '';
@@ -1167,6 +1173,7 @@ function reloadWithModel() {
     _writeUrlState();
     offset = 0;
     totalItems = 0;
+    totalApprox = false;
     aggChains = [];
     renderedCount = 0;
     _searchQuery = '';
@@ -1341,6 +1348,7 @@ async function _loadAggStream(min, params, refresh) {
     // 挡住滚动触发的 loadMore（收集期由本函数自己按需渲染窗口）。
     aggChains = [];
     totalItems = 0;
+    totalApprox = false;
     renderedCount = 0;
     fileListEl.innerHTML = '<div class="cv-sidebar-tip"><span class="spinner"></span>加载中…</div>';
     isLoadingMore = true;
@@ -1380,6 +1388,7 @@ async function _loadAggStream(min, params, refresh) {
             collectKeys(data);
         }
         if (data.total !== undefined && data.total !== null) totalItems = data.total;
+        totalApprox = !!data.total_approx;
         _updateStreamProgress(data);
         if (data.status === 'done') {
             done = true;
@@ -1427,6 +1436,7 @@ async function _loadAggFallback(min, params) {
     const data = await res.json();
     const items = data.items || [];
     totalItems = data.total || items.length;
+    totalApprox = !!data.total_approx;
     aggChains = items;
     renderedCount = 0;
     fileListEl.innerHTML = '';
@@ -1448,7 +1458,10 @@ function updateLoadStatus() {
     } else if (_q1Query) {
         document.getElementById('loadStatus').textContent = `搜索到 ${totalItems} 条（已显示 ${shown}）`;
     } else {
-        document.getElementById('loadStatus').textContent = `已显示 ${shown} / 共 ${totalItems} 条`;
+        // totalApprox：跨小时合并后没能把所有段都收上来时，后端只能给偏大的上界，
+        // 这里显式标「约」，避免用户以为总数不准是 bug。
+        const totalText = totalApprox ? `约 ${totalItems}` : `${totalItems}`;
+        document.getElementById('loadStatus').textContent = `已显示 ${shown} / 共 ${totalText} 条`;
     }
 }
 
@@ -1538,10 +1551,15 @@ async function selectAggChain(idx, el) {
 
     // 列表接口只回 file_count；「关联列表」需要明细，点开时单独取（单会话索引，
     // 毫秒级）。失败不影响主内容显示，只是不显示关联列表。
+    // 必须带上 chain_lookup：跨小时合并后的一条对话在多个小时叶子里各有 session 行，
+    // 不带它后端只会按 latest_file 定位到最后一个小时的那个叶子，关联列表就和
+    // file_count 对不上了。
+    const _chainQ = chain.chain_lookup
+        ? `&chain_lookup=${encodeURIComponent(chain.chain_lookup)}` : '';
     const _tracesPromise = (chain.file_count > 1 || chain.has_failure)
         ? fetch(`${_apiPrefix()}/session-traces?filename=${encodeURIComponent(chain.latest_file || '')}`
                 + `${logDir ? '&log_dir=' + encodeURIComponent(logDir) : ''}`
-                + `&api_key=${encodeURIComponent(chain.api_key || '')}${_sharedParams()}`)
+                + `&api_key=${encodeURIComponent(chain.api_key || '')}${_chainQ}${_sharedParams()}`)
             .then(r => r.ok ? r.json() : null)
             .then(d => (d && d.items) || null)
             .catch(() => null)
@@ -2014,6 +2032,7 @@ function _runQ1Search() {
     _searchQuery = '';              // 交由服务端过滤，允许分页加载更多
     offset = 0;
     totalItems = 0;
+    totalApprox = false;
     aggChains = [];
     fileListEl.innerHTML = '<div class="cv-sidebar-tip"><span class="spinner"></span>搜索中…</div>';
     document.getElementById('loadStatus').textContent = '';
@@ -2038,6 +2057,7 @@ function triggerDeepSearch() {
     btn.style.borderColor = 'var(--primary)';
     offset = 0;
     totalItems = 0;
+    totalApprox = false;
     aggChains = [];
     fileListEl.innerHTML = '<div class="cv-sidebar-tip"><span class="spinner"></span>深度搜索中…</div>';
     document.getElementById('loadStatus').textContent = '';
@@ -2056,6 +2076,7 @@ function exitDeepSearch() {
     document.getElementById('q1Search').value = '';
     offset = 0;
     totalItems = 0;
+    totalApprox = false;
     aggChains = [];
     fileListEl.innerHTML = '<div class="cv-sidebar-tip"><span class="spinner"></span>加载中…</div>';
     document.getElementById('loadStatus').textContent = '';

@@ -142,9 +142,10 @@ def _process_one_jiuwen(args: tuple) -> Optional[dict]:
 
     无 trace 文件或全部合并失败时返回 None（严格失败，避免静默产出不完整数据）。
     """
-    src_dir_s, out_dir_s, sess, log_dir = args
+    src_dir_s, out_dir_s, sess, log_dir, file_dirs_s = args
     src_dir = Path(src_dir_s)
     out_dir = Path(out_dir_s)
+    file_dirs = {k: Path(v) for k, v in file_dirs_s.items() if v} if file_dirs_s else None
 
     first_ts = sess.get("first_ts") or sess.get("_key", "")
     if not first_ts:
@@ -162,8 +163,8 @@ def _process_one_jiuwen(args: tuple) -> Optional[dict]:
     last_stem = ""
     for fn in sorted_filenames:
         stem = _stem_of(fn)
-        tri = _resolve_triplet(src_dir, stem)
-        merged = _load_merged(src_dir, stem, fn, tri)
+        tri = _resolve_triplet(src_dir, stem, file_dirs)
+        merged = _load_merged(src_dir, stem, fn, tri, file_dirs)
         if merged is None:
             logger.warning("jiuwen reformat: cannot merge %s/%s", src_dir, fn)
             continue
@@ -199,6 +200,7 @@ def jiuwen_reformat_export(
     log_dir: Optional[str] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     on_session_done: Optional[Callable[[], None]] = None,
+    file_dirs: Optional[Dict[str, str]] = None,
 ) -> dict:
     """线程池并行：对每个 session 的 trace_list 做 jiuwen 轨迹重构。
 
@@ -241,7 +243,7 @@ def jiuwen_reformat_export(
         first_ts = sess.get("first_ts") or sess.get("_key", "")
         if not first_ts:
             continue
-        tasks.append((src_dir, out_dir, sess, resolved_log_dir))
+        tasks.append((src_dir, out_dir, sess, resolved_log_dir, file_dirs))
 
     results: List[dict] = []
     errors: List[str] = []
