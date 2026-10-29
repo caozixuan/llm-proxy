@@ -804,15 +804,16 @@ def _export_view_leaves(roots, env_dir: str) -> List[str]:
 def _leaf_dir_key(leaf: str) -> str:
     """叶子的时间目录键（YYMMDDHH），用于「新到旧」排序。
 
-    取叶子路径最后一段；少数来源的叶子名不是纯时间目录（如 native 根），此时退化为
-    用父目录 + 自身，保证排序稳定且不会把最新叶子排到后面。
+    解析委托 utils.log_scan.scan_time_key（备份时间轴用同一个解析器，避免两套
+    规则漂移）。少数来源的叶子名不含时间目录（如 native 根），此时退化为
+    「父目录 + 自身」，保证排序稳定且不会把最新叶子排到后面。
     """
+    from utils.log_scan import scan_time_key
+    key = scan_time_key(leaf)
+    if key:
+        return key
     p = os.path.normpath(leaf or "")
-    tail = os.path.basename(p)
-    if len(tail) == 8 and tail.isdigit():
-        return tail
-    parent = os.path.basename(os.path.dirname(p))
-    return parent + tail
+    return os.path.basename(os.path.dirname(p)) + os.path.basename(p)
 
 
 def _export_key_leaves(roots, env_dir: str, api_key: str) -> List[str]:

@@ -305,6 +305,61 @@ DEFAULT_OBSUTIL_OUTPUT_DIR = str(Path.home() / ".obsutil_output")
 _STATUS_RE = re.compile(r"status \[(\d+)\]")
 _ERRMSG_RE = re.compile(r"error message \[([^\]]*)\]")
 
+# obsutil ls 的对象大小字段：如 "472B" / "1.2MB" / "391.68GB"
+_SIZE_RE = re.compile(r"^(\d+(?:\.\d+)?)(B|KB|MB|GB|TB)$")
+_SIZE_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def _parse_size_bytes(tok: str) -> Optional[int]:
+    m = _SIZE_RE.match(tok or "")
+    if not m:
+        return None
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2)])
+
+
+def obsutil_object_size(obs_url: str, timeout: int = 30) -> Optional[int]:
+    """查单个 OBS 对象的大小（字节）。不存在/查询失败返回 None。
+
+    用于删除本地前的轻量复核：对**单个对象**跑一次 `obsutil ls`，秒级返回。
+    不要用 `ls -du` 递归统计整个叶子 —— 实测单叶 80 万个对象要跑几分钟。
+    """
+    if not obs_url or not os.path.isfile(OBSUTIL_BIN):
+        return None
+    url = obs_url
+    if url.endswith("/"):
+        # 目录 URL 会命中该前缀下的第一个对象，语义不对；单对象查询不接受尾部 /
+        return None
+    try:
+        result = subprocess.run([OBSUTIL_BIN, "ls", url, "-limit=1"],
+                                capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            return None
+    except Exception:
+        return None
+
+    # 只有「对象列表里出现了与目标 key 完全一致的 obs:// 行」才算命中。
+    # 不能退化成全文扫第一个大小 token：对象不存在时 obsutil 只打印
+    # `Total size of prefix [...]: 0B`，会被当成「大小为 0」，从而把
+    # 上传失败误判成校验通过（实测踩到）。
+    target = url.rstrip("/")
+    lines = result.stdout.splitlines()
+    for i, raw in enumerate(lines):
+        line = raw.strip()
+        if not line.startswith("obs://") or line.rstrip("/") != target:
+            continue
+        for tok in line.split():
+            b = _parse_size_bytes(tok)
+            if b is not None:
+                return b
+        # 元数据在下一行：<空格>LastModified  Size  StorageClass  ETag
+        if i + 1 < len(lines):
+            for tok in lines[i + 1].split():
+                b = _parse_size_bytes(tok)
+                if b is not None:
+                    return b
+        return None
+    return None
+
 
 def find_failed_report(task_id: str, output_dir: str = "") -> Optional[str]:
     """在 output_dir 下查找 obsutil 某次 cp 的失败报告，返回最新匹配文件路径。

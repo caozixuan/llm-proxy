@@ -343,6 +343,29 @@ def get_logs(dir_path: str, limit: int = 200) -> List[dict]:
     return [dict(r) for r in rows]
 
 
+def get_recent_logs(limit: int = 30, level: str = "", dir_prefix: str = "") -> List[dict]:
+    """跨全部目录的「最近备份操作」：取最新 N 条日志。
+
+    备份页的「最近备份操作」区块用它。走 backup_logs 的 id 倒序（自增即时间序），
+    比 ORDER BY created_at 快且顺序稳定（同秒多条不抖动）。
+    """
+    sql = "SELECT id, dir_path, level, message, created_at FROM backup_logs"
+    conds, params = [], []
+    if level:
+        conds.append("level = ?")
+        params.append(level)
+    if dir_prefix:
+        conds.append("dir_path LIKE ?")
+        params.append(dir_prefix + "%")
+    if conds:
+        sql += " WHERE " + " AND ".join(conds)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    with _lock:
+        rows = _conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
 def clear_logs(dir_path: str):
     with _lock:
         _conn.execute("DELETE FROM backup_logs WHERE dir_path = ?", (dir_path,))

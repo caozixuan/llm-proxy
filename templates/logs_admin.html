@@ -144,7 +144,13 @@
     <div class="tabbar">
         <button :class="{active: tab === 'sync'}" @click="setTab('sync')">同步看板</button>
         <button :class="{active: tab === 'sources'}" @click="setTab('sources')">来源与路径</button>
-        <span class="tab-status">
+        <button :class="{active: tab === 'backup'}" @click="setTab('backup')">备份管理</button>
+        <span class="tab-status" v-if="tab === 'backup'">
+            <span class="dot" :class="(bkQueue.running || bkQueue.queue_len) ? 'on' : 'on'"></span>
+            {{ bkQueue.running ? ('上传中 · ' + bkQueue.running)
+                               : (bkQueue.queue_len ? ('排队中 ' + bkQueue.queue_len + ' 个') : '备份服务正常') }}
+        </span>
+        <span class="tab-status" v-else>
             <span class="dot" :class="ov.worker.running ? 'on' : 'off'"></span>
             {{ ov.worker.running ? ('同步运行中 · pid ' + ov.worker.pid) : 'worker 未运行' }}
         </span>
@@ -662,6 +668,311 @@
         </div>
     </div>
     </div><!-- /tab sources -->
+
+    <!-- ===================== Tab 3：备份管理 ===================== -->
+    <div v-show="tab === 'backup'">
+        <!-- KPI 行 -->
+        <div class="kpi-row" style="grid-template-columns: repeat(4, minmax(0, 1fr));">
+            <div class="kpi">
+                <div class="kpi-label">发现叶子节点</div>
+                <div class="kpi-value">{{ fmtNum(bk.totals.leaves) }}</div>
+                <div class="kpi-hint">log_dir.db 已登记叶子</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">待备份节点</div>
+                <div class="kpi-value">{{ fmtNum(bk.totals.pending) }}</div>
+                <div class="kpi-hint">{{ fmtNum(bk.totals.pending_files) }} 个文件待上传</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">已完成备份</div>
+                <div class="kpi-value">{{ fmtNum(bk.totals.done) }}</div>
+                <div class="kpi-hint">其中已归档 {{ fmtNum(bk.totals.archived) }} 个</div>
+            </div>
+            <div class="kpi">
+                <div class="kpi-label">待释放本地空间</div>
+                <div class="kpi-value">{{ bk.reclaimable_bytes == null ? '—' : fmtBytes(bk.reclaimable_bytes) }}</div>
+                <div class="kpi-hint">{{ pendingDelete.length }} 个目录待确认删除</div>
+            </div>
+        </div>
+
+        <!-- OBS 自动备份概览 -->
+        <div class="panel">
+            <div class="toolbar" style="margin-bottom:6px;">
+                <h6 style="margin:0;">OBS 自动备份概览</h6>
+            </div>
+            <div class="hint" style="margin-bottom:16px;">
+                将叶子节点数据自动上传至 OBS，并在校验后清理本地文件，降低本地磁盘占用。
+            </div>
+            <div style="display:grid; grid-template-columns: 1.15fr 1fr; gap:26px; align-items:end;">
+                <div>
+                    <div style="display:flex; justify-content:space-between; font-size:.8rem; margin-bottom:8px;">
+                        <span style="color:var(--muted-foreground);">总体进度</span>
+                        <strong>{{ bk.totals.progress_pct }}%</strong>
+                    </div>
+                    <div style="height:12px; border-radius:8px; background:var(--muted); overflow:hidden;">
+                        <i style="display:block; height:100%; border-radius:8px;
+                                  background:linear-gradient(90deg, var(--primary), color-mix(in srgb, var(--primary) 55%, #fff));"
+                           :style="{width: bk.totals.progress_pct + '%'}"></i>
+                    </div>
+                    <div style="font-size:.8rem; color:var(--muted-foreground); margin-top:10px;">
+                        已备份 {{ fmtNum(bk.totals.done) }} / {{ fmtNum(bk.totals.leaves) }} 个叶子节点
+                    </div>
+                </div>
+                <div>
+                    <div style="font-size:.76rem; color:var(--muted-foreground); margin-bottom:4px;">
+                        叶子节点备份时间分布（近 5 个月）
+                    </div>
+                    <div class="trend" style="height:104px;">
+                        <div v-for="m in bk.months" :key="m.month"
+                             :style="{height: bkMonthHeight(m) + '%'}"
+                             :title="m.month + ' · ' + fmtNum(m.leaves) + ' 个叶子'"></div>
+                    </div>
+                    <div class="trend-axis">
+                        <span v-for="m in bk.months" :key="m.month" style="flex:1; text-align:center;">{{ m.label }}</span>
+                        <span v-if="!bk.months.length">暂无数据</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 队列 + 右栏 -->
+        <div style="display:grid; grid-template-columns: 1.62fr 1fr; gap:16px; margin-bottom:18px;">
+            <!-- 叶子节点备份队列 -->
+            <div class="panel" style="margin-bottom:0;">
+                <div class="toolbar" style="margin-bottom:12px;">
+                    <h6 style="margin:0;">叶子节点备份队列（按时间从旧到新）</h6>
+                    <span style="margin-left:auto; display:flex; gap:6px; flex-wrap:wrap;">
+                        <select class="input input-sm" v-model="bkEnv" @change="loadBackupQueue()" style="width:auto;">
+                            <option value="">全部来源</option>
+                            <option v-for="s in bk.sources" :key="s.root_id" :value="s.root_id">{{ s.name }}</option>
+                        </select>
+                        <select class="input input-sm" v-model="bkStatus" style="width:auto;">
+                            <option value="">全部状态</option>
+                            <option value="pending">待备份</option>
+                            <option value="done">已备份</option>
+                            <option value="partial">部分失败</option>
+                            <option value="error">失败</option>
+                            <option value="backed_up">已清理</option>
+                            <option value="pending_delete">待删除</option>
+                        </select>
+                        <button class="btn btn-outline btn-sm" @click="bkOrder = (bkOrder === 'asc' ? 'desc' : 'asc')">
+                            {{ bkOrder === 'asc' ? '↑ 时间从旧到新' : '↓ 时间从新到旧' }}
+                        </button>
+                        <button class="btn btn-primary btn-sm" @click="bkArchiveSelected"
+                                :disabled="!bkChecked.length || bkArchiving">
+                            {{ bkArchiving ? '入队中…' : ('备份选中节点' + (bkChecked.length ? ' (' + bkChecked.length + ')' : '')) }}
+                        </button>
+                    </span>
+                </div>
+                <div class="dash-scroll">
+                <table class="dir-table" v-if="bkQueueRows.length">
+                    <thead>
+                        <tr>
+                            <th style="width:30px;"><input type="checkbox" @change="bkToggleAll" :checked="bkAllChecked"></th>
+                            <th>叶子节点 / 来源</th>
+                            <th>时间戳</th>
+                            <th class="col-center">文件数量</th>
+                            <th class="col-center">数据量</th>
+                            <th>备份状态</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr v-for="d in bkQueueRows" :key="d.dir_path">
+                            <td><input type="checkbox" v-model="bkChecked" :value="d.dir_path"></td>
+                            <td>
+                                <div class="mono" style="font-weight:600;">{{ bkLeafLabel(d) }}</div>
+                                <div style="font-size:.74rem; color:var(--muted-foreground);">来源: {{ d.env_label || d.env_name }}</div>
+                            </td>
+                            <td class="mono" style="font-size:.78rem;">{{ bkTs(d) }}</td>
+                            <td class="col-center">{{ d.file_count ? fmtNum(d.file_count) : '—' }}</td>
+                            <td class="col-center">—</td>
+                            <td>
+                                <span :class="['badge', bkBadge(d.status)]">{{ bkStatusLabel(d.status) }}</span>
+                                <span v-if="bkQueueSet.has(d.dir_path) && bkQueue.running !== d.dir_path"
+                                      class="badge badge-warn" style="margin-left:4px;">排队中</span>
+                            </td>
+                            <td style="white-space:nowrap;">
+                                <button class="btn btn-outline btn-sm"
+                                        v-if="d.has_local && d.status !== 'done' && d.status !== 'pending_delete' && d.status !== 'backed_up'"
+                                        @click="bkSyncOne(d)" :disabled="bkQueueSet.has(d.dir_path)">立即备份</button>
+                                <button class="btn btn-outline btn-sm" @click="bkOpenLogs(d)">查看</button>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+                <div v-else class="hint" style="margin:0;">
+                    {{ bkLoading ? '加载中…' : '暂无待备份的叶子节点' }}
+                </div>
+                </div>
+            </div>
+
+            <!-- 右栏 -->
+            <div>
+                <!-- 来源列表 -->
+                <div class="panel">
+                    <div class="toolbar" style="margin-bottom:10px;">
+                        <h6 style="margin:0;">来源列表</h6>
+                        <button class="btn btn-outline btn-sm" style="margin-left:auto;"
+                                @click="loadBackupOverview()" :disabled="bkLoading">刷新</button>
+                    </div>
+                    <table class="dir-table" v-if="bk.sources.length">
+                        <thead>
+                            <tr>
+                                <th>来源名称</th>
+                                <th class="col-center">叶子节点数</th>
+                                <th class="col-center">待备份</th>
+                                <th class="col-center">已备份</th>
+                                <th class="col-center">状态</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="s in bk.sources" :key="s.root_id">
+                                <td class="mono" style="font-size:.78rem;">{{ s.name }}</td>
+                                <td class="col-center">{{ fmtNum(s.leaves) }}</td>
+                                <td class="col-center">{{ fmtNum(s.pending) }}</td>
+                                <td class="col-center">{{ fmtNum(s.done) }}</td>
+                                <td class="col-center" style="font-size:.78rem;">
+                                    <span style="color:var(--success);">●</span> 正常
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <div v-else class="hint" style="margin:0;">暂无来源</div>
+                </div>
+
+                <!-- 自动备份策略 -->
+                <div class="panel">
+                    <div class="toolbar" style="margin-bottom:12px;">
+                        <h6 style="margin:0;">自动备份策略</h6>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
+                        <span>自动备份</span>
+                        <label style="margin-left:auto; display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" v-model="bkPolicy.enabled" @change="bkSavePolicy" style="width:auto;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">开启后按策略自动执行备份任务</span>
+                        </label>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
+                        <span>磁盘触发阈值</span>
+                        <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                            <input type="number" class="input input-sm" v-model.number="bkPolicy.threshold"
+                                   @change="bkSavePolicy" style="width:70px;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">%</span>
+                        </span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
+                        <span>检查周期</span>
+                        <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                            <input type="number" class="input input-sm" v-model.number="bkPolicy.interval"
+                                   @change="bkSavePolicy" style="width:70px;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">秒</span>
+                        </span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px; opacity:.55;">
+                        <span>最小文件保留天数</span>
+                        <span style="margin-left:auto; font-size:.76rem; color:var(--muted-foreground);">暂未实现</span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px; opacity:.55;">
+                        <span>OBS 校验后清理</span>
+                        <span style="margin-left:auto; font-size:.76rem; color:var(--muted-foreground);">需人工确认删除</span>
+                    </div>
+                    <div style="border-top:1px dashed var(--border); padding-top:10px; font-size:.76rem;
+                                color:var(--muted-foreground); line-height:1.6;">
+                        上传成功且哨兵校验通过后转「待删除」，本地文件需在下方确认后才清理。
+                    </div>
+                </div>
+
+                <!-- OBS 目标存储 -->
+                <div class="panel">
+                    <div class="toolbar" style="margin-bottom:12px;">
+                        <h6 style="margin:0;">OBS 目标存储</h6>
+                    </div>
+                    <div style="font-size:.82rem; margin-bottom:10px;">
+                        <div style="color:var(--muted-foreground); font-size:.76rem; margin-bottom:4px;">存储桶路径</div>
+                        <div class="mono" style="word-break:break-all;">{{ bkConfig.obs_base || '(未配置)' }}</div>
+                    </div>
+                    <div style="font-size:.82rem; margin-bottom:10px;">
+                        <div style="color:var(--muted-foreground); font-size:.76rem; margin-bottom:4px;">目录模板</div>
+                        <div class="mono" style="word-break:break-all; color:var(--muted-foreground);">/raw/{env}/{leaf}</div>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:8px; opacity:.55; font-size:.82rem;">
+                        <span>存储使用量</span>
+                        <span style="margin-left:auto; font-size:.76rem; color:var(--muted-foreground);">暂未实现</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 待确认删除 -->
+        <div class="panel" v-if="pendingDelete.length" style="border-color:var(--warning);">
+            <div class="toolbar" style="margin-bottom:10px;">
+                <h6 style="margin:0;">待确认删除（已上传 OBS）</h6>
+                <span style="font-size:.78rem; color:var(--muted-foreground);">{{ pendingDelete.length }} 个</span>
+                <button class="btn btn-sm" style="margin-left:auto; background:var(--danger); color:#fff; border-color:var(--danger);"
+                        @click="bkConfirmDelete(pendingDelete.map(function(d){return d.dir_path}))">
+                    批量确认删除
+                </button>
+            </div>
+            <table class="dir-table">
+                <thead><tr><th>环境</th><th>目录</th><th>OBS 路径</th><th>操作</th></tr></thead>
+                <tbody>
+                    <tr v-for="d in pendingDelete" :key="d.dir_path">
+                        <td class="mono">{{ d.env_label || d.env_name }}</td>
+                        <td class="mono">{{ d.mtime_tag }}</td>
+                        <td class="mono" style="font-size:.74rem; word-break:break-all;">{{ d.obs_path }}</td>
+                        <td>
+                            <button class="btn btn-outline btn-sm" style="color:var(--danger); border-color:var(--danger);"
+                                    @click="bkConfirmDelete([d.dir_path])">确认删除</button>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- 最近备份操作 -->
+        <div class="panel">
+            <div class="toolbar" style="margin-bottom:10px;">
+                <h6 style="margin:0;">最近备份操作</h6>
+            </div>
+            <table class="dir-table" v-if="bk.recent.length">
+                <thead>
+                    <tr><th>时间</th><th>类型</th><th>来源 / 叶子节点</th><th>消息</th></tr>
+                </thead>
+                <tbody>
+                    <tr v-for="l in bk.recent" :key="l.id">
+                        <td class="mono" style="font-size:.76rem; white-space:nowrap;">{{ l.created_at }}</td>
+                        <td><span :class="['badge', bkLevelBadge(l.level)]">{{ bkLevelLabel(l.level) }}</span></td>
+                        <td class="mono" style="font-size:.76rem;">{{ l.dir_path }}</td>
+                        <td style="font-size:.78rem;">{{ l.message }}</td>
+                    </tr>
+                </tbody>
+            </table>
+            <div v-else class="hint" style="margin:0;">暂无备份操作记录</div>
+        </div>
+
+        <!-- 详情抽屉 -->
+        <div class="drawer-overlay" v-if="bkDrawerPath" @click.self="bkCloseLogs"></div>
+        <div class="drawer-panel" v-if="bkDrawerPath">
+            <div class="drawer-head">
+                <div class="drawer-title">
+                    <div>
+                        <div style="font-weight:700;">备份详情</div>
+                        <div class="mono" style="font-size:.76rem; color:var(--muted-foreground);">{{ bkDrawerPath }}</div>
+                    </div>
+                    <button class="drawer-close" @click="bkCloseLogs">×</button>
+                </div>
+            </div>
+            <div class="drawer-body">
+                <div v-if="bkLogs.loading" style="color:#999; font-size:.82rem;">加载中…</div>
+                <pre v-else-if="bkLogs.lines.length"
+                     style="margin:0; font-size:.74rem; line-height:1.5; color:#d4d4d4; white-space:pre-wrap; word-break:break-all; font-family:ui-monospace,Menlo,Consolas,monospace;"><span
+                        v-for="(ln, i) in bkLogs.lines" :key="i"
+                        :style="{ color: bkLogLineColor(ln), display:'block' }">{{ ln }}</span></pre>
+                <div v-else style="color:#999; font-size:.82rem;">暂无该目录的备份日志。</div>
+            </div>
+        </div>
+    </div><!-- /tab backup -->
 </div>
 {% endraw %}
 {% endblock %}
@@ -722,6 +1033,23 @@ new Vue({
         logDrawerPath: null,  // 当前在右侧抽屉展示构建日志的源 path（null=关闭）
         buildLog: {},    // path -> { loading, lines[], note }
         pollers: {},     // path -> 构建完成检测 intervalId（结束即 clear）
+
+        // ===== 备份管理 Tab =====
+        bk: { totals: {}, months: [], sources: [], recent: [] },
+        bkDirs: [],          // /api/backup/dirs 的目录明细
+        bkConfig: { obs_base: '' },
+        bkPolicy: { enabled: false, threshold: 70, interval: 120 },
+        bkQueue: { running: '', queued: [], queue_len: 0 },
+        bkEnv: '',
+        bkStatus: '',
+        bkOrder: 'asc',      // 时间从旧到新
+        bkChecked: [],
+        bkLoading: false,
+        bkArchiving: false,
+        bkDrawerPath: null,
+        bkLogs: { loading: false, lines: [] },
+        bkTimer: null,
+        pendingDelete: [],   // 已上传 OBS、待人工确认删除的目录
     },
     computed: {
         logDrawerRow: function() {
@@ -771,6 +1099,30 @@ new Vue({
             // 这里只做窗口切片，排序不再改动。
             var start = (this.leafPage - 1) * this.leafPageSize;
             return (this.ov.leaves || []).slice(start, start + this.leafPageSize);
+        },
+        // ===== 备份管理 Tab =====
+        bkQueueRows: function() {
+            // 前端筛选 + 排序：来源 / 状态 / 时间方向。排序键用 mtime_tag
+            // （YYMMDDHH 定长，字典序即时间序），不用文件 mtime。
+            var self = this;
+            var rows = (this.bkDirs || []).filter(function(d) {
+                if (self.bkEnv && d.env_name !== self.bkEnv) return false;
+                if (self.bkStatus && d.status !== self.bkStatus) return false;
+                return true;
+            });
+            rows.sort(function(a, b) {
+                var ta = a.mtime_tag || '', tb = b.mtime_tag || '';
+                if (ta === tb) return (a.dir_path || '') < (b.dir_path || '') ? -1 : 1;
+                return self.bkOrder === 'asc' ? (ta < tb ? -1 : 1) : (ta > tb ? -1 : 1);
+            });
+            return rows;
+        },
+        bkAllChecked: function() {
+            return this.bkQueueRows.length > 0
+                && this.bkChecked.length === this.bkQueueRows.length;
+        },
+        bkQueueSet: function() {
+            return new Set(this.bkQueue.queued || []);
         },
     },
     methods: {
@@ -851,6 +1203,8 @@ new Vue({
             try { history.replaceState(null, '', '#' + t); } catch (e) {}
             // 只有看板 Tab 才轮询，切走就停
             if (t === 'sync') this.startOvPoll(); else this.stopOvPoll();
+            // 备份 Tab 同理：进入才拉数据并轮询，切走就停
+            if (t === 'backup') this.bkEnter(); else this.bkLeave();
         },
         leafPrev: function() {
             if (this.leafPage > 1) this.leafPage -= 1;
@@ -1228,16 +1582,212 @@ new Vue({
         showMsg: function(msg, ok) {
             this.msg = msg; this.msgOk = ok;
             setTimeout(function() { this.msg = ''; }.bind(this), 4000);
-        }
+        },
+
+        // ===== 备份管理 Tab =====
+        _bkFetch: function(url, opts) {
+            opts = opts || {};
+            opts.headers = Object.assign({ 'x-requested-with': 'XMLHttpRequest' }, opts.headers || {});
+            return fetch(url, opts).then(function(r) { return r.json(); });
+        },
+        loadBackupOverview: function() {
+            var self = this;
+            return this._bkFetch('/api/backup/overview').then(function(d) {
+                if (!d || !d.totals) return;
+                self.bk = d;
+                if (d.auto) {
+                    self.bkPolicy.enabled = !!d.auto.enabled;
+                    self.bkPolicy.threshold = d.auto.threshold;
+                    self.bkPolicy.interval = d.auto.interval;
+                }
+            }).catch(function() {});
+        },
+        loadBackupQueue: function() {
+            var self = this;
+            this.bkLoading = true;
+            return Promise.all([
+                this._bkFetch('/api/backup/dirs'),
+                this._bkFetch('/api/backup/queue-status'),
+                this._bkFetch('/api/backup/pending-delete'),
+            ]).then(function(res) {
+                self.bkDirs = (res[0] && res[0].dirs) || [];
+                self.bkQueue = res[1] || self.bkQueue;
+                self.pendingDelete = (res[2] && res[2].dirs) || [];
+            }).catch(function() {}).then(function() { self.bkLoading = false; });
+        },
+        loadBackupConfig: function() {
+            var self = this;
+            return this._bkFetch('/api/backup/config').then(function(d) {
+                if (d && !d.detail) self.bkConfig = d;
+            }).catch(function() {});
+        },
+        bkMonthHeight: function(m) {
+            var max = (this.bk.months || []).reduce(function(a, x) {
+                return Math.max(a, x.leaves || 0);
+            }, 1);
+            return m.leaves ? Math.max(6, Math.round(m.leaves * 100 / max)) : 2;
+        },
+        bkLeafLabel: function(d) {
+            // 「来源/时间戳」两段：newapi 的 mtime_tag 可能是 天/小时 两层
+            var t = d.mtime_tag || '';
+            return (d.env_label || d.env_name || '') + '/' + t.replace(/\//g, '');
+        },
+        bkTs: function(d) {
+            // mtime_tag 是 YYMMDDHH；把它渲染成可读时间，解析失败原样返回
+            var m = (d.mtime_tag || '').match(/(\d{2})(\d{2})(\d{2})(\d{2})$/);
+            if (!m) return d.mtime_tag || '—';
+            return '20' + m[1] + '-' + m[2] + '-' + m[3] + ' ' + m[4] + ':00';
+        },
+        bkStatusLabel: function(s) {
+            var m = {
+                pending: '待备份', syncing: '上传中', live_syncing: '在线同步',
+                done: '已备份', partial: '部分失败', error: '失败',
+                pending_delete: '待删除', backed_up: '已清理',
+            };
+            return m[s] || s;
+        },
+        bkBadge: function(s) {
+            var m = {
+                pending: 'badge-warn', syncing: 'badge-fmt', live_syncing: 'badge-fmt',
+                done: 'badge-active', partial: 'badge-warn', error: 'badge-missing',
+                pending_delete: 'badge-warn', backed_up: 'badge-history',
+            };
+            return m[s] || 'badge-history';
+        },
+        bkLevelLabel: function(l) {
+            return { info: '信息', error: '失败', warning: '警告' }[l] || '信息';
+        },
+        bkLevelBadge: function(l) {
+            return { info: 'badge-fmt', error: 'badge-missing',
+                     warning: 'badge-warn' }[l] || 'badge-history';
+        },
+        bkToggleAll: function(e) {
+            if (e.target.checked) {
+                this.bkChecked = this.bkQueueRows.map(function(d) { return d.dir_path; });
+            } else {
+                this.bkChecked = [];
+            }
+        },
+        bkSyncOne: function(d) {
+            var self = this;
+            this._bkFetch('/api/backup/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dirs: [d.dir_path] }),
+            }).then(function(r) {
+                if (r.detail) { alert(r.detail); return; }
+                self.loadBackupQueue();
+                self.bkStartPoll();
+            }).catch(function(e) { alert('请求失败: ' + e); });
+        },
+        bkArchiveSelected: function() {
+            var self = this;
+            var dirs = this.bkChecked.slice();
+            if (!dirs.length) return;
+            if (!confirm('确认备份选中的 ' + dirs.length + ' 个叶子节点？\n上传成功后会进入「待确认删除」，本地文件需再确认才清理。')) return;
+            this.bkArchiving = true;
+            this._bkFetch('/api/backup/sync', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dirs: dirs }),
+            }).then(function(r) {
+                if (r.detail) { alert(r.detail); return; }
+                self.bkChecked = [];
+                self.loadBackupQueue();
+                self.loadBackupOverview();
+                self.bkStartPoll();
+            }).catch(function(e) { alert('请求失败: ' + e); })
+              .then(function() { self.bkArchiving = false; });
+        },
+        bkSavePolicy: function() {
+            var self = this;
+            // 开关 / 阈值 / 周期都落在 sync_config 的 auto_backup_* 键上。
+            // 阈值与周期走已有的 /api/backup/config（PUT 只更新传入的键）。
+            this._bkFetch('/api/backup/strategy', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    enabled: !!this.bkPolicy.enabled,
+                    threshold: Number(this.bkPolicy.threshold) || 70,
+                    interval: Number(this.bkPolicy.interval) || 120,
+                }),
+            }).then(function(r) {
+                if (r && r.detail) alert(r.detail);
+                else self.loadBackupOverview();
+            }).catch(function(e) { alert('保存失败: ' + e); });
+        },
+        bkOpenLogs: function(d) {
+            var self = this;
+            this.bkDrawerPath = d.dir_path;
+            this.bkLogs = { loading: true, lines: [] };
+            this._bkFetch('/api/backup/logs/' + encodeURI(d.dir_path))
+                .then(function(r) {
+                    // 后端按 id 倒序返回（最新在前），抽屉里要正序显示
+                    var lines = (r.logs || []).slice().reverse().map(function(x) {
+                        return '[' + x.created_at + '] ' + (x.level || 'info') + ' ' + x.message;
+                    });
+                    self.bkLogs = { loading: false, lines: lines };
+                }).catch(function() { self.bkLogs = { loading: false, lines: [] }; });
+        },
+        bkCloseLogs: function() {
+            this.bkDrawerPath = null;
+            this.bkLogs = { loading: false, lines: [] };
+        },
+        bkLogLineColor: function(ln) {
+            if (!ln) return '#d4d4d4';
+            if (ln.indexOf(' error ') !== -1 || ln.indexOf('失败') !== -1) return '#f87171';
+            if (ln.indexOf(' warning ') !== -1) return '#fbbf24';
+            if (ln.indexOf('同步完成') !== -1) return '#4ade80';
+            return '#d4d4d4';
+        },
+        bkConfirmDelete: function(dirs) {
+            var self = this;
+            if (!dirs || !dirs.length) return;
+            if (!confirm('确认删除本地目录？(' + dirs.length + ' 个)\n这些目录已上传 OBS，删除后仅释放本地磁盘，不影响 OBS 备份。')) return;
+            this._bkFetch('/api/backup/confirm-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dirs: dirs }),
+            }).then(function(d) {
+                if (d.skipped && d.skipped.length) {
+                    alert('已删除 ' + (d.deleted || []).length + ' 个，跳过 ' + d.skipped.length + ' 个');
+                }
+                self.loadBackupQueue();
+                self.loadBackupOverview();
+            }).catch(function(e) { alert('请求失败: ' + e); });
+        },
+        bkStartPoll: function() {
+            // 队列有活才轮询；空闲即停（与备份页原逻辑一致）
+            if (this.bkTimer) return;
+            var self = this;
+            this.bkTimer = setInterval(function() {
+                self.loadBackupQueue();
+                if (!self.bkQueue.running && !self.bkQueue.queue_len) {
+                    clearInterval(self.bkTimer);
+                    self.bkTimer = null;
+                    self.loadBackupOverview();
+                }
+            }, 5000);
+        },
+        bkEnter: function() {
+            this.loadBackupOverview();
+            this.loadBackupConfig();
+            this.loadBackupQueue().then(this.bkStartPoll.bind(this));
+        },
+        bkLeave: function() {
+            if (this.bkTimer) { clearInterval(this.bkTimer); this.bkTimer = null; }
+        },
     },
     mounted: function() {
         // Tab 初值：hash 优先，默认同步看板
         var h = (location.hash || '').replace('#', '');
-        this.tab = (h === 'sources' || h === 'sync') ? h : 'sync';
+        this.tab = (h === 'sources' || h === 'sync' || h === 'backup') ? h : 'sync';
 
         this.load();
         // 看板轮询：仅看板 Tab 可见且页面在前台时跑
         this.startOvPoll();
+        // 直接带 #backup 打开时，进入即拉数据
+        if (this.tab === 'backup') this.bkEnter();
         var self = this;
         document.addEventListener('visibilitychange', function() {
             if (document.hidden) self.stopOvPoll();
@@ -1245,7 +1795,7 @@ new Vue({
         });
         window.addEventListener('hashchange', function() {
             var t = (location.hash || '').replace('#', '');
-            if ((t === 'sync' || t === 'sources') && t !== self.tab) self.setTab(t);
+            if ((t === 'sync' || t === 'sources' || t === 'backup') && t !== self.tab) self.setTab(t);
         });
         // 点击菜单外部时关闭「更多」下拉
         this._closeMenu = function(e) {

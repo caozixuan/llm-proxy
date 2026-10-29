@@ -369,6 +369,33 @@ def refresh_index(env_dir: Path, threshold: int = QUALIFIED_THRESHOLD_DEFAULT,
 
                 prev = dirs_cache.get(dir_name)
 
+                # ── 已归档叶子短路（备份上传 OBS 后删了本地目录）────────────
+                # 必须放在所有触盘分支之前。归档叶的 index.jsonl / cache_file 都
+                # 已不存在、db_count=0，落到下面的重算分支会得到 new_sessions={}，
+                # 把该叶缓存的统计清零 —— /sessions 的总量会静默下降。内容还在
+                # OBS 上，统计快照也还在 leaf_status.stats_json 里，直接沿用即可。
+                # 注意仍然 current_dirs.add（上面已加），否则会进入 removed 集合，
+                # 效果与清零相同。
+                if leaf_row is not None and leaf_row.get("archived"):
+                    raw = leaf_row.get("stats_json") or ""
+                    if raw:
+                        try:
+                            cached_sessions = json.loads(raw)
+                        except (ValueError, TypeError):
+                            cached_sessions = None
+                        if isinstance(cached_sessions, dict):
+                            entry = dict(prev) if prev else {}
+                            entry["sessions"] = cached_sessions
+                            entry["frozen"] = True
+                            entry["archived"] = True
+                            if entry != prev:
+                                dirs_cache[dir_name] = entry
+                                changed = True
+                            continue
+                    # 没有快照（不该发生）：沿用内存里的旧值，凭空造数据更糟。
+                    if prev is not None:
+                        continue
+
                 # frozen 快路径：历史目录不重扫。但必须先确认 index.db 的同步水位
                 # 没有推进过 —— watcher 折叠新 session 时不改 index.jsonl，
                 # 光看 frozen 会让快照永远停在旧内容（实测某叶 index.db 有 26 个

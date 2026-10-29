@@ -48,6 +48,7 @@ from utils.obs_utils import (
     load_sync_config,
     get_sync_config_path,
     obsutil_ls,
+    obsutil_object_size,
     find_failed_report,
     parse_failed_report,
     reupload_file,
@@ -392,6 +393,66 @@ def _scan_obs_dirs(obs_base: str, env_name: str = None) -> List[dict]:
     return result
 
 
+def _verify_upload_sentinels(real_dir: Path, obs_dst: str) -> tuple:
+    """核对哨兵对象是否真的落到了 OBS 上，返回 (ok, problems, checked)。
+
+    哨兵 = 叶子内 index.jsonl 与 .session_cache.jsonl（存在才查）。它们是叶子里
+    最关键的两个文件：前者是全部请求的索引，后者是会话缓存。任何一个在 OBS 上
+    缺失或大小不符，都说明这次上传没有把内容真正落盘，绝不能据此删除本地。
+
+    只查单个对象（每个一次 obsutil ls，秒级）。不要递归统计整个叶子 ——
+    实测单叶 80 万个对象，`ls -du` 要跑几分钟。
+
+    checked=0 表示该叶没有哨兵文件（如纯 -req.json 目录），没有可核对的锚点，
+    只能退化为依赖退出码 + obsutil 的 -vlength。
+
+    落点有两层可能是历史遗留：obsutil `cp <dir> <dst> -r` 会把**目录自身**也带上，
+    因此文件实际落在 `{obs_dst}/{dirname}/{file}`（实测 index.jsonl 在
+    `.../26080115/26080115/index.jsonl`），而不是 `{obs_dst}/{file}`。两个位置
+    都要查，否则所有 newapi 叶子都会被误判为核对失败。
+    """
+    problems: list = []
+    checked = 0
+    base = obs_dst.rstrip("/")
+    dir_name = Path(real_dir).name
+    for name in ("index.jsonl", ".session_cache.jsonl"):
+        local = real_dir / name
+        try:
+            if not local.is_file():
+                continue
+            local_size = local.stat().st_size
+        except OSError:
+            continue
+
+        candidates = [f"{base}/{name}"]
+        if dir_name:
+            candidates.append(f"{base}/{dir_name}/{name}")
+
+        remote_size = None
+        hit_url = candidates[0]
+        for obs_url in candidates:
+            sz = obsutil_object_size(obs_url)
+            if sz is not None:
+                remote_size, hit_url = sz, obs_url
+                break
+
+        if remote_size is None:
+            problems.append({
+                "local": str(local), "obs": candidates[0],
+                "detail": f"{name} 在 OBS 上不存在（查过 {' / '.join(candidates)}）",
+            })
+            continue
+        if remote_size != local_size:
+            problems.append({
+                "local": str(local), "obs": hit_url,
+                "detail": f"{name} 大小不符（本地 {local_size} / OBS {remote_size}）",
+            })
+            continue
+        checked += 1
+
+    return (not problems), problems, checked
+
+
 def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int, upload_script: str,
                       resolver=None):
     """在后台线程中同步单个目录到 OBS，直接上传整个文件夹，流式输出日志。
@@ -450,9 +511,25 @@ def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int
         proc.wait(timeout=600)
 
         if proc.returncode == 0:
-            update_sync_status(dir_path, "done", obs_path=obs_dst)
-            clear_failed_files(dir_path)
-            append_log(dir_path, "同步完成")
+            # 退出码之外再核一次哨兵对象：obsutil 的 -u 增量语义下，退出码 0 只
+            # 代表「本次没有失败的任务」，不保证目标前缀里真的落了数据（前缀写错、
+            # 对象被跳过都会是 0）。删除本地是不可逆操作，删之前必须确认内容在
+            # OBS 上，否则一次静默的路径错误就是永久丢数据。
+            ok, problems, checked = _verify_upload_sentinels(Path(real_dir), obs_dst)
+            if ok:
+                update_sync_status(dir_path, "done", obs_path=obs_dst)
+                clear_failed_files(dir_path)
+                append_log(dir_path,
+                           f"同步完成（哨兵已核对 {checked} 个）" if checked
+                           else "同步完成（无哨兵文件，仅依赖退出码与 -vlength）")
+            else:
+                msg = "；".join(p["detail"] for p in problems)
+                append_log(dir_path, f"哨兵核对失败: {msg}", level="error")
+                record_failed_files(dir_path, [
+                    (p["local"], p["obs"], p["detail"]) for p in problems if p.get("local")
+                ])
+                update_sync_status(dir_path, "partial",
+                                   error_msg=f"哨兵核对失败: {msg}", obs_path=obs_dst)
         else:
             # 尝试从 obsutil 失败报告解析出失败文件清单 → 标记 partial（部分失败）
             failed_items = []
@@ -758,6 +835,42 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                     return real
         return cand  # 兜底：返回 logs_all 下的路径（可能不存在）
 
+    def _mark_leaves_archived(dir_path: str, archived: bool = True) -> int:
+        """把某个备份目录对应的 leaf_status 行打上/取消归档标记，返回命中行数。
+
+        这是备份 ↔ session worker 之间的通知渠道：worker 每轮读同一个 WAL 库的
+        stale_stats_leaves()（已按 archived=0 过滤），所以这里写完标记后，worker
+        下一轮（≤15s）自然就不再重试这个问题叶子，不需要任何进程间消息。
+
+        dir_path（env_name/mtime_tag）与 leaf_status 的 (root_id, dir_key) 不是
+        一一对应：logs_all 的 env_name 是目录名，而 leaf_status 的 root_id 是路径
+        md5 或 'default'。所以主键用**绝对路径**归一化匹配；leaf_path 为空的存量行
+        再按 (root_id, dir_key) 兜底。
+        """
+        try:
+            import utils.logdir_store as _lds
+            if not _lds._ready():
+                return 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+        n = 0
+        try:
+            real = _resolve_real_dir(dir_path)
+            n += _lds.mark_archived([str(real)], archived=archived)
+        except Exception:  # noqa: BLE001
+            logger.exception("mark_archived by path failed: %s", dir_path)
+
+        if n == 0 and "/" in dir_path:
+            try:
+                env_name, rel = dir_path.split("/", 1)
+                root = _extra_root_for_env(env_name)
+                rid = _root_env_name(root) if root else env_name
+                n += _lds.mark_archived_by_root(rid, [rel], archived=archived)
+            except Exception:  # noqa: BLE001
+                logger.exception("mark_archived by root failed: %s", dir_path)
+        return n
+
     # 一次性幂等迁移：存量记录旧 env 前缀（basename）-> root_id
     try:
         from utils.backup_store import migrate_env_prefix
@@ -995,7 +1108,57 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
         except Exception as e:
             return JSONResponse({"detail": str(e)}, status_code=500)
 
-    @app.get("/api/backup/logs/{dir_path:path}")
+    @app.put("/api/backup/strategy")
+    async def backup_strategy_put(request: Request):
+        """保存自动备份策略（sync_config 的 auto_backup_* 键）。
+
+        与 /api/backup/config 分开：那边管 obs_base / workers 这类上传参数，
+        这边管「开不开自动备份、磁盘阈值、检查周期」。两边都是先 safe_load
+        再改键后整体写回，所以互不覆盖对方的键。
+        """
+        denied = _require_ajax(request)
+        if denied:
+            return denied
+
+        body = await request.json()
+        cfg_path = get_sync_config_path()
+        if not cfg_path:
+            return JSONResponse({"detail": "sync_config 未配置"}, status_code=400)
+
+        import yaml
+        try:
+            if cfg_path.is_file():
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    existing = yaml.safe_load(f) or {}
+            else:
+                existing = {}
+
+            if "enabled" in body:
+                existing["auto_backup_enabled"] = bool(body["enabled"])
+            if "threshold" in body:
+                try:
+                    existing["auto_backup_disk_percent"] = float(body["threshold"])
+                except (TypeError, ValueError):
+                    return JSONResponse({"detail": "阈值必须是数字"}, status_code=400)
+            if "interval" in body:
+                try:
+                    existing["auto_backup_check_interval"] = max(30, int(body["interval"]))
+                except (TypeError, ValueError):
+                    return JSONResponse({"detail": "检查周期必须是整数秒"}, status_code=400)
+
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                yaml.dump(existing, f, default_flow_style=False, allow_unicode=True)
+
+            # 守护线程每轮重读配置，这里不需要重启；返回生效值便于前端确认
+            cfg = _auto_cfg()
+            return JSONResponse({
+                "ok": True,
+                "enabled": cfg["enabled"],
+                "threshold": cfg["threshold"],
+                "interval": cfg["interval"],
+            })
+        except Exception as e:
+            return JSONResponse({"detail": str(e)}, status_code=500)
     def backup_logs(request: Request, dir_path: str):
         denied = _require_ajax(request)
         if denied:
@@ -1030,6 +1193,7 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                 return JSONResponse({"detail": f"删除失败: {e}"}, status_code=500)
 
         mark_backed_up(dir_path)
+        _mark_leaves_archived(dir_path, True)
         return JSONResponse({"ok": True})
 
     @app.get("/api/backup/obs-browse/{obs_path:path}")
@@ -1295,6 +1459,422 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
         t.start()
         return JSONResponse({"ok": True, "msg": "已开始自动上传"})
 
+    @app.get("/api/backup/timeline")
+    def backup_timeline(request: Request):
+        """跨环境的时间轴：每个时间点有多少叶子 / 文件 / 各状态分布。
+
+        数据来自两处，在 Python 里合并（各有一次性读，都是本地 SQLite）：
+          - backup_sync.db 的 backup_dirs：备份视角（状态、有无本地/OBS、文件数）
+          - log_dir.db 的 leaf_status：全部叶子（含备份表尚未登记的），带归档标记
+
+        合并键：优先归一化绝对路径；拿不到时退 f"{root_id}/{dir_key}"。
+        时间键用 log_scan.scan_time_key（与导出浏览同一解析器）；解析不出来时
+        回退 idx_mtime 换算成本机小时。
+
+        不做字节统计：没有现成表，du 走 NFS/递归列举都太慢（实测单叶 80 万个
+        对象、`obsutil ls -du` 要几分钟）。规模用「文件数 + 叶子数」表达。
+        """
+        denied = _require_ajax(request)
+        if denied:
+            return denied
+
+        from utils.log_scan import scan_time_key, day_key
+        from utils.logs_config import get_root_id
+
+        bucket = (request.query_params.get("bucket") or "day").lower()
+        if bucket not in ("hour", "day"):
+            bucket = "day"
+        order = (request.query_params.get("order") or "asc").lower()
+        env_filter = request.query_params.get("env_name", "") or ""
+        frm = (request.query_params.get("from") or "").strip()
+        to = (request.query_params.get("to") or "").strip()
+
+        def _bucket_of(hour_key: str, fallback_ts: float) -> str:
+            k = hour_key
+            if not k and fallback_ts:
+                try:
+                    from datetime import datetime as _dt
+                    k = _dt.fromtimestamp(fallback_ts).strftime("%y%m%d%H")
+                except (ValueError, OSError):
+                    k = ""
+            if not k:
+                return "unknown"
+            return day_key(k) if bucket == "day" else k
+
+        points: dict = {}
+
+        def _point(t: str) -> dict:
+            p = points.get(t)
+            if p is None:
+                p = points[t] = {
+                    "time": t, "label": t, "leaves": 0, "files": 0,
+                    "envs": set(), "status": {}, "has_local": 0, "has_obs": 0,
+                    "archived": 0,
+                }
+            return p
+
+        # ── 两路数据的职责分工 ─────────────────────────────────────────────
+        # 叶子数 / 归档数 / 本地存在数：只来自 leaf_status（唯一权威来源）。
+        # 状态分布 / 文件数 / 有无 OBS：来自 backup_dirs，按**归一化路径**逐个
+        # 叶子对齐。backup_dirs 里对不上任何叶子的陈旧行（实测 131 条，其中 78
+        # 条本地目录早已不存在）只贡献文件数，绝不增加叶子数 —— 否则时间轴的
+        # 叶子总和会比真实叶子数多，页面上的数字就没法对账。
+        dir_rows = list_dirs()
+        # logs_all 在 register 里可能是相对路径（LOGS_DIR 来自 get_log_dir），而
+        # leaf_status.leaf_path 一律是绝对路径。不转成绝对路径的话，下面的路径
+        # 归一化永远对不上，时间轴会显示 files=0 且没有任何状态分布。
+        logs_all_abs = Path(os.path.abspath(str(logs_all)))
+        dir_by_norm: dict = {}
+        extra_root_cache: dict = {}
+        matched_dir_paths: set = set()
+        for d in dir_rows:
+            dp = d.get("dir_path") or ""
+            if not dp:
+                continue
+            c = os.path.normpath(str(logs_all_abs / dp))
+            dir_by_norm[c] = (dp, d)
+            if "/" not in dp:
+                continue
+            env_name, rel = dp.split("/", 1)
+            if env_name not in extra_root_cache:
+                extra_root_cache[env_name] = _extra_root_for_env(env_name)
+            root = extra_root_cache[env_name]
+            if root:
+                dir_by_norm[os.path.normpath(str(Path(root) / rel))] = (dp, d)
+                dir_by_norm[os.path.normpath(str(Path(root) / rel / Path(rel).name))] = (dp, d)
+
+        try:
+            import utils.logdir_store as _lds
+            leaf_rows = _lds.all_leaf_rows() if _lds._ready() else []
+        except Exception:  # noqa: BLE001
+            leaf_rows = []
+
+        # env_filter 的 rid 集合：显式选中的 env 既可能是历史根（root_id = 路径
+        # md5），也可能是活跃 env 目录（root_id = 'default' 或该目录自己的 md5，
+        # 不在 _extra_roots 里）。三种都收进来，否则选中活跃 env 时叶子会被滤空。
+        want_rids = None
+        if env_filter:
+            want_rids = {env_filter}
+            root = _extra_root_for_env(env_filter)
+            if root:
+                want_rids.add(_root_env_name(root))
+            try:
+                from utils.logs_config import get_registered_roots
+                active_env = os.path.normpath(str(Path(logs_dir).parent))
+                for r0 in get_registered_roots(active_env):
+                    if r0 and (os.path.basename(os.path.normpath(r0)) == env_filter
+                               or os.path.normpath(r0) == os.path.normpath(str(logs_all / env_filter))):
+                        want_rids.add(_root_env_name(r0))
+            except Exception:  # noqa: BLE001
+                pass
+
+        for r in leaf_rows:
+            lp = r.get("leaf_path") or ""
+            rid = r.get("root_id") or ""
+            dk = r.get("dir_key") or ""
+            if want_rids is not None and rid not in want_rids:
+                continue
+            key_path = os.path.normpath(lp) if lp else ""
+            # logs_all 下的活跃 env：root_id 可能是 'default' 或路径 md5，
+            # 时间键只能从 dir_key 取（dir_key 就是小时目录名）。
+            t = _bucket_of(scan_time_key(lp) or scan_time_key(dk),
+                           float(r.get("idx_mtime") or 0))
+            if frm and t != "unknown" and t < frm:
+                continue
+            if to and t != "unknown" and t > to:
+                continue
+            p = _point(t)
+            p["leaves"] += 1
+            if rid:
+                p["envs"].add(rid)
+
+            b = dir_by_norm.get(key_path) if key_path else None
+            if b is not None:
+                dp, bd = b
+                matched_dir_paths.add(dp)
+                st = bd.get("status") or "pending"
+                p["status"][st] = p["status"].get(st, 0) + 1
+                p["files"] += int(bd.get("file_count") or 0)
+                if bd.get("has_obs"):
+                    p["has_obs"] += 1
+
+            if r.get("archived"):
+                p["archived"] += 1
+            elif lp:
+                # 不逐叶 os.path.isdir()：4700 次 NFS 元数据查询会把时间轴接口
+                # 拖到秒级甚至更久。archived=0 且登记过 leaf_path 就视为本地存在
+                # （归档流程一定会打标记，所以这个推断是可靠的）。
+                p["has_local"] += 1
+
+        # 未被任何叶子认领的 backup_dirs 行：只补文件数，不增加叶子数。
+        orphans = 0
+        for dp, bd in dir_by_norm.values():
+            if dp in matched_dir_paths:
+                continue
+            matched_dir_paths.add(dp)
+            orphans += 1
+            t = _bucket_of(scan_time_key(bd.get("mtime_tag") or dp), 0)
+            if env_filter and bd.get("env_name") != env_filter:
+                continue
+            if frm and t != "unknown" and t < frm:
+                continue
+            if to and t != "unknown" and t > to:
+                continue
+            _point(t)["files"] += int(bd.get("file_count") or 0)
+
+        out = []
+        for t in sorted(points, key=lambda x: (x == "unknown", x), reverse=(order == "desc")):
+            p = points[t]
+            out.append({
+                "time": t, "label": p["label"],
+                "leaves": p["leaves"], "files": p["files"],
+                "envs": sorted(p["envs"]),
+                "status": p["status"],
+                "has_local": p["has_local"], "has_obs": p["has_obs"],
+                "archived": p["archived"],
+            })
+        return JSONResponse({"bucket": bucket, "order": order, "points": out,
+                             "files_partial": True})
+
+    @app.get("/api/backup/overview")
+    def backup_overview(request: Request):
+        """「数据管理 → 备份管理」tab 的聚合总览。
+
+        一次返回四张统计卡、按月备份分布、来源列表、最近操作，避免前端开页
+        连打 6 个接口。叶子数仍以 leaf_status 为权威（与 /timeline 同口径），
+        backup_dirs 只提供备份状态与文件数。
+
+        没有现成数据源的字段直接给 null，前端显示为「—」，不臆造。
+        """
+        denied = _require_ajax(request)
+        if denied:
+            return denied
+
+        from utils.log_scan import scan_time_key, day_key
+
+        logs_all_abs = Path(os.path.abspath(str(logs_all)))
+        dir_rows = list_dirs()
+
+        # 归一化路径 → 备份行（与 /timeline 同一套对齐规则）
+        dir_by_norm: dict = {}
+        extra_root_cache: dict = {}
+        for d in dir_rows:
+            dp = d.get("dir_path") or ""
+            if not dp:
+                continue
+            dir_by_norm[os.path.normpath(str(logs_all_abs / dp))] = d
+            if "/" not in dp:
+                continue
+            env_name, rel = dp.split("/", 1)
+            if env_name not in extra_root_cache:
+                extra_root_cache[env_name] = _extra_root_for_env(env_name)
+            root = extra_root_cache[env_name]
+            if root:
+                dir_by_norm[os.path.normpath(str(Path(root) / rel))] = d
+                dir_by_norm[os.path.normpath(str(Path(root) / rel / Path(rel).name))] = d
+
+        import utils.logdir_store as _lds
+        try:
+            leaf_rows = _lds.all_leaf_rows() if _lds._ready() else []
+        except Exception:  # noqa: BLE001
+            leaf_rows = []
+
+        total_leaves = 0
+        pending_leaves = 0
+        done_leaves = 0
+        archived_leaves = 0
+        pending_files = 0
+        source_stat: dict = {}
+        months: dict = {}
+
+        for r in leaf_rows:
+            lp = r.get("leaf_path") or ""
+            rid = r.get("root_id") or ""
+            dk = r.get("dir_key") or ""
+            total_leaves += 1
+            st = source_stat.get(rid)
+            if st is None:
+                st = source_stat[rid] = {"leaves": 0, "pending": 0, "done": 0}
+            st["leaves"] += 1
+
+            b = dir_by_norm.get(os.path.normpath(lp)) if lp else None
+            bstatus = (b.get("status") if b else None) or "pending"
+            if b and b.get("has_obs"):
+                done_leaves += 1
+                st["done"] += 1
+            elif r.get("archived"):
+                archived_leaves += 1
+                done_leaves += 1
+                st["done"] += 1
+            else:
+                pending_leaves += 1
+                st["pending"] += 1
+                if b:
+                    pending_files += int(b.get("file_count") or 0)
+
+            t = scan_time_key(lp) or scan_time_key(dk)
+            if t:
+                m = day_key(t)[:4]
+                months[m] = months.get(m, 0) + 1
+
+        # 按月分布：最近 5 个月，缺月补 0（保持柱状图横轴连续）
+        month_points = []
+        if months:
+            keys = sorted(months)
+            recent = keys[-5:]
+            for k in recent:
+                month_points.append({"month": k, "label": k[-2:].lstrip("0") + "月",
+                                     "leaves": months[k]})
+
+        # 来源列表（名称走 sources 表）
+        name_map: dict = {}
+        try:
+            for s in _lds.list_sources():
+                name_map[s.get("root_id")] = s.get("name") or s.get("root_id")
+        except Exception:  # noqa: BLE001
+            pass
+        sources = []
+        for rid, st in source_stat.items():
+            sources.append({
+                "root_id": rid,
+                "name": name_map.get(rid) or rid,
+                "leaves": st["leaves"],
+                "pending": st["pending"],
+                "done": st["done"],
+                "status": "ok" if st["pending"] == 0 else "idle",
+            })
+        sources.sort(key=lambda x: x["leaves"], reverse=True)
+
+        try:
+            from utils.backup_store import get_recent_logs
+            recent = get_recent_logs(limit=20)
+        except Exception:  # noqa: BLE001
+            recent = []
+
+        cfg = _auto_cfg()
+        return JSONResponse({
+            "totals": {
+                "leaves": total_leaves,
+                "pending": pending_leaves,
+                "done": done_leaves,
+                "archived": archived_leaves,
+                "pending_files": pending_files,
+                "progress_pct": (round(done_leaves * 100 / total_leaves, 1)
+                                 if total_leaves else 0),
+            },
+            "months": month_points,
+            "sources": sources,
+            "recent": recent,
+            "auto": {
+                "enabled": cfg["enabled"],
+                "threshold": cfg["threshold"],
+                "interval": cfg["interval"],
+                "obs_base": cfg["obs_base"],
+            },
+            # 磁盘可释放空间需要真实 du，代价高（见 /storage 的后台计算），
+            # 这里不给臆造值。
+            "reclaimable_bytes": None,
+        })
+
+    @app.post("/api/backup/archive")
+    async def backup_archive(request: Request):
+        """按时间从最远到最近批量归档到 OBS。
+
+        dry_run=true（默认）：只返回候选与预览，不入队。
+        dry_run=false：按时间升序入队 backup_queue。claim_next_job 是
+        ORDER BY id ASC，所以「先入队 = 先被领取」，天然最远优先，不需要
+        动 dispatcher。
+
+        上传成功后仍然只转 pending_delete（不自动删本地），删除由人工在
+        「待确认删除」面板确认 —— 保留安全闸门。
+        """
+        denied = _require_ajax(request)
+        if denied:
+            return denied
+        body = await request.json()
+        dry_run = body.get("dry_run", True)
+        if isinstance(dry_run, str):
+            dry_run = dry_run.lower() in ("1", "true", "yes")
+        try:
+            limit = int(body.get("limit") or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, min(limit, 200))
+        older_than = str(body.get("older_than") or "").strip()
+        envs = body.get("envs") or []
+        if isinstance(envs, str):
+            envs = [envs]
+        envs = {e for e in envs if e}
+
+        from utils.log_scan import scan_time_key
+
+        queue_paths = {j.get("dir_path") for j in list_queue()}
+        with _sync_lock:
+            busy = set(_syncing_dirs)
+
+        candidates, skipped = [], []
+        for d in list_dirs():
+            dp = d.get("dir_path") or ""
+            if not dp:
+                continue
+            if envs and d.get("env_name") not in envs:
+                continue
+            if dp == _active_dir_path:
+                skipped.append({"dir_path": dp, "reason": "活跃目录"})
+                continue
+            if not d.get("has_local"):
+                skipped.append({"dir_path": dp, "reason": "本地不存在"})
+                continue
+            st = d.get("status") or "pending"
+            if st in ("done", "pending_delete", "backed_up", "live_syncing"):
+                skipped.append({"dir_path": dp, "reason": f"状态 {st}"})
+                continue
+            if dp in queue_paths:
+                skipped.append({"dir_path": dp, "reason": "已在队列"})
+                continue
+            if dp in busy:
+                skipped.append({"dir_path": dp, "reason": "正在上传"})
+                continue
+            t = scan_time_key(d.get("mtime_tag") or dp)
+            if older_than and t:
+                if t >= older_than:
+                    continue
+            elif older_than and not t:
+                # 时间键解析不出来就不参与「早于某时间」的筛选，避免误归档
+                skipped.append({"dir_path": dp, "reason": "无时间键"})
+                continue
+            candidates.append({"dir_path": dp, "time": t,
+                               "file_count": int(d.get("file_count") or 0),
+                               "status": st})
+
+        # 最远 → 最近
+        candidates.sort(key=lambda c: (c["time"] or "99999999", c["dir_path"]))
+        chosen = candidates[:limit]
+
+        if dry_run:
+            return JSONResponse({
+                "dry_run": True,
+                "matched": len(candidates),
+                "preview": chosen,
+                "skipped": skipped[:50],
+            })
+
+        enqueued, already = [], []
+        for c in chosen:
+            if enqueue_job(c["dir_path"], "sync"):
+                enqueued.append(c["dir_path"])
+            else:
+                already.append(c["dir_path"])
+        if enqueued:
+            _notify_dispatcher()
+            append_log(enqueued[0], f"批量归档入队 {len(enqueued)} 个目录（按时间从远到近）")
+        return JSONResponse({
+            "dry_run": False,
+            "enqueued": enqueued,
+            "already": already,
+            "remaining": max(0, len(candidates) - len(enqueued)),
+        })
+
     @app.get("/api/backup/pending-delete")
     def backup_pending_delete_list(request: Request):
         denied = _require_ajax(request)
@@ -1339,6 +1919,7 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                     skipped.append(dir_path)
                     continue
             mark_backed_up(dir_path)
+            _mark_leaves_archived(dir_path, True)
             deleted.append(dir_path)
         return JSONResponse({"ok": True, "deleted": deleted, "skipped": skipped})
 

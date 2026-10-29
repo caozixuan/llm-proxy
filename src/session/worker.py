@@ -99,6 +99,14 @@ def _init_env() -> None:
     logger.info("session_worker 启动 svc_dir=%s batch=%d interval=%.1fs threshold=%d",
                 svc_dir, BATCH, INTERVAL, THRESHOLD)
     try:
+        na = logdir_store.count_archived_leaves()
+        if na:
+            # 已归档（上传 OBS 后本地目录已删）的叶子不在补算范围内，
+            # 打印出来便于确认备份侧的通知标记已生效。
+            logger.info("跳过 %d 个已归档叶子（本地已删，内容在 OBS）", na)
+    except Exception as ex:  # noqa: BLE001
+        logger.warning("已归档叶子数查询失败: %s", ex)
+    try:
         n = logdir_store.count_stale_stats_leaves()
         if n:
             logger.info("发现 %d 个统计快照落后的叶子，开始后台补算", n)
@@ -255,11 +263,18 @@ def main() -> int:
     _init_env()
 
     try:
+        _prev_remaining = None
         while not _shutdown_requested:
             n = run_once()
             if n:
-                logger.info("本轮补算 %d 个叶子，剩余 %d 个落后",
-                            n, logdir_store.count_stale_stats_leaves())
+                _prev_remaining = logdir_store.count_stale_stats_leaves()
+                logger.info("本轮补算 %d 个叶子，剩余 %d 个落后", n, _prev_remaining)
+            elif _prev_remaining:
+                # 上一轮还有欠账、这轮一个都没捞到 → 说明剩余的已被归档过滤掉。
+                # 打一条，便于从日志确认备份侧打的 archived 标记已被本进程感知。
+                _prev_remaining = logdir_store.count_stale_stats_leaves()
+                logger.info("落后叶子已清空（含已归档叶子跳过），剩余 %d 个",
+                            _prev_remaining)
             if args.once:
                 break
             # 有活就立刻继续下一批（缩短总耗时）；没活就按 INTERVAL 空转。

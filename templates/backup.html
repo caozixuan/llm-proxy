@@ -189,6 +189,83 @@
         </div>
     </div>
 
+    <!-- Timeline / bulk archive -->
+    <div class="config-panel">
+        <h6 style="cursor:default;">
+            时间轴归档
+            <span style="margin-left:8px;font-size:.78rem;font-weight:400;color:var(--muted-foreground);">
+                按时间从远到近上传到 OBS，上传成功后进入「待确认删除」
+            </span>
+            <span style="margin-left:auto;display:flex;gap:6px;align-items:center;">
+                <select class="form-input" v-model="timeline.bucket" @change="loadTimeline()"
+                        style="width:auto;font-size:.78rem;padding:2px 6px;">
+                    <option value="day">按天</option>
+                    <option value="hour">按小时</option>
+                </select>
+                <button class="btn-xs" @click="toggleTimelineOrder()">
+                    {{ timeline.order === 'asc' ? '最远→最近' : '最近→最远' }}
+                </button>
+                <button class="btn-xs" @click="loadTimeline()" :disabled="timeline.loading">刷新</button>
+            </span>
+        </h6>
+        <div v-if="timeline.error" class="msg-err" style="color:var(--danger);font-size:.8rem;">{{ timeline.error }}</div>
+        <div v-else-if="!timeline.points.length" style="color:var(--muted-foreground);font-size:.84rem;">
+            {{ timeline.loading ? '加载中…' : '暂无数据' }}
+        </div>
+        <table class="dir-table" v-else>
+            <thead>
+                <tr>
+                    <th>时间</th>
+                    <th>叶子数</th>
+                    <th>文件数</th>
+                    <th>本地</th>
+                    <th>已归档</th>
+                    <th>状态分布</th>
+                    <th>操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr v-for="p in timeline.points" :key="p.time">
+                    <td class="mono">{{ p.label }}</td>
+                    <td>{{ fmtNum(p.leaves) }}</td>
+                    <td>{{ p.files > 0 ? fmtNum(p.files) : '-' }}</td>
+                    <td>{{ fmtNum(p.has_local) }}</td>
+                    <td>{{ p.archived > 0 ? fmtNum(p.archived) : '-' }}</td>
+                    <td style="font-size:.76rem;color:var(--muted-foreground);">
+                        <span v-for="(v, k) in p.status" :key="k" style="margin-right:6px;">
+                            {{ statusLabel(k) }} {{ v }}
+                        </span>
+                    </td>
+                    <td style="white-space:nowrap;">
+                        <button class="btn-xs" v-if="p.time !== 'unknown'"
+                                @click="archiveBefore(p.time)"
+                                title="把早于该时间的叶子按最远优先入队上传">
+                            归档至此前
+                        </button>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+        <div v-if="timeline.preview" style="margin-top:8px;font-size:.8rem;border-top:1px dashed var(--border);padding-top:8px;">
+            <div>
+                <strong>预览</strong>：匹配 {{ timeline.preview.matched }} 个，本次将入队 {{ timeline.preview.preview.length }} 个
+                <span v-if="timeline.preview.skipped && timeline.preview.skipped.length" style="color:var(--muted-foreground);">
+                    （跳过 {{ timeline.preview.skipped.length }} 个）
+                </span>
+            </div>
+            <div style="max-height:140px;overflow:auto;margin:4px 0;">
+                <div v-for="c in timeline.preview.preview" :key="c.dir_path" class="mono" style="font-size:.76rem;">
+                    {{ c.time || '?' }} · {{ c.dir_path }} · {{ fmtNum(c.file_count) }} 文件
+                </div>
+            </div>
+            <button class="btn btn-sm btn-primary" v-if="timeline.preview.preview.length"
+                    @click="confirmArchive" :disabled="archiving">
+                {{ archiving ? '入队中…' : '确认入队 (' + timeline.preview.preview.length + ')' }}
+            </button>
+            <button class="btn-xs" style="margin-left:6px;" @click="timeline.preview = null">取消</button>
+        </div>
+    </div>
+
     <!-- Pending-delete confirmation -->
     <div class="config-panel" v-if="pendingDelete.length" style="border-color:var(--warning);">
         <h6 style="cursor:default;">
@@ -386,7 +463,10 @@ new Vue({
         auto: { enabled: false, running: false, disk_percent: null, threshold: null, queue: [], current: '', uploaded: [], message: '', obs_configured: true },
         pendingDelete: [],
         autoTimer: null,
+        timelineTimer: null,
         queue: { running: '', queued: [], queue_len: 0 },
+        timeline: { points: [], bucket: 'day', order: 'asc', loading: false, error: '', preview: null },
+        archiving: false,
     },
     computed: {
         allChecked() {
@@ -520,6 +600,70 @@ new Vue({
                 .then(r => r.json())
                 .then(data => { this.config = data; })
                 .catch(e => console.error(e));
+        },
+        loadTimeline() {
+            this.timeline.loading = true;
+            this.timeline.error = '';
+            var q = '?bucket=' + encodeURIComponent(this.timeline.bucket)
+                  + '&order=' + encodeURIComponent(this.timeline.order);
+            if (this.envFilter) q += '&env_name=' + encodeURIComponent(this.envFilter);
+            fetch('/api/backup/timeline' + q, { headers: { 'x-requested-with': 'XMLHttpRequest' } })
+                .then(r => r.json())
+                .then(d => { this.timeline.points = d.points || []; })
+                .catch(e => { this.timeline.error = '时间轴加载失败: ' + e; })
+                .finally(() => { this.timeline.loading = false; });
+        },
+        toggleTimelineOrder() {
+            this.timeline.order = (this.timeline.order === 'asc') ? 'desc' : 'asc';
+            this.loadTimeline();
+        },
+        _archiveBody(dryRun) {
+            return {
+                dry_run: dryRun,
+                older_than: this.timeline.archiveBefore || '',
+                limit: this.timeline.archiveLimit || 20,
+                envs: this.envFilter ? [this.envFilter] : [],
+            };
+        },
+        archiveBefore(time) {
+            this.timeline.archiveBefore = time;
+            this.timeline.archiveLimit = 20;
+            this.timeline.preview = null;
+            fetch('/api/backup/archive', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-requested-with': 'XMLHttpRequest' },
+                body: JSON.stringify(this._archiveBody(true)),
+            })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.detail) { alert(d.detail); return; }
+                    this.timeline.preview = d;
+                    if (!d.preview || !d.preview.length) {
+                        alert('没有可归档的目录（早于 ' + time + '）');
+                        this.timeline.preview = null;
+                    }
+                })
+                .catch(e => alert('预览失败: ' + e));
+        },
+        confirmArchive() {
+            var pv = this.timeline.preview;
+            if (!pv || !pv.preview || !pv.preview.length) return;
+            this.archiving = true;
+            fetch('/api/backup/archive', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-requested-with': 'XMLHttpRequest' },
+                body: JSON.stringify(this._archiveBody(false)),
+            })
+                .then(r => r.json())
+                .then(d => {
+                    if (d.detail) { alert(d.detail); return; }
+                    this.timeline.preview = null;
+                    this.loadQueue();
+                    this.loadTimeline();
+                    this._startAutoRefresh();
+                })
+                .catch(e => alert('入队失败: ' + e))
+                .finally(() => { this.archiving = false; });
         },
         saveConfig() {
             this.saving = true;
@@ -805,12 +949,16 @@ new Vue({
         this.loadStorage(false);
         this.loadAuto();
         this.loadQueue();
+        this.loadTimeline();
         this.autoTimer = setInterval(() => { this.loadAuto(); this.loadQueue(); }, 5000);
+        // 时间轴比状态轮询更贵（读 backup_dirs + leaf_status 两张表），放宽到 15s。
+        this.timelineTimer = setInterval(() => { this.loadTimeline(); }, 15000);
     },
     beforeDestroy() {
         this._stopLogPoll();
         if (this.refreshTimer) clearInterval(this.refreshTimer);
         if (this.autoTimer) clearInterval(this.autoTimer);
+        if (this.timelineTimer) clearInterval(this.timelineTimer);
     },
 });
 {% endraw %}

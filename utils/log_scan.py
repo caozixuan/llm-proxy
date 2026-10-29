@@ -294,6 +294,37 @@ def resolve_leaf(root, dir_key: str) -> Path:
     return cand
 
 
+_RE_HOUR_TAG = re.compile(r"^\d{8}$")
+
+
+def scan_time_key(path_or_tag: str) -> str:
+    """从叶子路径 / mtime_tag 里取出小时时间键（YYMMDDHH）。取不到返回 ''。
+
+    目录布局有两类，时间段的位置不同：
+      - native: {root}/26072821            → 末段即时间键
+      - newapi: {root}/260728/26072821     → 末段仍是时间键（取末段即可）
+      - 折叠层变体: .../26072821/26072821  → 末段仍是
+    但 backup_dirs 的 mtime_tag 也可能是 'details/260728/26072821' 这类带字面
+    段的相对路径，末段不一定是时间键；此时从右往左找第一个 8 位数字段。
+
+    统一在这里解析，避免备份时间轴与导出浏览各写一套（utils/log_routes.py 的
+    _leaf_dir_key 现已委托本函数）。
+    """
+    s = (path_or_tag or "").replace("\\", "/").rstrip("/")
+    if not s:
+        return ""
+    for part in reversed(s.split("/")):
+        if _RE_HOUR_TAG.match(part):
+            return part
+    return ""
+
+
+def day_key(hour_key: str) -> str:
+    """YYMMDDHH → YYMMDD（按天归档时的分组键）。非法输入原样返回。"""
+    h = (hour_key or "").strip()
+    return h[:6] if _RE_HOUR_TAG.match(h) else h
+
+
 def detect_format(root: str) -> str:
     """采样一个叶子的 index.jsonl 首条，判断 'native' / 'newapi' / 'unknown' / 'empty'。"""
     root_path = Path(root)

@@ -161,6 +161,21 @@ def init_db(db_dir: str):
             _conn.execute(
                 "ALTER TABLE leaf_status ADD COLUMN sync_rowid INTEGER NOT NULL DEFAULT -1"
             )
+        # 迁移：归档标记。备份把叶子内容上传 OBS 并删除本地目录后置 1。
+        # 两个用途：
+        #   1) session_worker 的「待补算」查询会过滤 archived=0 —— 否则这些叶子
+        #      永远被判为落后（leaf_path 非空但目录已不存在），recompute_leaf 在
+        #      os.path.isdir 处返回 False，每轮空转重试、永不收敛。
+        #   2) stats_index.refresh_index 对归档叶子直接沿用缓存的 stats_json，
+        #      不触盘（触盘会让统计被清零，见 stats_index 注释）。
+        if "archived" not in cols:
+            _conn.execute(
+                "ALTER TABLE leaf_status ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+            )
+        if "archived_at" not in cols:
+            _conn.execute(
+                "ALTER TABLE leaf_status ADD COLUMN archived_at TEXT NOT NULL DEFAULT ''"
+            )
         _conn.commit()
 
 
@@ -489,13 +504,16 @@ def bulk_get_stats(root_id: str) -> List[dict]:
 
     只选统计需要的列，不走 bulk_get 的 SELECT *（省序列化）。返回每行 dict：
     dir_key, leaf_path, idx_size, idx_mtime, stats_json, stats_threshold, token_stats_json。
+
+    带出 archived 但不做过滤：归档叶子仍要参与 /sessions 的统计（内容在 OBS，
+    快照还在库里），只是 refresh_index 不再为它触盘。
     """
     if not _ready():
         return []
     with _lock:
         rows = _conn.execute(
             "SELECT dir_key, leaf_path, idx_size, idx_mtime, stats_json, stats_threshold, "
-            "sessions, token_stats_json, stats_sync_rowid, sync_rowid "
+            "sessions, token_stats_json, stats_sync_rowid, sync_rowid, archived "
             "FROM leaf_status WHERE root_id = ? ORDER BY dir_key", (root_id,)
         ).fetchall()
     return [dict(r) for r in rows]
@@ -538,6 +556,11 @@ def stale_stats_leaves(limit: int = 100) -> List[dict]:
     代价：全表读 4709 行 + 解析 JSON 约 0.03s（本地库），每轮只做一次。
 
     排序：水位差距大的优先，其次按会话数规模。
+
+    过滤 archived=0：备份归档（上传 OBS 后删了本地目录）的叶子没有可读的数据源，
+    recompute_leaf 会在 os.path.isdir 处直接返回 False，若不过滤就会每轮被重新
+    捞出来空转重试、永不收敛。备份侧写标记、本进程下一轮自己读到（同一个 WAL
+    库），这就是「通知 session worker」的机制。
     """
     if not _ready():
         return []
@@ -545,7 +568,7 @@ def stale_stats_leaves(limit: int = 100) -> List[dict]:
         rows = _conn.execute(
             "SELECT root_id, dir_key, leaf_path, idx_size, idx_mtime, sessions, "
             "stats_json, stats_sync_rowid, sync_rowid "
-            "FROM leaf_status WHERE leaf_path != ''"
+            "FROM leaf_status WHERE leaf_path != '' AND archived = 0"
         ).fetchall()
 
     out: List[dict] = []
@@ -572,13 +595,17 @@ def stale_stats_leaves(limit: int = 100) -> List[dict]:
 
 
 def count_stale_stats_leaves() -> int:
-    """需补算叶子的总数，供 worker 启动日志/进度展示。"""
+    """需补算叶子的总数，供 worker 启动日志/进度展示。
+
+    与 stale_stats_leaves 同口径，必须一起排除 archived，否则启动日志里的
+    「剩余 N 个落后」永远不归零。
+    """
     if not _ready():
         return 0
     with _lock:
         rows = _conn.execute(
             "SELECT sessions, stats_json, stats_sync_rowid, sync_rowid "
-            "FROM leaf_status WHERE leaf_path != ''"
+            "FROM leaf_status WHERE leaf_path != '' AND archived = 0"
         ).fetchall()
     n = 0
     for r in rows:
@@ -597,6 +624,88 @@ def count_stale_stats_leaves() -> int:
         if total != (r["sessions"] or 0):
             n += 1
     return n
+
+
+# ── 归档标记（备份上传 OBS 后删本地）─────────────────────────────────────
+
+
+def mark_archived(leaf_paths, archived: bool = True) -> int:
+    """按叶子绝对路径批量打/取消归档标记，返回命中行数。
+
+    备份侧删掉本地目录后调用。匹配用 normpath 归一化后的 leaf_path ——
+    backup_dirs.dir_path（env_name/mtime_tag）与 leaf_status 的
+    (root_id, dir_key) 不是一一对应（logs_all 的 env_name 是目录名，leaf_status
+    的 root_id 是路径 md5 或 'default'），只有绝对路径两边都能算出来。
+    """
+    if not _ready():
+        return 0
+    paths = [os.path.normpath(p) for p in (leaf_paths or []) if p]
+    if not paths:
+        return 0
+    flag = 1 if archived else 0
+    stamp = _now() if archived else ""
+    n = 0
+    with _lock:
+        for p in paths:
+            cur = _conn.execute(
+                "UPDATE leaf_status SET archived = ?, archived_at = ? WHERE leaf_path = ?",
+                (flag, stamp, p),
+            )
+            n += cur.rowcount or 0
+        _conn.commit()
+    return n
+
+
+def mark_archived_by_root(root_id: str, dir_keys, archived: bool = True) -> int:
+    """给 leaf_path 为空的存量叶子按 (root_id, dir_key) 打标记。
+
+    兜底路径：早期登记的叶子没回填 leaf_path，只有 root_id/dir_key。
+    """
+    if not _ready() or not root_id:
+        return 0
+    keys = [k for k in (dir_keys or []) if k]
+    if not keys:
+        return 0
+    flag = 1 if archived else 0
+    stamp = _now() if archived else ""
+    n = 0
+    with _lock:
+        for k in keys:
+            cur = _conn.execute(
+                "UPDATE leaf_status SET archived = ?, archived_at = ? "
+                "WHERE root_id = ? AND dir_key = ? AND leaf_path = ''",
+                (flag, stamp, root_id, k),
+            )
+            n += cur.rowcount or 0
+        _conn.commit()
+    return n
+
+
+def count_archived_leaves() -> int:
+    """已归档叶子数（供 worker 启动日志/备份页展示）。"""
+    if not _ready():
+        return 0
+    with _lock:
+        row = _conn.execute(
+            "SELECT COUNT(*) AS c FROM leaf_status WHERE archived = 1"
+        ).fetchone()
+    return row["c"] if row else 0
+
+
+def all_leaf_rows(include_archived: bool = True) -> List[dict]:
+    """跨全部 root 的轻量全表读，供备份时间轴聚合。
+
+    只取聚合需要的列（不读 stats_json，避免序列化 4700 行大字段）。
+    """
+    if not _ready():
+        return []
+    sql = ("SELECT root_id, dir_key, leaf_path, sessions, idx_mtime, archived "
+           "FROM leaf_status")
+    if not include_archived:
+        sql += " WHERE archived = 0"
+    with _lock:
+        rows = _conn.execute(sql).fetchall()
+    return [dict(r) for r in rows]
 
 
 def update_sync_rowid(leaf_path: str, rowid: int) -> int:
