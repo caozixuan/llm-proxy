@@ -1,33 +1,10 @@
-# OBS 同步配置
-# 用法: sync config settings/obs_base.yaml
-
-# OBS base 路径（必填）
-obs_base: obs://s3-asset-b-hd-cce-aifm-nlp-exp/raw/proxy/
-
-# 同步间隔（秒），默认 600（10分钟）
-interval: 600
-
-# ── 并发度（三个语义独立的键，不要再合并成一个 workers）────────────────
-# 以前这里只有一个 workers: 20，同时被当成「评估并行度 / 复制线程数 / 上传默认」，
-# 改任何一个都会连带改其他两个，且让 export_routes 里的代码默认值永远失效。
-
-# 导出/质检时每个 mtime 目录内的评估并行度（进程池大小）。默认 8。
-export_workers: 8
-
-# 同时处理几个 mtime 目录。默认 4。
-# 总并行单元 = export_dir_workers × export_workers = 4 × 8 = 32。
-export_dir_workers: 4
-
-# 上传时 obsutil 的文件并发（传给 tools/obs_upload.sh 的第 3 个参数）。默认 8。
-# 注意：旧版此处的 `workers` 曾被备份页（backup_routes / obs_sync）使用，
-# 那些路径仍各自读 `workers` 或回退 4，不受本键影响。
-upload_jobs: 8
-
-# 复制三元组文件到本地产物目录的线程数（NFS 本地 IO）。留空/0 = 跟随 export_workers。
+auto_backup_check_interval: 120
+auto_backup_disk_percent: 70.0
+auto_backup_enabled: false
 copy_threads: 8
-
-# 上传超时（秒），默认 3600
+export_dir_workers: 4
+export_workers: 8
+interval: 600
+obs_base: obs://s3-asset-b-hd-cce-aifm-nlp-exp/raw/proxy/
+upload_jobs: 8
 upload_timeout: 3600
-
-# 自定义上传脚本路径（可选），默认使用 obs_utils
-# upload_script: /path/to/upload.sh

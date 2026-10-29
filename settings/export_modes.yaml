@@ -81,6 +81,16 @@ modes:
     processor: "utils.eval.reformat_jiuwen:jiuwen_reformat_export"
     public: true
 
+  jiuwenswarm_dev:
+    label: "Jiuwenswarm 开发导出（快照分支聚合+权重+reasoning 回填）"
+    mode_label: "Jiuwenswarm 导出"
+    step: "Jiuwenswarm 聚合"
+    obs_sub: "session_analysis_jiuwenswarm"
+    local_dir: "logs_session_analysis_jiuwenswarm"
+    pipeline: "reformat"
+    processor: "utils.eval.reformat_jiuwenswarm:jiuwenswarm_export"
+    public: true
+
   eval:
     label: "质检模式（reformat+分析，出报告）"
     mode_label: "质检"

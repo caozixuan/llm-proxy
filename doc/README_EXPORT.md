@@ -8,7 +8,7 @@
 
 ## 概览
 
-Session 导出/质检模块提供 Web 界面，用于将 LLM 代理日志从本地 mtime 目录导出到结构化的 session 文件，并可选地进行质量检测（reformat + 分析 + 报告）。**当前实现**支持 6 种模式（export / reformat / reconstruct / full_reformat / jiuwen_reformat / eval），共享统一的后端任务引擎和前端轮询机制。
+Session 导出/质检模块提供 Web 界面，用于将 LLM 代理日志从本地 mtime 目录导出到结构化的 session 文件，并可选地进行质量检测（reformat + 分析 + 报告）。**当前实现**支持 7 种模式（export / reformat / reconstruct / full_reformat / jiuwen_reformat / jiuwenswarm_dev / eval），共享统一的后端任务引擎和前端轮询机制。
 
 > **模式清单已配置化**：全部模式的 id / 名称 / OBS 子前缀 / 本地落盘目录 / processor /
 > analyze / 格式限制 / 公开可见性都来自 `settings/export_modes.yaml`，网页端
@@ -166,6 +166,28 @@ hermes 重构聚合：`reconstruct_and_export` 逐 session 聚合**多个** trac
 落 `logs_session_analysis_jiuwen/`，OBS `session_analysis_jiuwen/`。与其他合并类模式平级，
 网页下拉、公开 `/export/submit`、离线 CLI 均已放开。
 
+### Jiuwenswarm 开发导出 (mode="jiuwenswarm_dev")
+
+`jiuwenswarm_export` 把 trace 文件转成**带 assistant 权重的 OpenAI chat 训练记录**：
+保留最大可证明快照分支、从原始 response 回填历史 reasoning，产物 schema 为
+`jiuwen.segment.weighted.openai.v3`。落 `logs_session_analysis_jiuwenswarm/`，
+OBS `session_analysis_jiuwenswarm/`。与其他合并类模式平级，网页下拉、公开
+`/export/submit`、离线 CLI 均已放开。
+
+产物布局（聚合模式）：
+
+```
+<local_base>/segments/<namespace>/<sha256>.json   每条会话一个加权记录
+<local_base>/manifests/<namespace>.jsonl          逐条清单
+<local_base>/manifests/<namespace>.summary.json   aggregation_stats / trajectory_types
+<local_base>/session_index.jsonl                  引擎收尾补写的会话清单
+```
+
+处理器声明了 `file_dirs` 形参，因此引擎的签名探测会放行**跨小时聚合**：整点切分只是
+存储桶、不是会话边界，勾选多个 mtime 目录 + `merge_hours` 时先合并会话再统一产出
+（`/export/submit?...&merge_hours=1` 同样支持）。被复制的采集会去重，独立重试保留。
+权重是候选权重（`task_outcome=unknown`），不代表任务成功判定。
+
 ### 手动质检 (POST /api/export/eval)
 
 从已有的导出记录创建 **新的** eval 记录，复制 `api_key`、`key_slot`、`mtime_dirs`，
@@ -206,6 +228,7 @@ _run_task(record_id, env_dir, env_key_name, obs_prefix, now_tag, mode, force=Fal
   │    reconstruct                         → reconstruct_and_export  (逐 session 聚合多个 trace)
   │    full_reformat                       → full_reformat_export    (trace_list 全部文件合并)
   │    jiuwen_reformat                     → jiuwen_reformat_export  (reasoning_content 回填)
+  │    jiuwenswarm_dev                    → jiuwenswarm_export      (快照分支聚合 + assistant 权重)
   │
   ├─ _run_task_inner(..., processor, evaluate_sessions, _run_upload_cmd, _log)
   │    ├─ local_base = temp_path/local_dir/env_key/slot/ex-tag，obs_sub 均取自配置
@@ -395,6 +418,7 @@ Modal 里可选「保存为草稿」（start=False）→ 只建 draft 记录，�
 | `utils/eval/reconstruct.py` | 重构聚合（多 trace 去重/保留分支/回填 reasoning） |
 | `utils/eval/reformat_full.py` | 全量导出（trace_list 全部文件合并） |
 | `utils/eval/reformat_jiuwen.py` | 九问导出（reasoning_content 回填重构） |
+| `utils/eval/reformat_jiuwenswarm.py` | Jiuwenswarm 开发导出（快照分支聚合 + 权重 + reasoning 回填） |
 | `utils/eval/eval.py` | 统计聚合 + Markdown 报告生成 |
 | `utils/eval/quality_rules.py` | 质量检测规则 |
 | `utils/obs_sync.py` | OBS 上传工具函数 |

@@ -2272,7 +2272,7 @@ def register_export_routes(app: FastAPI, logs_dir: str) -> None:
 
     @app.get("/export/submit")
     def public_export_submit(key: str = "", model: str = "", export_name: str = "",
-                             mode: str = "",
+                             mode: str = "", merge_hours: bool = False,
                              access_key: str = Query(default="", alias="access-key")):
         """按给定 key 正式导出：创建真实导出任务（export_records），显示名用 export_name。
 
