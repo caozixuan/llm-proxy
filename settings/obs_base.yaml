@@ -1,6 +1,11 @@
 auto_backup_check_interval: 120
 auto_backup_disk_percent: 70.0
 auto_backup_enabled: false
+backup_auto_delete: true
+backup_auto_submit: false
+backup_retain_days: 7
+backup_submit_batch: 20
+backup_submit_min_age_days: 7
 copy_threads: 8
 export_dir_workers: 4
 export_workers: 8

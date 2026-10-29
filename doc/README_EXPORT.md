@@ -168,24 +168,34 @@ hermes 重构聚合：`reconstruct_and_export` 逐 session 聚合**多个** trac
 
 ### Jiuwenswarm 开发导出 (mode="jiuwenswarm_dev")
 
-`jiuwenswarm_export` 把 trace 文件转成**带 assistant 权重的 OpenAI chat 训练记录**：
-保留最大可证明快照分支、从原始 response 回填历史 reasoning，产物 schema 为
-`jiuwen.segment.weighted.openai.v3`。落 `logs_session_analysis_jiuwenswarm/`，
-OBS `session_analysis_jiuwenswarm/`。与其他合并类模式平级，网页下拉、公开
-`/export/submit`、离线 CLI 均已放开。
+`jiuwenswarm_export` 把每个 trace 文件转成一条**带 assistant 权重的 OpenAI chat
+训练记录**：请求历史里 assistant 消息权重为 0，当前响应用候选权重（成功且未截断时
+`response_weight`，否则 0）。产物 schema 为 `jiuwen.request.weighted.openai.v2`。
+落 `logs_session_analysis_jiuwenswarm/`，OBS `session_analysis_jiuwenswarm/`。
+与其他合并类模式平级，网页下拉、公开 `/export/submit`、离线 CLI 均已放开。
 
-产物布局（聚合模式）：
+产物布局：
 
 ```
-<local_base>/segments/<namespace>/<sha256>.json   每条会话一个加权记录
+<local_base>/requests/<namespace>/<sha256>.json   一条请求一条加权记录
 <local_base>/manifests/<namespace>.jsonl          逐条清单
-<local_base>/manifests/<namespace>.summary.json   aggregation_stats / trajectory_types
+<local_base>/manifests/<namespace>.summary.json   trajectory_types / results
 <local_base>/session_index.jsonl                  引擎收尾补写的会话清单
 ```
 
-处理器声明了 `file_dirs` 形参，因此引擎的签名探测会放行**跨小时聚合**：整点切分只是
-存储桶、不是会话边界，勾选多个 mtime 目录 + `merge_hours` 时先合并会话再统一产出
-（`/export/submit?...&merge_hours=1` 同样支持）。被复制的采集会去重，独立重试保留。
+**逐请求、无全局聚合**：每条 trace 独立转换，互不依赖，因此可以完全并行。
+并发走 `utils.eval.pool.make_task_executor` 的**进程池**——转换是
+「json.loads → 规范化 → json.dumps」，纯 Python 编解码不释放 GIL，线程池没有收益
+（实测线程 ×8 仅 1.7x，进程池 ×8 达 7.9x、×16 达 14x）。
+
+处理器声明了 `file_dirs` 形参，因此引擎的签名探测会放行**跨小时合并**：整点切分只是
+存储桶，勾选多个 mtime 目录 + `merge_hours` 时先把同一段对话的各小时片段并成一条会话
+（`/export/submit?...&merge_hours=1` 同样支持），再逐文件导出。
+
+**成本特征**：输入 = 该 key 的全部 trace 文件，不按 mtime 过滤时体量可能很大
+（跨 12 小时的 key 实测 8 万文件 / 33GB）。建议按 `--mtime` 分批或用
+`tools/offline_reformat_export.py --key ... --mtime ...` 限定范围。
+
 权重是候选权重（`task_outcome=unknown`），不代表任务成功判定。
 
 ### 手动质检 (POST /api/export/eval)
@@ -228,7 +238,7 @@ _run_task(record_id, env_dir, env_key_name, obs_prefix, now_tag, mode, force=Fal
   │    reconstruct                         → reconstruct_and_export  (逐 session 聚合多个 trace)
   │    full_reformat                       → full_reformat_export    (trace_list 全部文件合并)
   │    jiuwen_reformat                     → jiuwen_reformat_export  (reasoning_content 回填)
-  │    jiuwenswarm_dev                    → jiuwenswarm_export      (快照分支聚合 + assistant 权重)
+  │    jiuwenswarm_dev                    → jiuwenswarm_export      (逐请求转换 + assistant 权重)
   │
   ├─ _run_task_inner(..., processor, evaluate_sessions, _run_upload_cmd, _log)
   │    ├─ local_base = temp_path/local_dir/env_key/slot/ex-tag，obs_sub 均取自配置
@@ -418,7 +428,7 @@ Modal 里可选「保存为草稿」（start=False）→ 只建 draft 记录，�
 | `utils/eval/reconstruct.py` | 重构聚合（多 trace 去重/保留分支/回填 reasoning） |
 | `utils/eval/reformat_full.py` | 全量导出（trace_list 全部文件合并） |
 | `utils/eval/reformat_jiuwen.py` | 九问导出（reasoning_content 回填重构） |
-| `utils/eval/reformat_jiuwenswarm.py` | Jiuwenswarm 开发导出（快照分支聚合 + 权重 + reasoning 回填） |
+| `utils/eval/reformat_jiuwenswarm.py` | Jiuwenswarm 开发导出（逐请求转换 + assistant 权重） |
 | `utils/eval/eval.py` | 统计聚合 + Markdown 报告生成 |
 | `utils/eval/quality_rules.py` | 质量检测规则 |
 | `utils/obs_sync.py` | OBS 上传工具函数 |

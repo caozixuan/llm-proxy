@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, wait
 from copy import deepcopy
 import hashlib
 import json
@@ -438,353 +438,6 @@ def validate_record(record):
     return True
 
 
-def _without_cache(value):
-    if isinstance(value, dict):
-        return {k: _without_cache(v) for k, v in value.items() if k != "cache_control"}
-    if isinstance(value, list):
-        return [_without_cache(v) for v in value]
-    return value
-
-
-def _message_identity(message):
-    """Match visible content like reformat_jiuwen; ignore only known metadata."""
-    value = {k: deepcopy(v) for k, v in message.items() if k not in {"weight", "reasoning_content"}}
-    for call in value.get("tool_calls", []):
-        function = call["function"]
-        try:
-            arguments = json.loads(function["arguments"])
-        except (ValueError, TypeError):
-            continue
-        if call.get("id") and isinstance(arguments, dict):
-            # Jiuwen omits this runtime-only field when carrying tool history.
-            arguments.pop("call_goal", None)
-        function["arguments"] = canonical(arguments)
-    return digest(_without_cache(value))
-
-
-def _transient(message):
-    return (message.get("role") == "user" and isinstance(message.get("content"), str)
-            and message["content"].lstrip().startswith("<system-reminder>"))
-
-
-def _record_order(record):
-    source = record["meta_info"]["unique_info"]["source"]
-    return (source.get("filename", ""), source.get("source_path", ""),
-            source.get("log_dir", ""), record["id"])
-
-
-def _prepare_records(records):
-    """Order all hourly buckets together and remove only copied captures.
-
-    The original filename remains part of capture identity: equal prompts or
-    equal answers under different filenames may be independent API calls.
-    JSON serialization and download paths do not define generation identity.
-    """
-    unique, aliases = {}, {}
-    for record in sorted(records, key=_record_order):
-        info = record["meta_info"]["unique_info"]
-        source = info["source"]
-        capture_key = digest([source.get("filename") or record["id"], info["request"],
-            info["source_messages"], info["response"], info.get("raw_response"),
-            {k: source.get(k) for k in ("format", "response_sha256", "stream_complete",
-                "capture_has_error", "response_status_source")},
-            record["messages"][info["current_response_index"]]["weight"]])
-        if capture_key not in unique:
-            primary = {**record, "meta_info": {**record["meta_info"], "unique_info": {
-                **info, "source": deepcopy(source)}}}
-            unique[capture_key] = primary
-        else:
-            primary = unique[capture_key]
-            provenance = primary["meta_info"]["unique_info"]["source"]
-            path = source.get("source_path")
-            if path and path != provenance.get("source_path"):
-                copies = provenance.setdefault("export_copies", [])
-                if path not in copies:
-                    copies.append(path)
-            provenance.setdefault("export_copy_sources", []).append({
-                "request_record_id": record["id"], "source": deepcopy(source)})
-        aliases[record["id"]] = primary["id"]
-    return list(unique.values()), aliases
-
-
-def aggregate_records(records):
-    """Keep maximal proven branches; backfill without overwriting existing reasoning.
-
-    Hourly inputs are sorted globally by original filename, not export folder.
-    Snapshot continuation requires a full prefix including a prior response,
-    never merely the first query or proxy user_id. Restoration uses unique
-    visible response content, scoped by identity and execution/query evidence.
-    """
-    input_count = len(records)
-    records, _ = _prepare_records(records)
-    nodes, leaves = [], []
-    indexed = defaultdict(list)
-    stats = Counter(input_requests=input_count, unique_input_requests=len(records),
-                    duplicate_export_copies=input_count - len(records))
-    for position, record in enumerate(records):
-        info = record["meta_info"]["unique_info"]
-        request = info["request"]
-        metadata = request.get("metadata") or {}
-        metadata = metadata if isinstance(metadata, dict) else {}
-        identity = metadata.get("user_id")
-        execution = metadata.get("harness_session_id", metadata.get("session_id", metadata.get("conversation_id")))
-        isolated = None if identity or execution else record["id"]
-        identity_scope = digest([identity, execution, isolated])
-        scope = digest([identity, execution, isolated, request.get("model"),
-                        _without_cache(request.get("system")), _without_cache(request.get("tools"))])
-        current = info["current_response_index"]
-        core = [(i, _message_identity(m)) for i, m in enumerate(record["messages"]) if not _transient(m)]
-        keys = [key for _, key in core]
-        output = record["messages"][current]
-        first_user = digest(next((m.get("content") for m in record["messages"]
-                                  if m["role"] == "user" and not _transient(m)), None))
-        anchored = bool(output.get("content") or output.get("tool_calls") or output.get("refusal"))
-        node = {"record": record, "position": position, "scope": scope, "identity_scope": identity_scope,
-                "first_user": first_user, "execution": execution, "core": core, "keys": keys,
-                "ancestors": [], "kind": info["trajectory_type"], "anchored": anchored}
-        candidates = [n for n in leaves if n["scope"] == scope and n["kind"] != "compaction"
-                      and node["kind"] != "compaction" and n["anchored"]
-                      and len(n["keys"]) <= len(keys) - 1 and n["keys"] == keys[:len(n["keys"])]]
-        if candidates:
-            length = max(len(n["keys"]) for n in candidates)
-            candidates = [n for n in candidates if len(n["keys"]) == length]
-        if len(candidates) == 1:
-            parent = candidates[0]
-            node["ancestors"] = [*parent["ancestors"], parent]
-            leaves.remove(parent)
-            stats["absorbed_snapshots"] += 1
-            before = parent["record"]["meta_info"]["unique_info"]["source"]
-            after = info["source"]
-            before_directory = str(Path(before["source_path"]).parent) if before.get("source_path") else before.get("log_dir")
-            after_directory = str(Path(after["source_path"]).parent) if after.get("source_path") else after.get("log_dir")
-            if before_directory and after_directory and before_directory != after_directory:
-                stats["cross_directory_continuations"] += 1
-            hours = [re.match(r"^(\d{4}-\d\d-\d\d[_T]\d\d)", s.get("filename", ""))
-                     for s in (before, after)]
-            if all(hours) and hours[0][1] != hours[1][1]:
-                stats["cross_hour_continuations"] += 1
-        elif candidates:
-            stats["ambiguous_continuations"] += 1
-        leaves.append(node)
-        nodes.append(node)
-        if anchored:
-            indexed[(identity_scope, _message_identity(output))].append(node)
-
-    owned = set()
-    results = []
-    for leaf in sorted(leaves, key=lambda n: n["position"]):
-        result = deepcopy(leaf["record"])
-        info = result["meta_info"]["unique_info"]
-        original_id = result["id"]
-        ancestors = {len(n["keys"]) - 1: n for n in leaf["ancestors"]}
-        core_positions = {index: number for number, (index, _) in enumerate(leaf["core"])}
-        chain = [*leaf["ancestors"], leaf]
-        references = {n["record"]["id"]: n for n in chain}
-        reasoning_sources = {}
-        used = []
-        for index, (message, annotation) in enumerate(zip(result["messages"], info["message_annotations"])):
-            if message["role"] != "assistant":
-                continue
-            current = index == info["current_response_index"]
-            source = leaf if current else ancestors.get(core_positions.get(index))
-            if source is None:
-                options = [n for n in indexed[(leaf["identity_scope"], _message_identity(message))]
-                           if n["position"] < leaf["position"] and (message.get("tool_calls")
-                                or leaf["execution"] or n["first_user"] == leaf["first_user"])]
-                if len(options) == 1:
-                    source = options[0]
-                elif options:
-                    stats["ambiguous_backfill_occurrences"] += 1
-            message["weight"] = 0.0
-            if source is None:
-                annotation["weight_reason"] = "unmatched_carried_context"
-                stats["unmatched_history_assistants"] += 1
-                continue
-            source_record = source["record"]
-            source_info = source_record["meta_info"]["unique_info"]
-            generated = source_record["messages"][source_info["current_response_index"]]
-            if _message_identity(generated) != _message_identity(message):
-                raise ValueError("Aggregate response position does not match selected history")
-            generation_id = source_record["id"]
-            references[generation_id] = source
-            annotation["generation_id"] = generation_id
-            annotation["source_request_id"] = generation_id
-            annotation["match_basis"] = ("current_response" if current else "proven_snapshot_prefix" if source in leaf["ancestors"]
-                                         else "unique_tool_identity" if message.get("tool_calls") else "unique_visible_content_with_context")
-            expected, existing = generated.get("reasoning_content", ""), message.get("reasoning_content", "")
-            native = source_info["response"]
-            native_blocks = native.get("content", [])
-            if not current and (expected or (isinstance(native_blocks, list) and any(
-                    isinstance(b, dict) and b.get("type") in REASONING_BLOCK_TYPES for b in native_blocks))):
-                reasoning_sources[generation_id] = deepcopy(native)
-            if expected and not existing:
-                message["reasoning_content"] = expected
-                annotation["reasoning_backfilled"] = True
-                stats["reasoning_backfilled_messages"] += 1
-                stats["reasoning_backfilled_characters"] += len(expected)
-            if expected and existing and expected != existing:
-                annotation["weight_reason"] = "reasoning_conflict_preserved"
-                stats["reasoning_conflicts"] += 1
-            elif generation_id in owned:
-                annotation["weight_reason"] = "already_trained_carried_generation"
-                stats["repeated_generations_masked"] += 1
-            elif generated["weight"] > 0:
-                message["weight"] = generated["weight"]
-                annotation["weight_reason"] = "first_generation_occurrence"
-                owned.add(generation_id)
-                used.append(generation_id)
-                stats["trainable_generations"] += 1
-            else:
-                annotation["weight_reason"] = "source_response_not_trainable"
-        info["schema"] = AGGREGATE_SCHEMA
-        info["aggregation"] = "maximal_proven_snapshot_branches_with_reasoning_backfill"
-        info["selected_request_id"] = original_id
-        info["absorbed_request_ids"] = [n["record"]["id"] for n in leaf["ancestors"]]
-        info["source_requests"] = [{"id": key, "source": deepcopy(n["record"]["meta_info"]["unique_info"]["source"]),
-                                    "candidate_weight": n["record"]["messages"][-1]["weight"]}
-                                   for key, n in sorted(references.items(), key=lambda item: item[1]["position"])]
-        # Backfill sources keep native blocks/signatures, not repeated full inputs.
-        info["backfill_responses"] = reasoning_sources
-        info["trainable_generation_ids"] = used
-        info["weight_policy"]["scope"] = "unique_original_generation_once_across_segments"
-        info["weight_policy"]["history_assistant"] = "matched_generation_candidate_else_zero"
-        result["id"] = digest([AGGREGATE_SCHEMA, original_id, info["absorbed_request_ids"]])
-        validate_record(result)
-        results.append(result)
-    stats["output_segments"] = len(results)
-    return results, dict(stats)
-
-
-def _aggregate_export(src_dir, out_dir, session_entries, api_key, workers, progress_cb,
-                      log_dir, should_cancel, on_session_done, response_weight,
-                      compression_weight, retain_raw_response, source_directories=None,
-                      file_dirs=None):
-    src, out = Path(src_dir).resolve(), Path(out_dir).resolve()
-    if not src.is_dir():
-        raise ValueError("Source directory does not exist")
-    if out == src or out.is_relative_to(src):
-        raise ValueError("Export output must not be inside the source directory")
-    stop, log = should_cancel or (lambda: False), progress_cb or (lambda message: None)
-    entries = [s for s in session_entries if not api_key or s.get("api_key") == api_key]
-    result = {"total_sessions": len(entries), "total_files": 0, "errors": [], "results": [], "cancelled": False}
-    if stop():
-        result["cancelled"] = True
-        return result
-    namespace = digest([str(src), log_dir or src.name, AGGREGATE_SCHEMA])[:24]
-    manifest = out / "manifests" / (namespace + ".jsonl")
-    manifest.parent.mkdir(parents=True, exist_ok=True)
-    jobs = defaultdict(list)
-    directories = {}
-    # 源目录解析：优先 file_dirs（跨小时合并后同一会话的 trace 可能分散在多个叶子，
-    # 只能按文件名逐个定位）；其次 source_directories（离线 CLI 多 input-dir 时按目录
-    # 逐个成组）；最后退回 src_dir。
-    resolved_file_dirs = {name: Path(where).resolve()
-                          for name, where in (file_dirs or {}).items() if where}
-    for index, session in enumerate(entries):
-        directories[index] = Path(source_directories[index]).resolve() if source_directories else src
-        names = trace_names(session)
-        if not names:
-            result["errors"].append({"session_index": index, "error": "no_trace_files"})
-        for name in names:
-            jobs[(resolved_file_dirs.get(name, directories[index]), name)].append(index)
-    loaded = {}
-    processed = set()
-
-    def load(directory, name):
-        document, source = load_source(directory, name)
-        source["log_dir"] = str(directory) if source_directories or resolved_file_dirs else log_dir or src.name
-        return convert_document(document, source=source, response_weight=response_weight,
-                                compression_weight=compression_weight, retain_raw_response=retain_raw_response)
-
-    # Reserve the namespace before work, including partial failures/cancellations.
-    with manifest.open("x", encoding="utf-8") as stream:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {}
-            for key in sorted(jobs, key=lambda key: (key[1], str(key[0]))):
-                if stop():
-                    result["cancelled"] = True
-                    break
-                futures[pool.submit(load, *key)] = key
-            for future in as_completed(futures):
-                if stop():
-                    result["cancelled"] = True
-                    for pending in futures:
-                        pending.cancel()
-                if future.cancelled():
-                    continue
-                key = futures[future]
-                processed.add(key)
-                try:
-                    loaded[key] = future.result()
-                except Exception as exc:
-                    result["errors"].append({"filename": key[1], "source_dir": str(key[0]), "error_type": type(exc).__name__, "error": str(exc)})
-        prepared, aliases = _prepare_records(list(loaded.values()))
-        owners = defaultdict(set)
-        for key, record in loaded.items():
-            owners[aliases[record["id"]]].update(jobs[key])
-        records, stats = aggregate_records(prepared)
-        stats["duplicate_export_copies"] = len(loaded) - len(prepared)
-        stats["input_requests"] = len(loaded)
-        result["aggregation_stats"] = stats
-        types = Counter()
-        outputs = defaultdict(list)
-        for record in records:
-            if stop():
-                result["cancelled"] = True
-                break
-            info = record["meta_info"]["unique_info"]
-            path = out / "segments" / namespace / (record["id"] + ".json")
-            write_json(path, record)
-            names = {r["source"]["filename"] for r in info["source_requests"]}
-            item = {"id": record["id"], "filename": info["source"]["filename"],
-                    "output_file": str(path.relative_to(out)).replace("\\", "/"),
-                    "source_files": sorted(names), "trajectory_type": info["trajectory_type"]}
-            stream.write(json.dumps(item, ensure_ascii=False) + "\n")
-            stream.flush()
-            indexes = {index for ref in info["source_requests"] for index in owners[ref["id"]]}
-            for index in indexes:
-                outputs[index].append(item["output_file"])
-            result["total_files"] += 1
-            types[info["trajectory_type"]] += 1
-        result["trajectory_types"] = dict(types)
-    for index, files in sorted(outputs.items()):
-        session = entries[index]
-        result["results"].append({"session": session.get("first_ts", session.get("_key", "")),
-            "first_ts": session.get("first_ts"), "last_ts": session.get("last_ts"),
-            "_key": session.get("_key", session.get("first_ts", "")), "latest_file": session.get("latest_file"),
-            "log_dir": log_dir or src.name, "api_call_count": len(trace_names(session)),
-            "request_files": sorted(set(files)), "models": session.get("models", []),
-            "training_eligibility": "pending_offline_task_association"})
-    # 兜底：聚合把多条会话并成了一个 segment 时，owners 有可能映射不到任何 session
-    # （例如整段内容都来自被去重的复制采集），于是 results 空而 total_files 非空。
-    # 导出引擎用 `not all_results` 判「无 session 数据 → 任务失败」，这里补出条目，
-    # 避免明明写出了 segment 却被判失败。
-    if result["total_files"] and not result["results"]:
-        log(f"Jiuwen compact export: {result['total_files']} segments produced but no session "
-            f"could be attributed; emitting {len(entries)} placeholder result(s)")
-        for index, session in enumerate(entries):
-            result["results"].append({"session": session.get("first_ts", session.get("_key", "")),
-                "first_ts": session.get("first_ts"), "last_ts": session.get("last_ts"),
-                "_key": session.get("_key", session.get("first_ts", "")),
-                "latest_file": session.get("latest_file"),
-                "log_dir": log_dir or src.name, "api_call_count": len(trace_names(session)),
-                "request_files": [], "models": session.get("models", []),
-                "training_eligibility": "pending_offline_task_association",
-                "attribution": "unresolved"})
-    if on_session_done:
-        for index, session in enumerate(entries):
-            if not result["cancelled"] or all((directories[index], name) in processed for name in trace_names(session)):
-                try:
-                    on_session_done()
-                except Exception:
-                    pass
-    result["input_requests"] = len(loaded)
-    result["manifest"] = str(manifest)
-    log(f"Jiuwen compact export: {len(loaded)} requests -> {result['total_files']} segments; {stats.get('reasoning_backfilled_messages', 0)} reasoning backfills")
-    write_json(out / "manifests" / (namespace + ".summary.json"), result)
-    return result
-
-
 def load_source(src_dir: Path, filename: str):
     """Reuse the service loader, including native triplets and new-api SSE."""
     if not filename or Path(filename).name != filename or "/" in filename or "\\" in filename or ":" in filename:
@@ -845,6 +498,7 @@ def load_source(src_dir: Path, filename: str):
 
 
 def write_json(path, record):
+    """原子写：先写同目录临时文件再 os.replace，避免半成品文件被下游读到。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     try:
@@ -860,6 +514,7 @@ def write_json(path, record):
 
 
 def trace_names(session):
+    """一个 session 要导出的 trace 文件名；trace_list 为空时回退 latest_file。"""
     values = [t["filename"] for t in session.get("trace_list", []) or []
               if isinstance(t, dict) and t.get("filename")]
     if not values and session.get("latest_file"):
@@ -867,16 +522,23 @@ def trace_names(session):
     return sorted(set(values))
 
 
-def _one(src, out, namespace, name, provenance, response_weight, compression_weight, retain_raw_response):
-    document, source = load_source(src, name)
+def _one(src, out, namespace, name, provenance, response_weight, compression_weight,
+         retain_raw_response):
+    """进程池 worker：一个 trace 文件 -> 一条加权记录。
+
+    模块级函数（进程池要 pickle 它），入参全是可 pickle 的基础类型。
+    """
+    document, source = load_source(Path(src), name)
     source.update(provenance)
     record = convert_document(document, source=source, response_weight=response_weight,
-                              compression_weight=compression_weight, retain_raw_response=retain_raw_response)
-    path = out / "requests" / namespace / (record["id"] + ".json")
+                              compression_weight=compression_weight,
+                              retain_raw_response=retain_raw_response)
+    path = Path(out) / "requests" / namespace / (record["id"] + ".json")
     write_json(path, record)
     info = record["meta_info"]["unique_info"]
     assistant = record["messages"][info["current_response_index"]]
-    return {"id": record["id"], "filename": name, "output_file": str(path.relative_to(out)).replace("\\", "/"),
+    return {"id": record["id"], "filename": name,
+            "output_file": str(path.relative_to(Path(out))).replace("\\", "/"),
             "trajectory_type": info["trajectory_type"], "candidate_weight": assistant["weight"],
             "source_sha256": source["source_sha256"]}
 
@@ -885,52 +547,60 @@ def jiuwenswarm_export(src_dir, out_dir, session_entries, api_key=None, workers=
                        progress_cb=None, log_dir=None, should_cancel=None,
                        on_session_done=None, file_dirs=None,
                        *, response_weight=None, compression_weight=None,
-                       retain_raw_response=True, aggregate=True):
-    """导出模式处理器入口：默认产出快照分支聚合记录；任务判定仍然推迟。
+                       retain_raw_response=True, aggregate=None):
+    """导出模式处理器入口：逐请求产出带 assistant 权重的记录。
 
     前 9 个形参与 reformat_and_analyze / reconstruct_and_export / jiuwen_reformat_export
     一致（见 test/test_processor_signatures.py 的硬性约束），外加：
 
-    file_dirs: filename -> 叶子目录。跨小时合并（merge_hours）时由引擎注入，用于在
+    file_dirs: filename -> 叶子目录。跨小时合并（merge_hours）时由引擎注入，用于
         会话被合并成一条后仍能按文件名找到散落在各叶子的源文件；逐目录导出时为 None。
-        声明了这个形参，引擎的签名探测才会允许本模式走跨小时聚合路径。
+        声明了这个形参，引擎的签名探测才会允许本模式走跨小时合并。
     response_weight / compression_weight: 候选权重，缺省读
         JIUWEN_EXPORT_ASSISTANT_WEIGHT / JIUWEN_EXPORT_COMPACTION_WEIGHT（默认 1）。
-    aggregate=False 退化为「每请求一条记录」的旧契约。
+    aggregate: 已废弃，接受但忽略 —— 全局聚合去掉后只有逐请求一种产出。
 
-    不做任务级成功推断，也不对相同 prompt 去重。
+    并发用进程池（utils.eval.pool.make_task_executor）：每个任务是
+    「读 JSON → 转换 → 写 JSON」，纯 Python 编解码不释放 GIL，线程池没有收益。
     """
     response_weight = validate_weight(os.getenv("JIUWEN_EXPORT_ASSISTANT_WEIGHT", "1") if response_weight is None else response_weight)
     configured = os.getenv("JIUWEN_EXPORT_COMPACTION_WEIGHT") if compression_weight is None else compression_weight
     compression_weight = response_weight if configured is None else validate_weight(configured)
     workers = max(1, min(int(workers), 32))
-    if aggregate:
-        return _aggregate_export(src_dir, out_dir, session_entries, api_key, workers, progress_cb,
-                                 log_dir, should_cancel, on_session_done, response_weight,
-                                 compression_weight, retain_raw_response, file_dirs=file_dirs)
+
     src, out = Path(src_dir).resolve(), Path(out_dir).resolve()
     if not src.is_dir():
         raise ValueError("Source directory does not exist")
     if out == src or out.is_relative_to(src):
         raise ValueError("Export output must not be inside the source directory")
-    entries = [s for s in session_entries if not api_key or s.get("api_key") == api_key]
     stop, log = should_cancel or (lambda: False), progress_cb or (lambda message: None)
-    result = {"total_sessions": len(entries), "total_files": 0, "errors": [], "results": [], "cancelled": False}
+    entries = [s for s in session_entries if not api_key or s.get("api_key") == api_key]
+    result = {"total_sessions": len(entries), "total_files": 0, "errors": [],
+              "results": [], "cancelled": False}
     if stop():
         result["cancelled"] = True
         return result
+
     namespace = digest([str(src), log_dir or src.name])[:24]
     manifest = out / "manifests" / (namespace + ".jsonl")
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    # Never replace an earlier export namespace, including a partial failed run.
-    stream = manifest.open("x", encoding="utf-8")
-    jobs, remaining, outputs = defaultdict(list), {}, defaultdict(list)
-    errors, completed = [], set()
+    resolved_file_dirs = {n: Path(w).resolve() for n, w in (file_dirs or {}).items() if w}
+
+    # 每个 trace 文件一个任务；同一文件被多条会话引用时只导出一次。
+    jobs, owners, remaining = {}, defaultdict(list), {}
     for index, session in enumerate(entries):
         names = trace_names(session)
         remaining[index] = len(names)
+        if not names:
+            result["errors"].append({"session_index": index, "error": "no_trace_files"})
         for name in names:
-            jobs[name].append(index)
+            jobs.setdefault(name, resolved_file_dirs.get(name, src))
+            owners[name].append(index)
+
+    n_jobs = len(jobs)
+    log(f"Jiuwenswarm 逐请求导出: {n_jobs} 个请求文件, {len(entries)} 个导出组, workers={workers}")
+
+    completed, outputs, types = set(), defaultdict(list), Counter()
 
     def notify(index):
         if index in completed:
@@ -944,64 +614,94 @@ def jiuwenswarm_export(src_dir, out_dir, session_entries, api_key=None, workers=
 
     for index, count in remaining.items():
         if count == 0:
-            errors.append({"session_index": index, "error": "no_trace_files"})
             notify(index)
-    log(f"Jiuwen per-request weighted export: {len(jobs)} unique requests, {len(entries)} export groups, workers={workers}")
-    types = Counter()
-    try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {}
-            for name, indexes in sorted(jobs.items()):
-                if stop():
-                    result["cancelled"] = True
-                    break
+
+    from utils.eval.pool import describe, make_task_executor
+    executor, pool_kind = make_task_executor(workers, n_jobs, label="jiuwenswarm")
+    log(describe(pool_kind))
+    # Never replace an earlier export namespace, including a partial failed run.
+    with manifest.open("x", encoding="utf-8") as stream:
+        try:
+            # 有界提交窗口：一个大叶子可能有 20 万+ trace 文件，一次性 submit 全部
+            # future 会让「提交」阶段本身就耗掉几分钟，期间主循环一行 manifest 都写
+            # 不出去（worker 却在闷头产出），进度看起来像卡死，内存也会被进度信息撑高。
+            # 只保持 workers×4 个在飞，完成一个补一个。
+            window = max(8, workers * 4)
+            pending, order = set(), sorted(jobs)
+            futures = {}          # future -> 请求文件名
+            cursor, number = 0, 0
+
+            def _submit(name):
                 groups = []
-                for index in indexes:
+                for index in owners[name]:
                     session = entries[index]
                     groups.append({"first_ts": session.get("first_ts", session.get("_key")),
                         "last_ts": session.get("last_ts"), "latest_file": session.get("latest_file"),
                         "trace_entries": [redact(t) for t in session.get("trace_list", []) or []
                                           if isinstance(t, dict) and t.get("filename") == name]})
                 provenance = {"log_dir": log_dir or src.name, "export_session_groups": groups}
-                futures[pool.submit(_one, src, out, namespace, name, provenance,
-                                    response_weight, compression_weight, retain_raw_response)] = name
-            for number, future in enumerate(as_completed(futures), 1):
-                if stop():
-                    result["cancelled"] = True
-                    for pending in futures:
-                        pending.cancel()
-                if future.cancelled():
-                    continue
-                name = futures[future]
-                try:
-                    item = future.result()
-                    stream.write(json.dumps(item, ensure_ascii=False) + "\n")
-                    stream.flush()
-                    types[item["trajectory_type"]] += 1
-                    result["total_files"] += 1
-                    for index in jobs[name]:
-                        outputs[index].append(item["output_file"])
-                except Exception as exc:
-                    errors.append({"filename": name, "error_type": type(exc).__name__, "error": str(exc)})
-                for index in jobs[name]:
-                    remaining[index] -= 1
-                    if remaining[index] == 0:
-                        notify(index)
-                if number % 100 == 0:
-                    log(f"Exported {result['total_files']}/{len(jobs)} requests; errors={len(errors)}")
-    finally:
-        stream.close()
+                future = executor.submit(_one, str(jobs[name]), str(out), namespace, name,
+                                         provenance, response_weight, compression_weight,
+                                         retain_raw_response)
+                futures[future] = name
+                return future
+
+            while cursor < len(order) and len(pending) < window and not stop():
+                pending.add(_submit(order[cursor]))
+                cursor += 1
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    if stop():
+                        result["cancelled"] = True
+                    if future.cancelled():
+                        continue
+                    name = futures.pop(future, None)
+                    if name is None:
+                        continue
+                    number += 1
+                    try:
+                        item = future.result()
+                        stream.write(json.dumps(item, ensure_ascii=False) + "\n")
+                        stream.flush()
+                        types[item["trajectory_type"]] += 1
+                        result["total_files"] += 1
+                        for index in owners[name]:
+                            outputs[index].append(item["output_file"])
+                    except Exception as exc:
+                        result["errors"].append({"filename": name,
+                                                 "error_type": type(exc).__name__,
+                                                 "error": str(exc)})
+                    for index in owners[name]:
+                        remaining[index] -= 1
+                        if remaining[index] == 0:
+                            notify(index)
+                    if number % 200 == 0 or number == n_jobs:
+                        log(f"已导出 {number}/{n_jobs} 个请求；错误 {len(result['errors'])}")
+                    if result["cancelled"]:
+                        continue
+                    if cursor < len(order):
+                        pending.add(_submit(order[cursor]))
+                        cursor += 1
+                if result["cancelled"]:
+                    for pending_future in pending:
+                        pending_future.cancel()
+                    break
+        finally:
+            executor.shutdown(wait=not result["cancelled"], cancel_futures=True)
+
     for index, files in sorted(outputs.items()):
         session = entries[index]
         result["results"].append({"session": session.get("first_ts", session.get("_key", "")),
             "first_ts": session.get("first_ts"), "last_ts": session.get("last_ts"),
-            "_key": session.get("_key", session.get("first_ts", "")), "latest_file": session.get("latest_file"),
+            "_key": session.get("_key", session.get("first_ts", "")),
+            "latest_file": session.get("latest_file"),
             "log_dir": log_dir or src.name, "api_call_count": len(trace_names(session)),
-            "request_files": sorted(files), "models": session.get("models", []),
+            "request_files": sorted(set(files)), "models": session.get("models", []),
             "training_eligibility": "pending_offline_task_association"})
-    result["errors"] = errors
     result["trajectory_types"] = dict(types)
     result["manifest"] = str(manifest)
+    log(f"Jiuwen weighted export: {n_jobs} requests -> {result['total_files']} records")
     write_json(out / "manifests" / (namespace + ".summary.json"), result)
     return result
 
@@ -1097,44 +797,22 @@ def main():
     for root in roots:
         for directory, names in discover(root).items():
             groups.setdefault(directory, set()).update(names)
-    if not args.per_request:
-        entries, directories = [], {}
-        for directory, names in sorted(groups.items()):
-            directories[len(entries)] = directory
-            entries.append({"first_ts": str(directory), "trace_list": [{"filename": name} for name in sorted(names)]})
-        response_weight = validate_weight(os.getenv("JIUWEN_EXPORT_ASSISTANT_WEIGHT", "1") if args.response_weight is None else args.response_weight)
-        configured = os.getenv("JIUWEN_EXPORT_COMPACTION_WEIGHT") if args.compression_weight is None else args.compression_weight
-        compression_weight = response_weight if configured is None else validate_weight(configured)
-        result = _aggregate_export(roots[0], out, entries, None, max(1, min(args.workers, 32)),
-            (lambda message: print(message, flush=True)) if args.verbose else None,
-            "offline:" + digest([str(root) for root in roots]), None, None, response_weight,
-            compression_weight, not args.omit_raw_response, source_directories=directories)
-        result.update(aggregation="maximal_proven_snapshot_branches_with_reasoning_backfill",
-                      task_association="deferred", weight_scope="assistant_only_unique_generation_weights")
-        write_json(out / "export_summary.json", result)
-        print(json.dumps({k: result[k] for k in ("total_files", "input_requests", "aggregation_stats", "errors")}, ensure_ascii=False, indent=2))
-        return 1 if result["errors"] else 0
-    results, errors = [], []
-    print(f"Selected {sum(len(names) for names in groups.values())} requests across {len(groups)} source directories", flush=True)
-    for number, (directory, names) in enumerate(sorted(groups.items()), 1):
-        session = {"first_ts": "offline-selection", "trace_list": [{"filename": name} for name in sorted(names)]}
-        result = jiuwenswarm_export(str(directory), str(out), [session], workers=args.workers,
-            progress_cb=(lambda message: print(message, flush=True)) if args.verbose else None, log_dir=str(directory),
-            response_weight=args.response_weight, compression_weight=args.compression_weight,
-            retain_raw_response=not args.omit_raw_response, aggregate=not args.per_request)
-        results.append({"source_dir": str(directory), "files": result["total_files"],
-                        "manifest": result["manifest"], "trajectory_types": result["trajectory_types"]})
-        errors.extend(result["errors"])
-        if number % 100 == 0 or number == len(groups):
-            print(f"Processed {number}/{len(groups)} source directories; errors={len(errors)}", flush=True)
-    summary = {"total_files": sum(r["files"] for r in results), "errors": errors,
-               "sources": results, "aggregation": "none" if args.per_request else "maximal_proven_snapshot_branches_with_reasoning_backfill", "task_association": "deferred",
-               "weight_scope": "assistant_only_candidate_weights"}
-    (out / "export_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"total_files": summary["total_files"], "error_count": len(errors),
-                      "source_directories": len(results), "summary": str(out / "export_summary.json")}, ensure_ascii=False))
-    return 1 if errors else 0
-
-
+    entries = []
+    for directory, names in sorted(groups.items()):
+        entries.append({"first_ts": str(directory),
+                        "trace_list": [{"filename": name} for name in sorted(names)]})
+    result = jiuwenswarm_export(roots[0], out, entries, None,
+        workers=max(1, min(args.workers, 32)),
+        progress_cb=(lambda message: print(message, flush=True)) if args.verbose else None,
+        log_dir="offline:" + digest([str(root) for root in roots]),
+        response_weight=args.response_weight, compression_weight=args.compression_weight,
+        retain_raw_response=not args.omit_raw_response,
+        file_dirs={f: str(d) for d, names in groups.items() for f in names})
+    result.update(aggregation="none_one_record_per_request",
+                  task_association="deferred", weight_scope="assistant_only_candidate_weights")
+    write_json(out / "export_summary.json", result)
+    print(json.dumps({k: result[k] for k in ("total_files", "errors", "trajectory_types")},
+                     ensure_ascii=False, indent=2))
+    return 1 if result["errors"] else 0
 if __name__ == "__main__":
     raise SystemExit(main())

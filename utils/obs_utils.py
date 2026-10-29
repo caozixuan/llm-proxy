@@ -322,6 +322,11 @@ def obsutil_object_size(obs_url: str, timeout: int = 30) -> Optional[int]:
 
     用于删除本地前的轻量复核：对**单个对象**跑一次 `obsutil ls`，秒级返回。
     不要用 `ls -du` 递归统计整个叶子 —— 实测单叶 80 万个对象要跑几分钟。
+
+    必须带 `-bf=raw`：默认输出把大小格式化成 2 位小数的可读值（如 "659.75KB"），
+    反推字节数会引入舍入误差（659.75*1024=675584，真实值 675579，差 5 字节）。
+    实测这会让每一个 >1KB 的哨兵都误判为「大小不符」，而文件本身其实完全一致。
+    `-bf=raw` 输出 "675579B"，精确无歧义。
     """
     if not obs_url or not os.path.isfile(OBSUTIL_BIN):
         return None
@@ -330,7 +335,7 @@ def obsutil_object_size(obs_url: str, timeout: int = 30) -> Optional[int]:
         # 目录 URL 会命中该前缀下的第一个对象，语义不对；单对象查询不接受尾部 /
         return None
     try:
-        result = subprocess.run([OBSUTIL_BIN, "ls", url, "-limit=1"],
+        result = subprocess.run([OBSUTIL_BIN, "ls", url, "-limit=1", "-bf=raw"],
                                 capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             return None

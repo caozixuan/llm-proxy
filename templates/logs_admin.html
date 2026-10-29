@@ -689,9 +689,12 @@
                 <div class="kpi-hint">其中已归档 {{ fmtNum(bk.totals.archived) }} 个</div>
             </div>
             <div class="kpi">
-                <div class="kpi-label">待释放本地空间</div>
-                <div class="kpi-value">{{ bk.reclaimable_bytes == null ? '—' : fmtBytes(bk.reclaimable_bytes) }}</div>
-                <div class="kpi-hint">{{ pendingDelete.length }} 个目录待确认删除</div>
+                <div class="kpi-label">本地磁盘使用</div>
+                <div class="kpi-value">{{ bk.disk && bk.disk.percent != null ? bk.disk.percent + '%' : '—' }}</div>
+                <div class="kpi-hint" v-if="bk.disk && bk.disk.total_h">
+                    已用 {{ bk.disk.used_h }} / 共 {{ bk.disk.total_h }} · 可用 {{ bk.disk.free_h }}
+                </div>
+                <div class="kpi-hint" v-else>{{ pendingDelete.length }} 个目录待确认删除</div>
             </div>
         </div>
 
@@ -703,7 +706,7 @@
             <div class="hint" style="margin-bottom:16px;">
                 将叶子节点数据自动上传至 OBS，并在校验后清理本地文件，降低本地磁盘占用。
             </div>
-            <div style="display:grid; grid-template-columns: 1.15fr 1fr; gap:26px; align-items:end;">
+            <div style="display:flex; flex-direction:column; gap:22px;">
                 <div>
                     <div style="display:flex; justify-content:space-between; font-size:.8rem; margin-bottom:8px;">
                         <span style="color:var(--muted-foreground);">总体进度</span>
@@ -718,9 +721,30 @@
                         已备份 {{ fmtNum(bk.totals.done) }} / {{ fmtNum(bk.totals.leaves) }} 个叶子节点
                     </div>
                 </div>
-                <div>
+                <div style="border-top:1px dashed var(--border); padding-top:18px;">
                     <div style="font-size:.76rem; color:var(--muted-foreground); margin-bottom:4px;">
-                        叶子节点备份时间分布（近 5 个月）
+                        备份完成趋势（按实际备份时间，每小时）
+                        <span v-if="bk.total_synced" style="margin-left:6px;">
+                            累计 {{ fmtNum(bk.total_synced) }} 个
+                        </span>
+                    </div>
+                    <div class="trend" style="height:104px;">
+                        <div v-for="t in bk.trend" :key="t.hour"
+                             :style="{height: bkTrendHeight(t) + '%'}"
+                             :title="t.hour + ':00 · ' + fmtNum(t.leaves) + ' 个叶子'"></div>
+                    </div>
+                    <div class="trend-axis">
+                        <template v-if="bk.trend.length">
+                            <span>{{ bk.trend[0].label }}</span>
+                            <span>{{ bk.trend[Math.floor(bk.trend.length / 2)].label }}</span>
+                            <span>{{ bk.trend[bk.trend.length - 1].label }}</span>
+                        </template>
+                        <span v-else>暂无数据</span>
+                    </div>
+                </div>
+                <div style="border-top:1px dashed var(--border); padding-top:18px;">
+                    <div style="font-size:.76rem; color:var(--muted-foreground); margin-bottom:4px;">
+                        叶子节点备份时间分布（按数据月份，近 5 个月）
                     </div>
                     <div class="trend" style="height:104px;">
                         <div v-for="m in bk.months" :key="m.month"
@@ -728,7 +752,8 @@
                              :title="m.month + ' · ' + fmtNum(m.leaves) + ' 个叶子'"></div>
                     </div>
                     <div class="trend-axis">
-                        <span v-for="m in bk.months" :key="m.month" style="flex:1; text-align:center;">{{ m.label }}</span>
+                        <span v-for="m in bk.months" :key="m.month"
+                              style="flex:1; text-align:center;">{{ m.label }}</span>
                         <span v-if="!bk.months.length">暂无数据</span>
                     </div>
                 </div>
@@ -773,6 +798,7 @@
                             <th>时间戳</th>
                             <th class="col-center">文件数量</th>
                             <th class="col-center">数据量</th>
+                            <th>OBS 路径</th>
                             <th>备份状态</th>
                             <th>操作</th>
                         </tr>
@@ -787,6 +813,13 @@
                             <td class="mono" style="font-size:.78rem;">{{ bkTs(d) }}</td>
                             <td class="col-center">{{ d.file_count ? fmtNum(d.file_count) : '—' }}</td>
                             <td class="col-center">—</td>
+                            <td>
+                                <a v-if="d.obs_path" class="mono" style="font-size:.74rem; color:var(--primary); cursor:pointer;"
+                                   :title="d.obs_path" @click="bkShowObs(d)">
+                                    {{ bkObsShort(d.obs_path) }}
+                                </a>
+                                <span v-else style="color:var(--muted-foreground);">—</span>
+                            </td>
                             <td>
                                 <span :class="['badge', bkBadge(d.status)]">{{ bkStatusLabel(d.status) }}</span>
                                 <span v-if="bkQueueSet.has(d.dir_path) && bkQueue.running !== d.dir_path"
@@ -803,6 +836,20 @@
                 </table>
                 <div v-else class="hint" style="margin:0;">
                     {{ bkLoading ? '加载中…' : '暂无待备份的叶子节点' }}
+                </div>
+                <!-- 分页 -->
+                <div v-if="bkTotal > 0" class="toolbar" style="margin:12px 0 0; justify-content:flex-end;">
+                    <span style="font-size:.78rem; color:var(--muted-foreground);">
+                        共 {{ fmtNum(bkTotal) }} 条 · 第 {{ bkPage }} / {{ bkPages }} 页
+                    </span>
+                    <button class="btn btn-outline btn-sm" @click="bkGoPage(1)"
+                            :disabled="bkPage <= 1 || bkLoading">首页</button>
+                    <button class="btn btn-outline btn-sm" @click="bkGoPage(bkPage - 1)"
+                            :disabled="bkPage <= 1 || bkLoading">上一页</button>
+                    <button class="btn btn-outline btn-sm" @click="bkGoPage(bkPage + 1)"
+                            :disabled="bkPage >= bkPages || bkLoading">下一页</button>
+                    <button class="btn btn-outline btn-sm" @click="bkGoPage(bkPages)"
+                            :disabled="bkPage >= bkPages || bkLoading">末页</button>
                 </div>
                 </div>
             </div>
@@ -824,6 +871,7 @@
                                 <th class="col-center">待备份</th>
                                 <th class="col-center">已备份</th>
                                 <th class="col-center">状态</th>
+                                <th>OBS</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -834,6 +882,13 @@
                                 <td class="col-center">{{ fmtNum(s.done) }}</td>
                                 <td class="col-center" style="font-size:.78rem;">
                                     <span style="color:var(--success);">●</span> 正常
+                                </td>
+                                <td>
+                                    <a v-if="s.obs_path" class="mono" style="font-size:.72rem; color:var(--primary); cursor:pointer;"
+                                       :title="s.obs_path" @click="bkShowObs(s)">
+                                        {{ bkObsShort(s.obs_path) }}
+                                    </a>
+                                    <span v-else style="color:var(--muted-foreground);">—</span>
                                 </td>
                             </tr>
                         </tbody>
@@ -854,6 +909,29 @@
                         </label>
                     </div>
                     <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
+                        <span>自动提交归档任务</span>
+                        <label style="margin-left:auto; display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" v-model="bkPolicy.auto_submit" @change="bkSavePolicy" style="width:auto;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">队列空时按时间从远到近自动入队</span>
+                        </label>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
+                        <span>每轮提交数量</span>
+                        <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                            <input type="number" class="input input-sm" v-model.number="bkPolicy.submit_batch"
+                                   @change="bkSavePolicy" min="1" style="width:70px;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">个</span>
+                        </span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
+                        <span>只自动提交早于</span>
+                        <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                            <input type="number" class="input input-sm" v-model.number="bkPolicy.submit_min_age_days"
+                                   @change="bkSavePolicy" min="0" style="width:70px;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">天的叶子</span>
+                        </span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
                         <span>磁盘触发阈值</span>
                         <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
                             <input type="number" class="input input-sm" v-model.number="bkPolicy.threshold"
@@ -869,17 +947,25 @@
                             <span style="font-size:.76rem; color:var(--muted-foreground);">秒</span>
                         </span>
                     </div>
-                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px; opacity:.55;">
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
                         <span>最小文件保留天数</span>
-                        <span style="margin-left:auto; font-size:.76rem; color:var(--muted-foreground);">暂未实现</span>
+                        <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                            <input type="number" class="input input-sm" v-model.number="bkPolicy.retain_days"
+                                   @change="bkSavePolicy" min="0" style="width:70px;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">天</span>
+                        </span>
                     </div>
-                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px; opacity:.55;">
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
                         <span>OBS 校验后清理</span>
-                        <span style="margin-left:auto; font-size:.76rem; color:var(--muted-foreground);">需人工确认删除</span>
+                        <label style="margin-left:auto; display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" v-model="bkPolicy.auto_delete" @change="bkSavePolicy" style="width:auto;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">校验通过后自动删除本地</span>
+                        </label>
                     </div>
                     <div style="border-top:1px dashed var(--border); padding-top:10px; font-size:.76rem;
                                 color:var(--muted-foreground); line-height:1.6;">
-                        上传成功且哨兵校验通过后转「待删除」，本地文件需在下方确认后才清理。
+                        关闭「OBS 校验后清理」时，上传并校验成功的目录会转入「待确认删除」，需在下方人工确认后才清理。
+                        保留天数内的叶子即使开启自动清理也不会删除。
                     </div>
                 </div>
 
@@ -942,13 +1028,31 @@
                 <tbody>
                     <tr v-for="l in bk.recent" :key="l.id">
                         <td class="mono" style="font-size:.76rem; white-space:nowrap;">{{ l.created_at }}</td>
-                        <td><span :class="['badge', bkLevelBadge(l.level)]">{{ bkLevelLabel(l.level) }}</span></td>
+                        <td><span :class="['badge', bkEventBadge(l)]">{{ bkEventLabel(l) }}</span></td>
                         <td class="mono" style="font-size:.76rem;">{{ l.dir_path }}</td>
                         <td style="font-size:.78rem;">{{ l.message }}</td>
                     </tr>
                 </tbody>
             </table>
             <div v-else class="hint" style="margin:0;">暂无备份操作记录</div>
+        </div>
+
+        <!-- OBS 路径详情 -->
+        <div class="modal-overlay" v-if="bkObsPath" @click.self="bkCloseObs">
+            <div class="modal-box">
+                <h6>OBS 路径</h6>
+                <div class="modal-field">
+                    <label>完整路径</label>
+                    <div class="mono" style="word-break:break-all; font-size:.78rem; line-height:1.6;
+                                             background:var(--muted); padding:10px; border-radius:6px;">
+                        {{ bkObsPath }}
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-outline btn-sm" @click="bkCopyObs">复制</button>
+                    <button class="btn btn-primary btn-sm" @click="bkCloseObs">关闭</button>
+                </div>
+            </div>
         </div>
 
         <!-- 详情抽屉 -->
@@ -1036,18 +1140,24 @@ new Vue({
 
         // ===== 备份管理 Tab =====
         bk: { totals: {}, months: [], sources: [], recent: [] },
-        bkDirs: [],          // /api/backup/dirs 的目录明细
+        bkDirs: [],          // /api/backup/dirs 当前页的目录明细
         bkConfig: { obs_base: '' },
-        bkPolicy: { enabled: false, threshold: 70, interval: 120 },
+        bkPolicy: { enabled: false, threshold: 70, interval: 120, auto_delete: true, retain_days: 7,
+                    auto_submit: false, submit_batch: 20, submit_min_age_days: 7 },
         bkQueue: { running: '', queued: [], queue_len: 0 },
         bkEnv: '',
         bkStatus: '',
         bkOrder: 'asc',      // 时间从旧到新
+        bkPage: 1,
+        bkPageSize: 15,
+        bkTotal: 0,
+        bkPages: 1,
         bkChecked: [],
         bkLoading: false,
         bkArchiving: false,
         bkDrawerPath: null,
         bkLogs: { loading: false, lines: [] },
+        bkObsPath: null,     // OBS 详情弹窗的完整路径
         bkTimer: null,
         pendingDelete: [],   // 已上传 OBS、待人工确认删除的目录
     },
@@ -1102,24 +1212,15 @@ new Vue({
         },
         // ===== 备份管理 Tab =====
         bkQueueRows: function() {
-            // 前端筛选 + 排序：来源 / 状态 / 时间方向。排序键用 mtime_tag
-            // （YYMMDDHH 定长，字典序即时间序），不用文件 mtime。
-            var self = this;
-            var rows = (this.bkDirs || []).filter(function(d) {
-                if (self.bkEnv && d.env_name !== self.bkEnv) return false;
-                if (self.bkStatus && d.status !== self.bkStatus) return false;
-                return true;
-            });
-            rows.sort(function(a, b) {
-                var ta = a.mtime_tag || '', tb = b.mtime_tag || '';
-                if (ta === tb) return (a.dir_path || '') < (b.dir_path || '') ? -1 : 1;
-                return self.bkOrder === 'asc' ? (ta < tb ? -1 : 1) : (ta > tb ? -1 : 1);
-            });
-            return rows;
+            // 后端已按 mtime_tag（YYMMDDHH 定长，字典序即时间序）排序并分页，
+            // 这里直接消费结果，不在前端重排 —— 否则分页游标会和显示顺序错位。
+            return this.bkDirs || [];
         },
         bkAllChecked: function() {
             return this.bkQueueRows.length > 0
-                && this.bkChecked.length === this.bkQueueRows.length;
+                && this.bkQueueRows.every(function(d) {
+                    return this.bkChecked.indexOf(d.dir_path) !== -1;
+                }.bind(this));
         },
         bkQueueSet: function() {
             return new Set(this.bkQueue.queued || []);
@@ -1599,21 +1700,40 @@ new Vue({
                     self.bkPolicy.enabled = !!d.auto.enabled;
                     self.bkPolicy.threshold = d.auto.threshold;
                     self.bkPolicy.interval = d.auto.interval;
+                    self.bkPolicy.auto_submit = !!d.auto.auto_submit;
+                    self.bkPolicy.submit_batch = d.auto.submit_batch;
+                    if (d.auto.submit_min_age_days != null) {
+                        self.bkPolicy.submit_min_age_days = d.auto.submit_min_age_days;
+                    }
                 }
             }).catch(function() {});
         },
         loadBackupQueue: function() {
             var self = this;
             this.bkLoading = true;
+            var q = '?page=' + this.bkPage + '&page_size=' + this.bkPageSize
+                  + '&order=' + encodeURIComponent(this.bkOrder);
+            if (this.bkEnv) q += '&env_name=' + encodeURIComponent(this.bkEnv);
+            if (this.bkStatus) q += '&status=' + encodeURIComponent(this.bkStatus);
             return Promise.all([
-                this._bkFetch('/api/backup/dirs'),
+                this._bkFetch('/api/backup/dirs' + q),
                 this._bkFetch('/api/backup/queue-status'),
                 this._bkFetch('/api/backup/pending-delete'),
             ]).then(function(res) {
-                self.bkDirs = (res[0] && res[0].dirs) || [];
+                var d = res[0] || {};
+                self.bkDirs = d.dirs || [];
+                self.bkTotal = d.total || 0;
+                self.bkPages = d.pages || 1;
+                self.bkPage = d.page || 1;
                 self.bkQueue = res[1] || self.bkQueue;
                 self.pendingDelete = (res[2] && res[2].dirs) || [];
             }).catch(function() {}).then(function() { self.bkLoading = false; });
+        },
+        bkGoPage: function(p) {
+            var target = Math.max(1, Math.min(Number(p) || 1, this.bkPages));
+            if (target === this.bkPage) return;
+            this.bkPage = target;
+            this.loadBackupQueue();
         },
         loadBackupConfig: function() {
             var self = this;
@@ -1626,6 +1746,14 @@ new Vue({
                 return Math.max(a, x.leaves || 0);
             }, 1);
             return m.leaves ? Math.max(6, Math.round(m.leaves * 100 / max)) : 2;
+        },
+        bkTrendHeight: function(t) {
+            // 按实际备份时间聚合的小时柱：高度取窗口内最大值归一化。
+            // 0 值也给最小高度，保证柱子在横轴上仍占位（能看出「这小时没备份」）。
+            var max = (this.bk.trend || []).reduce(function(a, x) {
+                return Math.max(a, x.leaves || 0);
+            }, 1);
+            return t.leaves ? Math.max(6, Math.round(t.leaves * 100 / max)) : 2;
         },
         bkLeafLabel: function(d) {
             // 「来源/时间戳」两段：newapi 的 mtime_tag 可能是 天/小时 两层
@@ -1660,6 +1788,26 @@ new Vue({
         bkLevelBadge: function(l) {
             return { info: 'badge-fmt', error: 'badge-missing',
                      warning: 'badge-warn' }[l] || 'badge-history';
+        },
+        // 「最近备份操作」按结构化事件渲染；没有事件标签的历史行退回 level 语义。
+        bkEventLabel: function(l) {
+            var m = {
+                upload_done: '上传完成', verify_ok: '校验通过', verify_fail: '校验失败',
+                deleted: '已清理', upload_fail: '上传失败', delete_fail: '清理失败',
+                enqueue: '已入队',
+            };
+            if (l.event && m[l.event]) return m[l.event];
+            return this.bkLevelLabel(l.level);
+        },
+        bkEventBadge: function(l) {
+            var m = {
+                upload_done: 'badge-active', verify_ok: 'badge-active',
+                deleted: 'badge-active', verify_fail: 'badge-missing',
+                upload_fail: 'badge-missing', delete_fail: 'badge-missing',
+                enqueue: 'badge-fmt',
+            };
+            if (l.event && m[l.event]) return m[l.event];
+            return this.bkLevelBadge(l.level);
         },
         bkToggleAll: function(e) {
             if (e.target.checked) {
@@ -1701,8 +1849,9 @@ new Vue({
         },
         bkSavePolicy: function() {
             var self = this;
-            // 开关 / 阈值 / 周期都落在 sync_config 的 auto_backup_* 键上。
-            // 阈值与周期走已有的 /api/backup/config（PUT 只更新传入的键）。
+            // 策略全部落在 sync_config：auto_backup_* 三键 + backup_auto_delete /
+            // backup_retain_days 两键。后端 safe_load → 改键 → 整体写回，
+            // 所以只传本次改动的键也不会覆盖其它配置。
             this._bkFetch('/api/backup/strategy', {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
@@ -1710,6 +1859,11 @@ new Vue({
                     enabled: !!this.bkPolicy.enabled,
                     threshold: Number(this.bkPolicy.threshold) || 70,
                     interval: Number(this.bkPolicy.interval) || 120,
+                    auto_delete: !!this.bkPolicy.auto_delete,
+                    retain_days: Number(this.bkPolicy.retain_days) || 0,
+                    auto_submit: !!this.bkPolicy.auto_submit,
+                    submit_batch: Number(this.bkPolicy.submit_batch) || 20,
+                    submit_min_age_days: Number(this.bkPolicy.submit_min_age_days) || 0,
                 }),
             }).then(function(r) {
                 if (r && r.detail) alert(r.detail);
@@ -1732,6 +1886,29 @@ new Vue({
         bkCloseLogs: function() {
             this.bkDrawerPath = null;
             this.bkLogs = { loading: false, lines: [] };
+        },
+        // OBS 路径：表格里只显示末段，点击看完整值
+        bkObsShort: function(p) {
+            if (!p) return '—';
+            var s = String(p).replace(/\/+$/, '');
+            var i = s.lastIndexOf('/');
+            return i >= 0 ? s.substring(i + 1) : s;
+        },
+        bkShowObs: function(row) {
+            this.bkObsPath = row && row.obs_path ? row.obs_path : null;
+        },
+        bkCloseObs: function() { this.bkObsPath = null; },
+        bkCopyObs: function() {
+            var self = this;
+            if (!this.bkObsPath) return;
+            var done = function() { /* 静默 */ };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(this.bkObsPath).then(done, function() {
+                    alert(self.bkObsPath);
+                });
+            } else {
+                alert(this.bkObsPath);
+            }
         },
         bkLogLineColor: function(ln) {
             if (!ln) return '#d4d4d4';
