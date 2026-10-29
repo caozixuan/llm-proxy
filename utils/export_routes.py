@@ -779,6 +779,8 @@ def _run_merged_hours(mtime_dirs, _env_dir, local_base, api_key, force, workers,
         )
         if _mcfg.analyze is not None:
             kw["analyze"] = _mcfg.analyze
+        if _mcfg.profile is not None:
+            kw["profile"] = _mcfg.profile
         ra_result = processor(**kw)
 
     all_results = ra_result.get("results", []) or []
@@ -1117,27 +1119,22 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
                     _progress_reporter.set_progress(done, total)
 
                 with _tm.stage(_mcfg.step or "重构合并"):
-                    if _mcfg.analyze is None:
-                        _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
-                        ra_result = processor(
-                            src_dir=mt_src, out_dir=str(local_base),
-                            session_entries=session_entries, api_key=api_key, workers=workers,
-                            progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
-                            log_dir=_log_dir_key_for(_env_dir, mt_src),
-                            should_cancel=_should_cancel,
-                            on_session_done=_on_done,
-                        )
-                    else:
-                        _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
-                        ra_result = processor(
-                            src_dir=mt_src, out_dir=str(local_base),
-                            session_entries=session_entries, api_key=api_key, workers=workers,
-                            progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
-                            log_dir=_log_dir_key_for(_env_dir, mt_src),
-                            analyze=_mcfg.analyze,
-                            should_cancel=_should_cancel,
-                            on_session_done=_on_done,
-                        )
+                    # 两个分支只差 analyze 一个关键字；profile 与 analyze 同为可选，
+                    # 配置里没有就不传（处理器可能根本没有这个形参）。
+                    _call_kw = dict(
+                        src_dir=mt_src, out_dir=str(local_base),
+                        session_entries=session_entries, api_key=api_key, workers=workers,
+                        progress_cb=lambda msg, _mt=mt: _log(f"[{_mt}] {msg}"),
+                        log_dir=_log_dir_key_for(_env_dir, mt_src),
+                        should_cancel=_should_cancel,
+                        on_session_done=_on_done,
+                    )
+                    if _mcfg.profile is not None:
+                        _call_kw["profile"] = _mcfg.profile
+                    _log(f"[{mt}] 进入 {_mcfg.step}: {len(session_entries)} sessions, workers={workers}...")
+                    if _mcfg.analyze is not None:
+                        _call_kw["analyze"] = _mcfg.analyze
+                    ra_result = processor(**_call_kw)
                 res["results"] = ra_result["results"]
                 res["entries"] = session_entries
                 _n_err = len(ra_result.get('errors', []))

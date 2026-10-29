@@ -1417,6 +1417,9 @@ _WORKER_SPECS = {
     # 独立进程是因为单叶上传可达数分钟，且删除本地是不可逆操作，需要独立可观测的
     # 执行体（web 重启不该中断它）。
     "backup": WorkerSpec("backup", "src.backup.worker", "backup_services"),
+    # 本地清理：只删本地目录，与上传彻底分离。删除在 NFS 上可能无限阻塞，
+    # 独立进程 + 独立队列可以避免卡住上传流水线，也便于分别统计。
+    "clear": WorkerSpec("clear", "src.backup.clear_worker", "clear_services"),
 }
 
 
@@ -1708,6 +1711,23 @@ def cmd_backup_worker(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_clear_worker(args: argparse.Namespace) -> int:
+    """本地清理 worker（只删本地目录，与上传分离）。"""
+    spec = _WORKER_SPECS["clear"]
+    action = args.clear_action
+    if action == "start":
+        return _worker_start(spec, args)
+    if action == "stop":
+        return _worker_stop(spec, args)
+    if action == "logs":
+        return _worker_logs(spec, args)
+    if action == "status":
+        return _print_worker_services(spec, load_state())
+    if action == "list":
+        return _print_worker_services(spec, load_state())
+    return 1
+
+
 def _start_all_workers(args: argparse.Namespace) -> None:
     """随 app 一起拉起导出 / 回填 / 实时索引 / session 预热 / 备份归档五个独立 worker。
 
@@ -1715,7 +1735,7 @@ def _start_all_workers(args: argparse.Namespace) -> None:
     导出会一直停在 queued、回填停在 pending、new-api 叶子不再实时同步、统计快照
     不再后台补算、备份队列停在 queued。默认随 `app start` 启动，`--no-workers` 可关闭。
     """
-    for name in ("export", "backfill", "watch", "session", "backup"):
+    for name in ("export", "backfill", "watch", "session", "backup", "clear"):
         try:
             _worker_start(_WORKER_SPECS[name], args)
         except Exception as e:
@@ -1724,7 +1744,7 @@ def _start_all_workers(args: argparse.Namespace) -> None:
 
 def _stop_all_workers(args: argparse.Namespace) -> None:
     """随 app 一起停止全部 worker（各自幂等：未在跑则跳过）。"""
-    for name in ("export", "backfill", "watch", "session", "backup"):
+    for name in ("export", "backfill", "watch", "session", "backup", "clear"):
         try:
             _worker_stop(_WORKER_SPECS[name], args)
         except Exception as e:
@@ -1876,6 +1896,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_worker_subparser(subparsers, "watch", "watch_action", cmd_watch_worker)
     _add_worker_subparser(subparsers, "session", "session_action", cmd_session_worker)
     _add_worker_subparser(subparsers, "backup", "backup_action", cmd_backup_worker)
+    _add_worker_subparser(subparsers, "clear", "clear_action", cmd_clear_worker)
 
     # --- key subcommands ---
     p_key = subparsers.add_parser("key", help="API key management (list/add/del/stop/start/config)")

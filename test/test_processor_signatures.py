@@ -85,6 +85,27 @@ def test_analyze_param_matches_registry():
         )
 
 
+def test_profile_param_matches_registry():
+    """注册表里配了 profile 的模式，处理器必须声明 profile 形参。
+
+    与 analyze 的三态同一套约定：yaml 写了就作为关键字传，没写就不传。
+    多个模式共用同一处理器、靠 profile 区分行为时（如 jiuwenswarm_dev / _xiaoyi），
+    处理器漏声明 profile 会在进入函数前抛 TypeError。
+    """
+    cfg = get_config()
+    for mode in cfg.all():
+        if not getattr(mode, "processor", None):
+            continue
+        if getattr(mode, "profile", None) is None:
+            continue
+        fn = cfg.resolve_processor(mode.id)
+        params = set(inspect.signature(fn).parameters)
+        assert "profile" in params, (
+            f"模式 {mode.id} 在 yaml 里配了 profile={mode.profile!r}，"
+            f"但处理器 {fn.__name__} 没有 profile 形参"
+        )
+
+
 def main() -> int:
     failures = 0
     for name, fn in sorted(globals().items()):

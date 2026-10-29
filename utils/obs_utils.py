@@ -216,6 +216,34 @@ def run_download_cmd(
 # 目录/文件列表
 # ---------------------------------------------------------------------------
 
+_DU_RE = re.compile(r"\[DU\]\s+Total prefix\s+\[[^\]]*\]\s+size:\s*([0-9.]+)\s*([KMGT]?B)", re.I)
+
+
+def obsutil_prefix_size(obs_url: str, timeout: int = 600) -> Optional[int]:
+    """递归统计某个 OBS 前缀的实际总字节数。失败返回 None。
+
+    这是**删除前的强校验**：拿 OBS 上真实存在的体积与本地记录比对。
+    代价高（要递归列举所有对象，单叶几十万文件要几十秒到几分钟），
+    所以只在「保留期已到、准备删除」时逐库调用，不做实时展示。
+
+    输出形如：`[DU] Total prefix [raw/.../]: size: 59.73GB`
+    """
+    if not obs_url or not os.path.isfile(OBSUTIL_BIN):
+        return None
+    url = obs_url if obs_url.endswith("/") else obs_url + "/"
+    try:
+        r = subprocess.run([OBSUTIL_BIN, "ls", url, "-du"],
+                           capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None
+    except Exception:
+        return None
+    m = _DU_RE.search(r.stdout or "")
+    if not m:
+        return None
+    return _parse_size_bytes(m.group(1) + m.group(2).upper())
+
+
 def obsutil_ls(path: str, show_dirs: bool = False, limit: int = 1000) -> List[dict]:
     """执行 obsutil ls -d，只列出当前一层的子目录和文件（不递归）。
 

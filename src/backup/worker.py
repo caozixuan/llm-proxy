@@ -86,7 +86,9 @@ def _init_env() -> str:
     logdir_store.init_db(svc_dir)
     # 上次被 kill 时留在 running 的任务降回 queued，否则 claim_next_job
     # 看到「已有 running」会永远返回 None，队列就此卡死。
-    backup_store.reset_running_on_startup()
+    n = backup_store.reset_running_on_startup()
+    if n:
+        logger.info("启动时把 %d 个中断的 running 任务降回 queued", n)
     cfg = backup_routes._auto_cfg()
     logger.info(
         "backup_worker 启动 svc_dir=%s auto_delete=%s retain_days=%s obs_base=%s",
@@ -106,10 +108,14 @@ def run_once() -> bool:
     dir_path = job["dir_path"]
     job_type = job.get("job_type", "sync")
     svc_dir = get_service_log_dir()
+    requeue = False
     logger.info("领取任务 #%s %s dir=%s", job.get("id"), job_type, dir_path)
     try:
         if job_type == "resync":
             backup_routes._run_resync_failed(dir_path)
+        elif job_type == "purge":
+            # 人工确认删除：不走上传，直接校核 + 提交 clear
+            backup_routes.run_purge_job(dir_path, svc_dir)
         else:
             cfg = backup_routes._auto_cfg()
             if not cfg["obs_base"]:
@@ -120,7 +126,7 @@ def run_once() -> bool:
                 return True
             # resolve_real_backup_dir 需要的是 SERVICE_LOG_DIR：它内部用
             # Path(logs_dir).parent.parent 反推 logs_all。
-            backup_routes._run_sync_for_dir(
+            res = backup_routes._run_sync_for_dir(
                 dir_path,
                 logs_all=None,        # 路径全部由 resolver 解析，不依赖 logs_all
                 obs_base=cfg["obs_base"],
@@ -130,6 +136,8 @@ def run_once() -> bool:
                 auto_delete=cfg["auto_delete"],
                 retain_days=cfg["retain_days"],
             )
+            # 被停机信号打断（obsutil 退出码为负）：不算失败，重新排队等下次跑
+            requeue = (res == "interrupted")
     except Exception:
         logger.exception("执行备份任务失败: %s", dir_path)
         try:
@@ -140,56 +148,16 @@ def run_once() -> bool:
             pass
     finally:
         backup_store.finish_job(job["id"])
+        # 必须等 finish_job 释放队列行之后才能重新入队：唯一部分索引会拒绝
+        # 与仍在 running 的同名任务并存。
+        if requeue and not _shutdown_requested:
+            try:
+                if backup_store.enqueue_job(dir_path, "sync"):
+                    logger.info("已重新入队被中断的任务: %s", dir_path)
+            except Exception:  # noqa: BLE001
+                logger.exception("re-enqueue failed: %s", dir_path)
         logger.info("任务完成 #%s dir=%s", job.get("id"), dir_path)
     return True
-
-
-def maybe_auto_submit() -> int:
-    """自动提交归档任务：开启后按「最远→最近」把候选目录批量入队。
-
-    只在队列空时补货（run_once 返回 False 时调用），这样：
-      - 不会把几千个任务一次性堆进 backup_queue；
-      - 每个叶子都是「结算完一个再进下一批」，失败不污染后续批次；
-      - 入队顺序即执行顺序（claim_next_job 是 ORDER BY id ASC），
-        所以最旧的数据总被最先处理。
-
-    返回本轮入队数量。未开启时直接返回 0。
-    """
-    cfg = backup_routes._auto_cfg()
-    if not cfg.get("auto_submit") or not cfg["obs_base"]:
-        return 0
-
-    # 只自动提交「早于 N 天」的叶子：避免自动任务动到近期数据。
-    # 未配置或为 0 时不限制（older_than 为空）。
-    older_than = backup_routes._submit_age_cutoff(cfg.get("submit_min_age_days") or 0)
-
-    try:
-        chosen, matched, _skipped = backup_routes.select_archive_candidates(
-            active_dir_path="",             # worker 不知道活跃目录，靠 status 过滤已足够
-            envs=None,
-            older_than=older_than,
-            limit=cfg["submit_batch"],
-            busy=set(),
-        )
-    except Exception:
-        logger.exception("自动提交：挑选候选失败")
-        return 0
-
-    enqueued = 0
-    for c in chosen:
-        if backup_store.enqueue_job(c["dir_path"], "sync"):
-            enqueued += 1
-    if enqueued:
-        logger.info("自动提交 %d 个归档任务（最远优先，剩余候选 %d，早于 %s）",
-                    enqueued, max(0, matched - enqueued), older_than or "不限")
-        try:
-            backup_store.append_log(
-                chosen[0]["dir_path"],
-                f"自动提交 {enqueued} 个归档任务（按时间从远到近）",
-                event="enqueue")
-        except Exception:  # noqa: BLE001
-            pass
-    return enqueued
 
 
 def main() -> int:
@@ -207,13 +175,28 @@ def main() -> int:
     handled = 0
     try:
         while not _shutdown_requested:
+            # 1) 手里有上传任务就先干完（run_once 内部已串行，一次一个）。
             did = run_once()
             if did:
                 handled += 1
-                continue          # 有活就立刻继续，缩短总耗时
-            # 队列空了：若开了「自动提交」，按最远→最近补一批
-            if maybe_auto_submit():
-                continue          # 补货成功，立刻回去干活
+                continue
+
+            # 2) 推进串行流水线一步：按叶子时间从远到近，
+            #    遇到没备份的 → 入队上传（一次一个）；
+            #    遇到已备份且到期的 → OBS 体积校核后提交删除。
+            #
+            #    **提交完立即推进下一个，不等 clear_worker 删完**：
+            #    删除是 clear_worker 自己的队列（claim_next_clear 按 id ASC），
+            #    只要提交顺序是按时间排的，执行顺序就也是按时间的。
+            #    在这里干等只会让上传通道空转。
+            cfg = backup_routes._auto_cfg()
+            action, dp = backup_routes.run_pipeline_step(
+                cfg["auto_delete"], cfg["retain_days"], cfg["submit_min_age_days"],
+                auto_submit=cfg["auto_submit"])
+            if action:
+                logger.info("流水线推进 [%s] %s", action, dp)
+                continue
+
             if args.once:
                 break
             _sleep(IDLE_INTERVAL)

@@ -85,13 +85,27 @@ _DEFAULT_MODES: Dict[str, dict] = {
         "public": True,
     },
     "jiuwenswarm_dev": {
-        "label": "Jiuwenswarm 开发导出（快照分支聚合+权重+reasoning 回填）",
-        "mode_label": "Jiuwenswarm 导出",
-        "step": "Jiuwenswarm 聚合",
-        "obs_sub": "session_analysis_jiuwenswarm",
-        "local_dir": "logs_session_analysis_jiuwenswarm",
+        "label": "Jiuwenswarm 开发导出（压缩分段 + 权重 + reasoning 回填）",
+        "mode_label": "Jiuwenswarm 开发",
+        "step": "Jiuwenswarm 分段",
+        "obs_sub": "session_analysis_jiuwenswarm_dev",
+        "local_dir": "logs_session_analysis_jiuwenswarm_dev",
         "pipeline": "reformat",
-        "processor": "utils.eval.reformat_jiuwenswarm:jiuwenswarm_export",
+        "processor": "utils.eval.jiuwenswarm_segments:jiuwenswarm_segments_export",
+        "profile": "dev",
+        "formats": ["newapi"],
+        "public": True,
+    },
+    "jiuwenswarm_xiaoyi": {
+        "label": "小艺导出（压缩分段 + 权重 + reasoning 回填）",
+        "mode_label": "小艺导出",
+        "step": "小艺分段",
+        "obs_sub": "session_analysis_jiuwenswarm_xiaoyi",
+        "local_dir": "logs_session_analysis_jiuwenswarm_xiaoyi",
+        "pipeline": "reformat",
+        "processor": "utils.eval.jiuwenswarm_segments:jiuwenswarm_segments_export",
+        "profile": "xiaoyi",
+        "formats": ["newapi"],
         "public": True,
     },
     "eval": {
@@ -114,6 +128,7 @@ class ModeConfig:
     __slots__ = (
         "id", "label", "mode_label", "step", "obs_sub", "local_dir",
         "pipeline", "processor", "analyze", "formats", "max_mtimes", "public",
+        "profile",
     )
 
     def __init__(self, mode_id: str, raw: dict) -> None:
@@ -146,6 +161,11 @@ class ModeConfig:
             self.max_mtimes: Optional[int] = int(mm) if mm is not None else None
         except (TypeError, ValueError):
             self.max_mtimes = None
+
+        # 三态，同 analyze：不写 None（不传该关键字），写了则原样传给处理器。
+        # 供「同一处理器、多套行为参数」的模式共用实现（如 jiuwenswarm 各业务线）。
+        prof = raw.get("profile")
+        self.profile: Optional[str] = None if prof is None else str(prof)
 
         self.public = bool(raw.get("public", False))
 

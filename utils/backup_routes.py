@@ -33,6 +33,7 @@ from utils.backup_store import (
     has_any_dirs,
     list_dirs,
     list_env_names,
+    list_clear_queue,
     list_failed_files,
     list_queue,
     mark_backed_up,
@@ -40,6 +41,7 @@ from utils.backup_store import (
     record_failed_files,
     reset_running_on_startup,
     set_deleted,
+    set_upload_stats,
     set_uploaded,
     update_sync_pid,
     update_sync_status,
@@ -335,6 +337,57 @@ def _scan_data_dirs(logs_all: Path, env_name: str = None, port_env_map: dict = N
     return result
 
 
+def _seed_dirs_from_leaf_status(env_name: str) -> int:
+    """用 leaf_status **补齐**某个来源在 backup_dirs 里缺失的叶子行。
+
+    幂等：只插缺失的 (root_id, dir_key)，已有的行（含已上传/已删除的）不动。
+    返回本次新增条数。
+
+    为什么这样做而不是「首次扫盘」：
+      - _scan_root_leaves / _scan_data_dirs 走 iter_index_dirs，是 NFS 上的
+        递归 walk，选择从未备份过的来源时实测 45s+ 不返回。
+      - 旧逻辑用 has_any_dirs() 判断「是否需要初始扫描」，只要有 1 行就跳过；
+        而 backup_dirs 里某些来源只有零星几行（历史遗留 / 之前的扫描被超时
+        打断），于是剩下的叶子永远补不进来。
+
+    dir_path 用 f"{root_id}/{dir_key}"，与 backup_dirs 既有口径一致。
+    """
+    try:
+        import utils.logdir_store as _lds
+        if not _lds._ready():
+            return 0
+        rows = _lds.bulk_get_stats(env_name)
+    except Exception:  # noqa: BLE001
+        logger.exception("seed dirs from leaf_status failed: %s", env_name)
+        return 0
+
+    # 已有行一次性取出来，避免逐条 SELECT（upsert_dir 内部会查一次）
+    try:
+        existing = {r["dir_key"] for r in list_dirs(env_name=env_name)}
+    except Exception:  # noqa: BLE001
+        existing = set()
+
+    n = 0
+    for r in rows:
+        dk = (r.get("dir_key") or "").strip()
+        if not dk or dk in existing:
+            continue
+        # 已归档（本地已删）的叶子不该再进备份队列
+        if r.get("archived"):
+            continue
+        # file_count 故意留 0：逐个 iterdir 数文件是 NFS 上的元数据风暴
+        # （72 个叶子实测几十秒）。前端无值时显示「—」，不影响归档本身。
+        try:
+            upsert_dir(f"{env_name}/{dk}", env_name, dk, 0, has_local=True)
+            existing.add(dk)
+            n += 1
+        except Exception:  # noqa: BLE001
+            logger.exception("seed dir failed: %s/%s", env_name, dk)
+    if n:
+        logger.info("从 leaf_status 补齐 %d 个目录到备份队列（env=%s）", n, env_name)
+    return n
+
+
 def _scan_root_leaves(root: str) -> List[dict]:
     """扫描一个非 logs_all 根（如 new-api 的 details）下含 index.jsonl 的叶子。
 
@@ -395,59 +448,154 @@ def _scan_obs_dirs(obs_base: str, env_name: str = None) -> List[dict]:
     return result
 
 
+def _confirm_delete_sync(dirs: list) -> dict:
+    """人工确认删除：**不直接写 clear 队列**，而是交回 backup_worker 处理。
+
+    所有删除申请都必须由 backup_worker 发出（它掌握上传状态与校核逻辑），
+    clear_worker 只负责执行。这样删除来源单一、可追溯。
+
+    流程：web 把目录重置为 pending 并重新入上传队列 → backup_worker 领到后
+    走 `synced=1` 分支（已上传过）→ 做 OBS 体积校核 → 通过才提交 clear。
+    """
+    from utils.backup_store import enqueue_job
+    submitted, skipped = [], []
+    for dir_path in dirs:
+        info = get_dir(dir_path)
+        # 安全前提：必须确认内容在 OBS 上（有 obs_path）
+        if not info or not info.get("has_obs") or not info.get("obs_path"):
+            skipped.append(dir_path)
+            append_log(dir_path, "清理申请被拒绝：未确认已上传 OBS", level="error")
+            continue
+        # 用 purge 任务类型：worker 领到后直接走「校核 + 提交 clear」，
+        # 不受 assert auto_delete / retain_days 约束（人工确认是明确意图）。
+        update_sync_status(dir_path, "pending", obs_path=info.get("obs_path", ""))
+        if enqueue_job(dir_path, "purge"):
+            append_log(dir_path, "已提交清理申请，等待 backup_worker 校核后转入 clear",
+                       event="delete_requested")
+            submitted.append(dir_path)
+        else:
+            skipped.append(dir_path)
+    return {"ok": True, "queued": submitted, "skipped": skipped}
+
+
+def run_purge_job(dir_path: str, logs_dir: str) -> bool:
+    """处理「人工确认删除」申请（job_type='purge'）。
+
+    人工确认是明确意图，**不受 auto_delete / retain_days 约束**，但校核照做：
+    仍然要先核对 OBS 体积，通过才提交 clear —— 删除不可逆，人工点了也不跳过验证。
+
+    与自动路径一样，删除申请由 backup_worker 发出，web 不直接写 clear 队列。
+    """
+    real_dir = resolve_real_backup_dir(dir_path, logs_dir)
+    info = get_dir(dir_path) or {}
+    obs_path = info.get("obs_path") or ""
+    if not obs_path:
+        append_log(dir_path, "清理申请被拒绝：无 OBS 路径", level="error", event="verify_fail")
+        update_sync_status(dir_path, "pending", obs_path="", error_msg="无 OBS 路径")
+        return False
+    append_log(dir_path, "收到人工清理申请，开始 OBS 体积校核")
+    return _submit_clear_verified(dir_path, real_dir, obs_path)
+
+
 def _maybe_auto_delete(dir_path: str, real_dir: Path, obs_dst: str,
                        auto_delete: bool, retain_days: int) -> bool:
-    """上传且校验通过后，按策略决定是否自动删除本地目录。返回是否已删除。
+    """**刚上传完**的目录：保留期已到就提交清理申请。
 
-    这是整个备份链路里**唯一**会 rmtree 的自动路径，因此三重守卫缺一不可：
-      1) 调用方只在哨兵校验通过后才调它（内容确实在 OBS 上）；
-      2) 策略开关 backup_auto_delete 为真；
-      3) 叶子时间早于 backup_retain_days 天（最近的数据留在本地，便于回看）。
-    任一不满足就退回原来的 pending_delete 人工闸门，行为与之前一致。
+    与「已备份目录」的处理刻意分开（见 _submit_clear_verified）：
+    这里的内容刚刚走了完整上传 + 哨兵校验（obsutil -vlength 逐文件 +
+    index.jsonl 大小比对），已经证明「确实传上去了」，**不需要再做
+    ls -du 全量体积核对** —— 那要递归列举几十万对象，对刚传完的目录是重复劳动。
 
-    删除成功后：
-      - backup_dirs 打 deleted_at，status=backed_up（has_local=0, has_obs=1）；
-      - leaf_status 打 archived 标记 —— 这就是「通知 session worker」的机制，
-        worker 每轮读同一个 WAL 库的 stale_stats_leaves()（已按 archived=0 过滤），
-        下一轮自然不再重试这个已删除的叶子。
+    规则：保留期内 → 保持 done（页面显示「已备份」），等到期后由
+    run_pipeline_step 的 clear 分支接手；已到期 → 直接提交 clear。
     """
-    env_name, _, mtime_tag = dir_path.partition("/")
+    _env, _, mtime_tag = dir_path.partition("/")
     if not auto_delete:
-        update_sync_status(dir_path, "pending_delete", obs_path=obs_dst)
-        append_log(dir_path, "自动清理已关闭，转入待确认删除")
+        append_log(dir_path, "自动清理已关闭，本地数据保留")
         return False
     if _leaf_too_new(mtime_tag, retain_days):
-        update_sync_status(dir_path, "pending_delete", obs_path=obs_dst)
         append_log(dir_path,
-                   f"仍在保留期内（{retain_days} 天），转入待确认删除")
+                   f"仍在保留期内（{retain_days} 天），保持已备份状态")
         return False
+    # 简单校核已完成（哨兵 + -vlength），直接提交
+    return _enqueue_clear_now(dir_path, real_dir, obs_dst,
+                              reason="上传校验通过")
+
+
+def _enqueue_clear_now(dir_path: str, real_dir: Path, obs_dst: str,
+                       reason: str = "") -> bool:
+    """把目录提交到 clear 队列（状态转 pending_delete）。
+
+    **只有 backup_worker 会调用这里** —— 所有删除申请都必须从 worker 发出，
+    web 侧不直接写 clear 队列。这样删除来源单一、可追溯。
+    """
+    from utils.backup_store import enqueue_clear
+
     if not real_dir.is_dir():
-        update_sync_status(dir_path, "backed_up", obs_path=obs_dst)
+        mark_backed_up(dir_path)
+        set_uploaded(dir_path)
+        set_deleted(dir_path)
         return False
 
+    abs_path = str(real_dir.resolve())
     try:
-        n_files = sum(1 for _ in real_dir.rglob("*") if _.is_file())
-        shutil.rmtree(str(real_dir))
+        queued = enqueue_clear(dir_path, abs_path)
     except Exception as e:  # noqa: BLE001
-        append_log(dir_path, f"自动清理失败: {e}", level="error", event="delete_fail")
-        update_sync_status(dir_path, "pending_delete", obs_path=obs_dst,
-                           error_msg=f"自动清理失败: {e}")
-        logger.exception("auto delete failed for %s", dir_path)
+        logger.exception("enqueue_clear failed for %s", dir_path)
+        update_sync_status(dir_path, "done", obs_path=obs_dst,
+                           error_msg=f"清理入队失败: {e}")
         return False
 
-    mark_backed_up(dir_path)
-    set_uploaded(dir_path)      # 内容确实在 OBS 上（校验已过）
-    set_deleted(dir_path)       # 本地确实已清空
-    append_log(dir_path, f"校验通过，已自动清理本地（{n_files} 个文件）", event="deleted")
+    update_sync_status(dir_path, "pending_delete", obs_path=obs_dst)
+    if queued:
+        append_log(dir_path,
+                   f"{reason}，已提交清理申请: {abs_path}", event="delete_queued")
+    else:
+        append_log(dir_path, "本地清理任务已在队列中")
+    return queued
 
-    # 通知 session worker：打归档标记（同库轮询，无需进程间消息）
-    try:
-        import utils.logdir_store as _lds
-        if _lds._ready():
-            _lds.mark_archived([str(real_dir)], True)
-    except Exception:  # noqa: BLE001
-        logger.exception("mark_archived failed for %s", dir_path)
-    return True
+
+def _submit_clear_verified(dir_path: str, real_dir: Path, obs_dst: str) -> bool:
+    """**已经备份过**的目录：先做 OBS 体积校核，通过才提交清理申请。
+
+    与 _maybe_auto_delete 的区别：这些目录的上传发生在过去（可能几天前），
+    当时的上传结果不可复验，所以这里用 `obsutil ls -du` 取 OBS 前缀的
+    **真实字节数**，与 backup_dirs.size_bytes 比对（容差 1%）。
+    不通过 → 保持 done + 记 verify_fail，绝不删除。
+    """
+    from utils.backup_store import set_upload_stats
+    from utils.obs_utils import obsutil_prefix_size
+
+    if not real_dir.is_dir():
+        mark_backed_up(dir_path)
+        set_uploaded(dir_path)
+        set_deleted(dir_path)
+        return False
+
+    info = get_dir(dir_path) or {}
+    expect = int(info.get("size_bytes") or -1)
+    actual = obsutil_prefix_size(obs_dst) if obs_dst else None
+
+    if actual is None:
+        msg = "OBS 体积核对失败（无法读取前缀大小），暂不清理"
+        append_log(dir_path, msg, level="error", event="verify_fail")
+        update_sync_status(dir_path, "done", obs_path=obs_dst, error_msg=msg)
+        return False
+
+    # 首次核对成功时把真实体积写回（比上传时的 Succeed bytes 更准）
+    if expect <= 0:
+        set_upload_stats(dir_path, size_bytes=actual)
+        expect = actual
+    if actual < expect * 0.99:
+        msg = (f"OBS 体积小于本地记录（OBS {actual} < 记录 {expect}），"
+               f"疑似未传完，暂不清理")
+        append_log(dir_path, msg, level="error", event="verify_fail")
+        update_sync_status(dir_path, "done", obs_path=obs_dst, error_msg=msg)
+        return False
+
+    return _enqueue_clear_now(
+        dir_path, real_dir, obs_dst,
+        reason=f"已备份目录 OBS 体积核对通过（{actual} 字节）")
 
 
 def _verify_upload_sentinels(real_dir: Path, obs_dst: str) -> tuple:
@@ -539,14 +687,25 @@ def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int
                 append_log(dir_path, "本地目录不存在且无 OBS 路径，跳过", level="error")
             return
 
-        # synced=1：之前已成功同步过，status 可能被后续操作误覆盖，修正并跳过
+        # synced=1：之前已成功同步过（**已备份**），跳过重复上传。
+        #
+        # 这条路径对应「已经备份过的目录」：当初的上传结果无法复验，所以这里
+        # 走 _submit_clear_verified —— 先 `obsutil ls -du` 取 OBS 真实体积，
+        # 与记录比对通过才提交 clear 申请。与刚上传完的 _maybe_auto_delete
+        # （走简单校核）刻意区分开。
+        #
+        # 早先这里直接 return，导致「已传过但没删」的目录永远停在 done，
+        # 实测 26070714 就是这样卡住的。
         dir_info = get_dir(dir_path)
         if dir_info and dir_info.get("synced") and dir_info.get("obs_path"):
             if dir_info.get("status") != "done":
                 update_sync_status(dir_path, "done", obs_path=dir_info["obs_path"])
-                append_log(dir_path, f"已有成功同步记录（synced=1），修正状态为 done，跳过重复上传")
+                append_log(dir_path, "已有成功同步记录（synced=1），修正状态为 done，跳过重复上传")
             else:
                 append_log(dir_path, "已有成功同步记录（synced=1），跳过重复上传")
+            if auto_delete and Path(real_dir).is_dir() \
+                    and not _leaf_too_new(mtime_tag, retain_days):
+                _submit_clear_verified(dir_path, Path(real_dir), dir_info["obs_path"])
             return
 
         update_sync_status(dir_path, "syncing", obs_path=obs_dst)
@@ -557,6 +716,8 @@ def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int
         proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
         task_id = ""
         output_dir = ""
+        uploaded_bytes = None
+        succeeded_count = None
         for line in proc.stdout:
             line = line.rstrip()
             if line:
@@ -566,9 +727,30 @@ def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int
                     task_id = line.split(":", 1)[1].strip()
                 elif not output_dir and line.startswith("OutputDir:"):
                     output_dir = line.split(":", 1)[1].strip()
+                # 上传结束时的统计行：「Succeed bytes:      962.01MB」
+                # 「Succeed count:      2827      Failed count:       0」
+                # 这是唯一能拿到真实数据量的地方（本地不预先统计）。
+                elif line.startswith("Succeed bytes:"):
+                    from utils.obs_utils import _parse_size_bytes
+                    tok = line.split(":", 1)[1].strip().split()[0] if line.split(":", 1)[1].strip() else ""
+                    parsed = _parse_size_bytes(tok)
+                    if parsed is not None:
+                        uploaded_bytes = parsed
+                elif line.startswith("Succeed count:"):
+                    try:
+                        succeeded_count = int(line.split(":", 1)[1].split()[0])
+                    except (IndexError, ValueError):
+                        pass
         proc.wait(timeout=600)
 
         if proc.returncode == 0:
+            # 先落数据量与文件数：即使后面校验失败，这两个值也是真实的观测结果，
+            # 有助于判断「到底传了多少」。
+            try:
+                set_upload_stats(dir_path, size_bytes=uploaded_bytes,
+                                 file_count=succeeded_count)
+            except Exception:  # noqa: BLE001
+                logger.exception("set_upload_stats failed for %s", dir_path)
             # 退出码之外再核一次哨兵对象：obsutil 的 -u 增量语义下，退出码 0 只
             # 代表「本次没有失败的任务」，不保证目标前缀里真的落了数据（前缀写错、
             # 对象被跳过都会是 0）。删除本地是不可逆操作，删之前必须确认内容在
@@ -594,6 +776,19 @@ def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int
                 update_sync_status(dir_path, "partial",
                                    error_msg=f"哨兵核对失败: {msg}", obs_path=obs_dst)
         else:
+            # 负退出码 = 被信号杀死（-15=SIGTERM，-9=SIGKILL）。这通常是我们自己
+            # 停机/重启时把正在跑的 obsutil 一起杀了，不是数据或 OBS 的问题。
+            # 这类情况退回 queued，让下次启动自动重跑，不要污染失败统计。
+            if proc.returncode is not None and proc.returncode < 0:
+                sig = -proc.returncode
+                append_log(dir_path,
+                           f"上传被中断（signal {sig}），已退回队列等待重跑",
+                           level="warning", event="upload_interrupted")
+                update_sync_status(dir_path, "pending", obs_path="", error_msg="")
+                # 不能在这里直接 enqueue_job：当前 job 在 backup_queue 里仍是
+                # 'running'，唯一部分索引 (dir_path WHERE state IN ('queued',
+                # 'running')) 会拒绝插入。交给调用方在 finish_job 之后再入队。
+                return "interrupted"
             # 尝试从 obsutil 失败报告解析出失败文件清单 → 标记 partial（部分失败）
             failed_items = []
             report = find_failed_report(task_id, output_dir) if task_id else None
@@ -677,10 +872,16 @@ def _queue_dispatch_loop():
 
         dir_path = job["dir_path"]
         job_type = job.get("job_type", "sync")
+        _requeue_after_finish = ""
         _syncing_dirs.add(dir_path)
         try:
             if job_type == "resync":
                 _run_resync_failed(dir_path)
+            elif job_type == "purge":
+                # 人工清理申请：run_purge_job 需要 SERVICE_LOG_DIR
+                # （resolve_real_backup_dir 内部用它的 parent.parent 反推 logs_all）
+                from utils.log_paths import get_service_log_dir
+                run_purge_job(dir_path, get_service_log_dir())
             else:
                 acfg = _auto_cfg()
                 obs_base = acfg["obs_base"]
@@ -693,15 +894,26 @@ def _queue_dispatch_loop():
                 else:
                     logs_all = _dispatcher_ctx.get("logs_all")
                     resolver = _dispatcher_ctx.get("resolver")
-                    _run_sync_for_dir(dir_path, logs_all, obs_base, workers,
-                                      upload_script, resolver=resolver,
-                                      auto_delete=acfg["auto_delete"],
-                                      retain_days=acfg["retain_days"])
+                    res = _run_sync_for_dir(dir_path, logs_all, obs_base, workers,
+                                            upload_script, resolver=resolver,
+                                            auto_delete=acfg["auto_delete"],
+                                            retain_days=acfg["retain_days"])
+                    if res == "interrupted":
+                        _requeue_after_finish = dir_path
         except Exception:
             logger.exception("queue dispatch failed for %s", dir_path)
             _syncing_dirs.discard(dir_path)
         finally:
             finish_job(job["id"])
+            # 被信号打断的任务：此时队列行已释放，才能重新入队（唯一部分索引
+            # 会拒绝与仍在 running 的同名任务并存）。
+            if _requeue_after_finish:
+                try:
+                    if enqueue_job(_requeue_after_finish, "sync"):
+                        logger.info("已重新入队被中断的任务: %s", _requeue_after_finish)
+                    _requeue_after_finish = ""
+                except Exception:  # noqa: BLE001
+                    logger.exception("re-enqueue failed: %s", _requeue_after_finish)
 
 
 def _backup_worker_alive() -> bool:
@@ -899,6 +1111,8 @@ def _auto_cfg() -> dict:
         # 与 retain_days（删本地的保留期）是两件事，但默认取同一个值更直观。
         "submit_min_age_days": max(0, int(cfg.get("backup_submit_min_age_days",
                                                   retain_days) or 0)),
+        # 每轮最多提交多少个「到期清理」（每个都要跑一次 obsutil ls -du 校核）
+        "clear_batch": max(1, int(cfg.get("backup_clear_batch", 3) or 3)),
     }
 
 
@@ -955,11 +1169,13 @@ def _run_auto_backup_round(logs_all: Path, active_env: str, active_path: str,
             append_log(dir_path, f"自动备份上传异常: {e}", level="error")
             continue
 
-        # 上传结果以 DB 状态为准：done 才转 pending_delete（partial/error 保留原状态待人工处理）
+        # 上传结果以 DB 状态为准。**不要在这里强行转 pending_delete**：
+        # _run_sync_for_dir 末尾的 _maybe_auto_delete 已经按保留期做过判断
+        # （到期→提交 clear 转 pending_delete；未到期→保持 done 显示「已备份」）。
+        # 早先在这里无条件转 pending_delete，会把还在保留期的目录也推进删除流程，
+        # 与「时间到了再删」的语义冲突。
         info = get_dir(dir_path)
-        if info and info.get("status") == "done" and info.get("obs_path"):
-            update_sync_status(dir_path, "pending_delete", obs_path=info["obs_path"])
-            append_log(dir_path, "自动备份上传成功，转入待确认删除")
+        if info and info.get("status") in ("done", "pending_delete") and info.get("obs_path"):
             uploaded.append(dir_path)
             _auto_set(uploaded=list(uploaded),
                       pending_delete_count=count_pending_delete(active_env))
@@ -977,6 +1193,133 @@ def _run_auto_backup_round(logs_all: Path, active_env: str, active_path: str,
     _auto_set(running=False, current="", queue=[],
               pending_delete_count=count_pending_delete(active_env),
               message=f"本轮完成：成功上传 {len(uploaded)} 个，待确认删除")
+
+
+# ---------------------------------------------------------------------------
+# 串行流水线：整个叶子列表按时间从远到近，一次只推进一个
+# ---------------------------------------------------------------------------
+
+# 校核/上传失败的叶子在这么久内不再重试，避免一个永远失败的目录卡死整条流水线。
+VERIFY_RETRY_BACKOFF_SEC = 3600
+
+
+def _recent_event(dir_path: str, events, within_sec: int) -> bool:
+    """该目录最近是否发生过指定事件之一（用于流水线失败退避）。"""
+    from utils.backup_store import _conn, _lock
+    from datetime import datetime as _dt, timedelta as _td
+    events = tuple(events)
+    if not events:
+        return False
+    since = (_dt.now() - _td(seconds=within_sec)).strftime("%Y-%m-%d %H:%M:%S")
+    marks = ",".join("?" * len(events))
+    try:
+        with _lock:
+            row = _conn.execute(
+                f"SELECT 1 FROM backup_logs WHERE dir_path = ? "
+                f"AND event IN ({marks}) AND created_at >= ? LIMIT 1",
+                (dir_path, *events, since)).fetchone()
+        return row is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _recent_verify_fail(dir_path: str, within_sec: int = VERIFY_RETRY_BACKOFF_SEC) -> bool:
+    return _recent_event(dir_path, ("verify_fail",), within_sec)
+
+
+def select_pipeline_next(auto_delete: bool, retain_days: int,
+                         submit_min_age_days: int = 0):
+    """串行流水线的**唯一**决策点：返回下一个要处理的叶子，或 None。
+
+    规则（严格按叶子时间从远到近，最旧的先处理）：
+      - `pending` / `error` / `partial` → 动作 `backup`（上传 → 简单校核）；
+      - `done` 且已过保留期           → 动作 `clear`（OBS 体积校核 → 提交删除）；
+      - `done` 但仍在保留期           → 跳过（等时间到，不删）；
+      - `pending_delete` / `backed_up` → 跳过（已提交/已删，等后续）；
+      - `syncing` / `live_syncing`     → 跳过（正在被别的流程占用）。
+
+    返回 {"action": "backup"|"clear", "dir_path", "time", "obs_path", "reason"}。
+    """
+    from utils.log_paths import get_service_log_dir
+    from utils.log_scan import scan_time_key
+    from datetime import datetime as _dt, timedelta as _td
+
+    svc_dir = get_service_log_dir()
+    clear_cutoff = _dt.now() - _td(days=max(0, int(retain_days)))
+    submit_cutoff = _submit_age_cutoff(submit_min_age_days)
+
+    queued = {j.get("dir_path") for j in list_queue()}
+    clearing = {j.get("dir_path") for j in list_clear_queue()}
+
+    rows = []
+    for d in list_dirs():
+        key = scan_time_key(d.get("mtime_tag") or d.get("dir_path") or "")
+        if not key:
+            continue
+        rows.append((key, d))
+    rows.sort(key=lambda x: (x[0], x[1].get("dir_path") or ""))
+
+    for key, d in rows:
+        dp = d.get("dir_path") or ""
+        st = (d.get("status") or "pending")
+        if not d.get("has_local"):
+            continue
+        if st in ("pending_delete", "backed_up", "syncing", "live_syncing"):
+            continue
+        if dp in queued or dp in clearing:
+            continue
+
+        if st == "done":
+            if not auto_delete or not d.get("obs_path"):
+                continue
+            try:
+                ts = _dt.strptime(key, "%y%m%d%H")
+            except ValueError:
+                continue
+            if ts >= clear_cutoff:
+                continue                       # 还在保留期，等时间到
+            if _recent_verify_fail(dp):
+                continue                       # 刚校核失败过，先放一边
+            return {"action": "clear", "dir_path": dp, "time": key,
+                    "obs_path": d["obs_path"], "reason": "保留期已到"}
+
+        # pending / error / partial / 其它未知状态 → 视为待备份
+        if submit_cutoff and key >= submit_cutoff:
+            continue                           # 太新，不自动动
+        if _recent_event(dp, ("upload_fail",), VERIFY_RETRY_BACKOFF_SEC):
+            continue                           # 刚上传失败过，先放一边别反复撞墙
+        return {"action": "backup", "dir_path": dp, "time": key,
+                "obs_path": d.get("obs_path") or "", "reason": f"状态 {st}"}
+
+    return None
+
+
+def run_pipeline_step(auto_delete: bool, retain_days: int,
+                      submit_min_age_days: int = 0, auto_submit: bool = True):
+    """推进串行流水线的一步。
+
+    返回 (action, dir_path) 或 (None, "")。真正的上传/删除由调用方执行：
+      - action == "backup" → 入队 sync 任务，由 run_once 执行上传；
+      - action == "clear"  → 这里就地完成校核并提交 clear。
+
+    auto_submit=False 时只推进 clear 分支，不再自动入队新的上传任务
+    （对应页面上「自动提交归档任务」开关）；已经排进队列的活不受影响。
+    """
+    from utils.log_paths import get_service_log_dir
+
+    step = select_pipeline_next(auto_delete, retain_days, submit_min_age_days)
+    if not step:
+        return None, ""
+    dp = step["dir_path"]
+    if step["action"] == "clear":
+        real = resolve_real_backup_dir(dp, get_service_log_dir())
+        ok = _submit_clear_verified(dp, real, step["obs_path"])
+        return ("clear" if ok else None), dp
+    if not auto_submit:
+        return None, ""
+    # backup：只入队一个，保证队列里恒为 0/1，严格串行
+    enqueued = enqueue_job(dp, "sync")
+    return ("backup" if enqueued else None), dp
 
 
 def _auto_backup_loop(logs_all: Path, active_env: str, active_path: str, resolver) -> None:
@@ -1002,6 +1345,9 @@ def _auto_backup_loop(logs_all: Path, active_env: str, active_path: str, resolve
             else:
                 _auto_set(message=f"磁盘 {pct}% ≥ 阈值 {cfg['threshold']}%，开始自动上传")
                 _run_auto_backup_round(logs_all, active_env, active_path, resolver)
+
+            # 注意：到期清理（流水线的 clear 分支）**不在 web 进程里跑**。
+            # 所有删除申请必须由 backup_worker 发出，web 只负责展示与上传入队。
 
             time.sleep(cfg["interval"])
         except Exception:  # noqa: BLE001 — 守护线程不能崩
@@ -1120,10 +1466,14 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
     # 启动手动上传串行队列 dispatcher：登记上下文 + 恢复中断项 + 起线程
     _dispatcher_ctx["logs_all"] = logs_all
     _dispatcher_ctx["resolver"] = _resolve_real_dir
-    try:
-        reset_running_on_startup()
-    except Exception:
-        logger.exception("reset backup_queue running-on-startup failed")
+    # 只在没有 backup_worker 运行时才重置队列：worker 存活时任务由它持有，
+    # web 重启（很常见）不该把它正在跑的大叶子打回 queued —— 那会让队列显示
+    # 「排队中」而 worker 仍在传，看起来像任务卡死。
+    if not _backup_worker_alive():
+        try:
+            reset_running_on_startup()
+        except Exception:
+            logger.exception("reset backup_queue running-on-startup failed")
     _ensure_dispatcher()
 
     def _ctx(request: Request) -> dict:
@@ -1158,15 +1508,18 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
         paged = bool(page_raw or size_raw)
         _newapi_root = _extra_root_for_env(env_name) if env_name else None
 
-        # 只有该 env 在 DB 中完全没有记录时，才做一次性初始扫描（首次建立 DB 或 DB 丢失）
-        if env_name and not has_any_dirs(env_name):
-            if _newapi_root:
-                fs_dirs = _scan_root_leaves(_newapi_root)
-            else:
-                fs_dirs = _scan_data_dirs(logs_all, env_name=env_name, port_env_map=_port_env_map)
-            for d in fs_dirs:
-                upsert_dir(d["dir_path"], d["env_name"], d["mtime_tag"], d["file_count"],
-                           port=d.get("port", ""), has_local=True)
+        # 用 leaf_status 幂等补齐该来源缺失的叶子行。
+        #
+        # 不能在这里扫盘：旧实现对历史根调 _scan_root_leaves → iter_index_dirs，
+        # 那是 NFS 上的递归 walk（proxy45 这类源实测 >45s 不返回），前端把
+        # 「选中来源」变成一次超时，表现为「选了没反应」。
+        #
+        # 原来用 has_any_dirs() 做闸门（有 1 行就跳过），导致备份队列只有零星
+        # 几行的来源（历史遗留 / 扫描被超时打断）永远补不全 —— 例如某源
+        # leaf_status 有 1427 个叶子、backup_dirs 只有 32 行。改成每次都补齐：
+        # _seed 内部先取已有 dir_key 集合，只插缺失的，纯本地 SQLite，毫秒级。
+        if env_name:
+            _seed_dirs_from_leaf_status(env_name)
 
         db_dirs = list_dirs(env_name=env_name if env_name else None)
 
@@ -1206,6 +1559,8 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                 "env_label": _label_map.get(d["env_name"], d["env_name"]),
                 "mtime_tag": d["mtime_tag"],
                 "file_count": d["file_count"],
+                # 上传时 obsutil 报告的真实字节数；-1 表示尚未上传
+                "size_bytes": int(d.get("size_bytes", -1) or -1),
                 "synced": d.get("synced", 0),
                 "status": d.get("status", "pending"),
                 "sync_time": d.get("sync_time", ""),
@@ -1314,10 +1669,37 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                 running = j["dir_path"]
             else:
                 queued.append(j["dir_path"])
+
+        # 自动提交模式下队列常常是「刚被领走 → 空 → 立刻补下一个」，
+        # 前端只看 running/queue_len 会觉得「开了自动备份却什么都没发生」。
+        # 这里带上开关状态与剩余候选数，让界面能解释「现在处于什么阶段」。
+        cfg = _auto_cfg()
+        candidates = None
+        if cfg["auto_submit"]:
+            try:
+                _chosen, matched, _skipped = select_archive_candidates(
+                    _active_dir_path, None,
+                    _submit_age_cutoff(cfg["submit_min_age_days"]),
+                    1, set())
+                candidates = matched
+            except Exception:  # noqa: BLE001
+                candidates = None
+
+        # 本地清理队列（clear_worker 消费）：与上传队列分开统计，
+        # 界面上要能分别看到「正在上传」和「正在清理」。
+        try:
+            from utils.backup_store import clear_queue_stats
+            clear_stats = clear_queue_stats()
+        except Exception:  # noqa: BLE001
+            clear_stats = {"queued": 0, "running": "", "failed": 0}
+
         return JSONResponse({
             "running": running,
             "queued": queued,
             "queue_len": len(queued),
+            "auto_submit": cfg["auto_submit"],
+            "candidates": candidates,
+            "clear": clear_stats,
             "jobs": [
                 {
                     "dir_path": j["dir_path"],
@@ -1981,7 +2363,8 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
         archived_leaves = 0
         pending_files = 0
         source_stat: dict = {}
-        months: dict = {}
+        # 按「数据日期」聚合：{YYMMDD: {"leaves": 总数, "done": 已备份}}
+        days: dict = {}
 
         for r in leaf_rows:
             lp = r.get("leaf_path") or ""
@@ -2015,44 +2398,105 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
 
             t = scan_time_key(lp) or scan_time_key(dk)
             if t:
-                m = day_key(t)[:4]
-                months[m] = months.get(m, 0) + 1
+                dk_day = day_key(t)          # YYMMDD
+                cell = days.get(dk_day)
+                if cell is None:
+                    cell = days[dk_day] = {"leaves": 0, "done": 0}
+                cell["leaves"] += 1
+                # 已备份口径与 totals 一致：有 OBS 内容，或已归档（本地已删）
+                if (b and b.get("has_obs")) or r.get("archived"):
+                    cell["done"] += 1
 
-        # 按月分布：最近 5 个月，缺月补 0（保持柱状图横轴连续）
-        month_points = []
-        if months:
-            keys = sorted(months)
-            recent = keys[-5:]
-            for k in recent:
-                month_points.append({"month": k, "label": k[-2:].lstrip("0") + "月",
-                                     "leaves": months[k]})
-
-        # 按小时的「备份完成量」趋势。
-        # 数据源是 backup_dirs.sync_time —— 每次上传成功都会盖这个时间戳，
-        # 所以它是「什么时候真正备份了多少叶子」的真实记录，不是派生估计。
-        # 注意不能用 scan_time_key（那是数据产生时间，不是备份时间）。
+        # 按「数据日期」分布，支持 天 / 周 / 月 三种粒度。
+        # 用数据日期（目录名 YYMMDDHH）而不是备份时间 —— 这张图回答的是
+        # 「哪天的数据备份完了」，与按备份时间的趋势图互补。
         #
-        # 横轴按**实际有备份记录的小时**铺开，不做「最近 24 小时」固定窗口：
-        # 备份是间歇性的（实测只在 9/26 和今天有记录），固定窗口会让柱子
-        # 全挤在右边一两个位置、其余全是 0，看不出实际分布。
-        hourly: dict = {}
-        try:
-            from utils.backup_store import hourly_sync_counts
-            for r in hourly_sync_counts():
-                if r["hour"]:
-                    hourly[r["hour"]] = r["leaves"]
-        except Exception:  # noqa: BLE001
-            hourly = {}
+        # 日粒度的键是 YYMMDD；周/月 由日粒度聚合而来（先算日，再 roll up），
+        # 保证三种粒度下的总数一致。
+        def _week_key(k: str) -> str:
+            """YYMMDD → 该周周一（YYMMDD）。用 ISO 周，跨年也不会串。"""
+            from datetime import datetime, timedelta
+            try:
+                d = datetime.strptime("20" + k, "%Y%m%d")
+            except ValueError:
+                return k
+            return (d - timedelta(days=d.weekday())).strftime("%y%m%d")
 
-        keys = sorted(hourly)
-        # 只保留最近 48 个备份小时，避免历史很长时柱子挤成一条线。
-        shown = keys[-48:]
-        trend_points = [{
-            "hour": h,
-            "label": h[5:10] + " " + h[11:13],   # MM-DD HH
-            "leaves": hourly[h],
-        } for h in shown]
-        total_synced = sum(hourly.values())
+        day_points, week_points, month_points = [], [], []
+        if days:
+            keys = sorted(days)
+            # 日：最近 60 个有数据的日子
+            for k in keys[-60:]:
+                cell = days[k]
+                pct = round(cell["done"] * 100 / cell["leaves"], 1) if cell["leaves"] else 0
+                day_points.append({
+                    "key": k,
+                    # 键是 YYMMDD：k[2:4]=月，k[4:6]=日
+                    "label": k[2:4].lstrip("0") + "/" + k[4:6].lstrip("0"),
+                    "leaves": cell["leaves"],
+                    "done": cell["done"],
+                    "pct": pct,
+                })
+
+            # 周 / 月：把日粒度 roll up
+            # 键格式说明：YYMMDD（如 260901）。周/月的标签都要取「月/日」两段：
+            #   k[2:4] = MM，k[4:6] = DD
+            # 之前误写成 k[4:6]/k[6:8]（那是 DD/HH，越界成空串），标签才会
+            # 变成「8/周」「6/1」这种错位结果。
+            for gran, target, n_keep, lab in (
+                ("week", week_points, 26,
+                 lambda k: k[2:4].lstrip("0") + "/" + k[4:6].lstrip("0") + "周"),
+                ("month", month_points, 12,
+                 lambda k: k[2:4].lstrip("0") + "月"),
+            ):
+                roll: dict = {}
+                for k in keys:
+                    gk = _week_key(k) if gran == "week" else k[:4] + "01"
+                    c = roll.get(gk)
+                    if c is None:
+                        c = roll[gk] = {"leaves": 0, "done": 0}
+                    c["leaves"] += days[k]["leaves"]
+                    c["done"] += days[k]["done"]
+                for gk in sorted(roll)[-n_keep:]:
+                    c = roll[gk]
+                    target.append({
+                        "key": gk,
+                        "label": lab(gk),
+                        "leaves": c["leaves"],
+                        "done": c["done"],
+                        "pct": round(c["done"] * 100 / c["leaves"], 1) if c["leaves"] else 0,
+                    })
+
+
+        # 按**天**的「备份完成量」趋势，支持 7/30/90 天窗口。
+        # 与下面按小时的口径同源（backup_dirs.sync_time），只是粒度不同：
+        # 备份是间歇性的，按小时会出现大量 0 值柱子，按天更能看出节奏。
+        from datetime import datetime as _dt, timedelta as _td
+        try:
+            trend_days = int(request.query_params.get("trend_days") or 30)
+        except (TypeError, ValueError):
+            trend_days = 30
+        trend_days = max(1, min(trend_days, 365))
+
+        daily: dict = {}
+        try:
+            from utils.backup_store import daily_sync_counts
+            for r in daily_sync_counts():
+                if r["day"]:
+                    daily[r["day"]] = r["leaves"]
+        except Exception:  # noqa: BLE001
+            daily = {}
+
+        daily_points = []
+        today = _dt.now().date()
+        for i in range(trend_days - 1, -1, -1):
+            d = (today - _td(days=i)).strftime("%Y-%m-%d")
+            daily_points.append({
+                "day": d,
+                "label": d[5:7].lstrip("0") + "/" + d[8:10].lstrip("0"),
+                "leaves": daily.get(d, 0),
+            })
+        daily_in_window = sum(p["leaves"] for p in daily_points)
 
         # 来源列表（名称走 sources 表）
         name_map: dict = {}
@@ -2075,11 +2519,22 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
             })
         sources.sort(key=lambda x: x["leaves"], reverse=True)
 
+        # 「最近备份操作」分页：前端用 recent_page 翻页，不再只取 20 条。
         try:
-            from utils.backup_store import get_recent_logs
-            recent = get_recent_logs(limit=20)
+            recent_page = max(1, int(request.query_params.get("recent_page") or 1))
+        except (TypeError, ValueError):
+            recent_page = 1
+        try:
+            recent_size = max(1, min(int(request.query_params.get("recent_size") or 20), 200))
+        except (TypeError, ValueError):
+            recent_size = 20
+        try:
+            from utils.backup_store import get_recent_logs, count_recent_logs
+            recent_total = count_recent_logs()
+            recent = get_recent_logs(limit=recent_size,
+                                     offset=(recent_page - 1) * recent_size)
         except Exception:  # noqa: BLE001
-            recent = []
+            recent, recent_total = [], 0
 
         cfg = _auto_cfg()
         # 本地磁盘实际用量（df）：前端「待释放本地空间」卡片改为显示真实值，
@@ -2096,12 +2551,19 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                 "progress_pct": (round(done_leaves * 100 / total_leaves, 1)
                                  if total_leaves else 0),
             },
+            # 按「数据日期」分布：三种粒度都返回，前端切换不需再请求
+            "days": day_points,
+            "weeks": week_points,
             "months": month_points,
-            # 按实际备份时间（sync_time）聚合的小时趋势
-            "trend": trend_points,
-            "total_synced": total_synced,
+            # 按实际备份时间（sync_time）聚合的日趋势，窗口由 trend_days 决定
+            "trend_daily": daily_points,
+            "trend_days_window": trend_days,
+            "trend_daily_total": daily_in_window,
             "sources": sources,
             "recent": recent,
+            "recent_total": recent_total,
+            "recent_page": recent_page,
+            "recent_size": recent_size,
             "auto": {
                 "enabled": cfg["enabled"],
                 "threshold": cfg["threshold"],
@@ -2193,7 +2655,13 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
 
     @app.post("/api/backup/confirm-delete")
     async def backup_confirm_delete(request: Request):
-        """人工确认删除：仅对 pending_delete 且已上传(has_obs)的目录，删本地并标 backed_up。"""
+        """人工确认删除：仅对 pending_delete 且已上传(has_obs)的目录，删本地并标 backed_up。
+
+        **必须把删除放到线程池**：NFS 的 unlink 可能长时间阻塞（实测卡死过
+        30 分钟），而这里是 async 端点、直接调用 shutil.rmtree 会阻塞 uvicorn
+        的事件循环 —— 表现就是「点了确认删除没有任何反应」，而且整个站点的
+        所有接口一起失去响应。
+        """
         denied = _require_ajax(request)
         if denied:
             return denied
@@ -2202,28 +2670,8 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
         if not dirs:
             return JSONResponse({"detail": "没有选择目录"}, status_code=400)
 
-        deleted, skipped = [], []
-        for dir_path in dirs:
-            info = get_dir(dir_path)
-            # 安全校验：必须是待删状态 + 已上传 OBS，防止误删未备份数据
-            if not info or info.get("status") != "pending_delete" \
-                    or not info.get("has_obs") or not info.get("obs_path"):
-                skipped.append(dir_path)
-                append_log(dir_path, "确认删除被拒绝：非待删状态或未成功上传", level="error")
-                continue
-            target = _resolve_real_dir(dir_path)
-            if target.is_dir():
-                try:
-                    shutil.rmtree(str(target))
-                    append_log(dir_path, f"人工确认删除，本地目录已删除: {target}")
-                except Exception as e:  # noqa: BLE001
-                    append_log(dir_path, f"删除失败: {e}", level="error")
-                    skipped.append(dir_path)
-                    continue
-            mark_backed_up(dir_path)
-            _mark_leaves_archived(dir_path, True)
-            deleted.append(dir_path)
-        return JSONResponse({"ok": True, "deleted": deleted, "skipped": skipped})
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(_confirm_delete_sync, dirs)
 
     _cleanup_stale_live_syncs()
 

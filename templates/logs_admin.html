@@ -114,6 +114,24 @@
         color-mix(in srgb, var(--destructive) 30%, transparent)); }
 .trend-axis { display: flex; justify-content: space-between; font-size: .7rem;
     color: var(--muted-foreground); margin-top: 6px; }
+/* 堆叠柱（分布图）：外层只负责占位，内层 <i> 才是实际柱子。
+   不能复用 .trend > div 那套（它会给容器本身刷上渐变背景，整条变成色块）。 */
+.trend-stack { display: flex; align-items: flex-end; gap: 4px; height: 110px;
+    padding-top: 8px; border-bottom: 1px solid var(--border); }
+.trend-stack > .col { flex: 1; min-width: 3px; height: 100%;
+    display: flex; flex-direction: column; justify-content: flex-end; }
+.trend-stack > .col > i { display: block; width: 100%; }
+
+/* 分段按钮（7/30/90 天、按天/周/月）：与 .btn-xs 的朴素风格区分开，
+   选中态用实心主色，未选中态是浅底描边，视觉上像一组互斥开关。 */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    overflow: hidden; }
+.seg button { background: var(--card); border: none; border-right: 1px solid var(--border);
+    padding: 4px 10px; font-size: 11px; line-height: 1.4; color: var(--muted-foreground);
+    cursor: pointer; transition: background var(--transition), color var(--transition); }
+.seg button:last-child { border-right: none; }
+.seg button:hover { background: var(--muted); color: var(--foreground); }
+.seg button.on { background: var(--primary); color: #fff; font-weight: 600; }
 .rate-big { font-size: 1.5rem; font-weight: 700; letter-spacing: -.5px; }
 .rate-unit { font-size: .72rem; color: var(--muted-foreground); margin-left: 4px; }
 
@@ -708,9 +726,17 @@
             </div>
             <div style="display:flex; flex-direction:column; gap:22px;">
                 <div>
-                    <div style="display:flex; justify-content:space-between; font-size:.8rem; margin-bottom:8px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;
+                                font-size:.8rem; margin-bottom:8px;">
                         <span style="color:var(--muted-foreground);">总体进度</span>
-                        <strong>{{ bk.totals.progress_pct }}%</strong>
+                        <span style="display:flex; align-items:center; gap:10px;">
+                            <strong style="font-size:1.15rem;">{{ bk.totals.progress_pct }}%</strong>
+                            <span class="seg">
+                                <button v-for="r in [7, 30, 90]" :key="'t' + r"
+                                        :class="{on: bkTrendDays === r}"
+                                        @click="bkSetTrendDays(r)">{{ r }}天</button>
+                            </span>
+                        </span>
                     </div>
                     <div style="height:12px; border-radius:8px; background:var(--muted); overflow:hidden;">
                         <i style="display:block; height:100%; border-radius:8px;
@@ -721,40 +747,64 @@
                         已备份 {{ fmtNum(bk.totals.done) }} / {{ fmtNum(bk.totals.leaves) }} 个叶子节点
                     </div>
                 </div>
+                <!-- 备份完成趋势：按实际备份时间（sync_time）的日粒度 -->
                 <div style="border-top:1px dashed var(--border); padding-top:18px;">
-                    <div style="font-size:.76rem; color:var(--muted-foreground); margin-bottom:4px;">
-                        备份完成趋势（按实际备份时间，每小时）
-                        <span v-if="bk.total_synced" style="margin-left:6px;">
-                            累计 {{ fmtNum(bk.total_synced) }} 个
+                    <div style="display:flex; align-items:baseline; gap:8px; margin-bottom:6px;">
+                        <span style="font-size:.76rem; color:var(--muted-foreground);">
+                            备份完成趋势（按实际备份时间，近 {{ bkTrendDays }} 天）
+                        </span>
+                        <span style="margin-left:auto; font-size:.76rem; color:var(--muted-foreground);">
+                            窗口内完成 {{ fmtNum(bk.trend_daily_total) }} 个
                         </span>
                     </div>
-                    <div class="trend" style="height:104px;">
-                        <div v-for="t in bk.trend" :key="t.hour"
+                    <div class="trend" style="height:110px;">
+                        <div v-for="t in bk.trend_daily" :key="t.day"
                              :style="{height: bkTrendHeight(t) + '%'}"
-                             :title="t.hour + ':00 · ' + fmtNum(t.leaves) + ' 个叶子'"></div>
+                             :title="t.day + ' · 完成 ' + fmtNum(t.leaves) + ' 个叶子'"></div>
                     </div>
                     <div class="trend-axis">
-                        <template v-if="bk.trend.length">
-                            <span>{{ bk.trend[0].label }}</span>
-                            <span>{{ bk.trend[Math.floor(bk.trend.length / 2)].label }}</span>
-                            <span>{{ bk.trend[bk.trend.length - 1].label }}</span>
+                        <template v-if="bk.trend_daily.length">
+                            <span>{{ bk.trend_daily[0].label }}</span>
+                            <span>{{ bk.trend_daily[Math.floor(bk.trend_daily.length / 2)].label }}</span>
+                            <span>{{ bk.trend_daily[bk.trend_daily.length - 1].label }}</span>
                         </template>
                         <span v-else>暂无数据</span>
                     </div>
                 </div>
                 <div style="border-top:1px dashed var(--border); padding-top:18px;">
-                    <div style="font-size:.76rem; color:var(--muted-foreground); margin-bottom:4px;">
-                        叶子节点备份时间分布（按数据月份，近 5 个月）
+                    <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+                        <span style="font-size:.76rem; color:var(--muted-foreground);">
+                            叶子节点备份分布（按数据日期）
+                        </span>
+                        <span style="font-size:.72rem; color:var(--muted-foreground);">
+                            深色=已备份 · 浅色=待备份 · 柱高=叶子数
+                        </span>
+                        <span style="margin-left:auto;">
+                            <span class="seg">
+                                <button v-for="g in [['day','按天'],['week','按周'],['month','按月']]"
+                                        :key="g[0]" :class="{on: bkGran === g[0]}"
+                                        @click="bkGran = g[0]">{{ g[1] }}</button>
+                            </span>
+                        </span>
                     </div>
-                    <div class="trend" style="height:104px;">
-                        <div v-for="m in bk.months" :key="m.month"
-                             :style="{height: bkMonthHeight(m) + '%'}"
-                             :title="m.month + ' · ' + fmtNum(m.leaves) + ' 个叶子'"></div>
+                    <div class="trend-stack">
+                        <div v-for="d in bkDistRows" :key="d.key" class="col"
+                             :title="d.key + ' · 共 ' + fmtNum(d.leaves) + ' 个叶子 · 已备份 '
+                                     + fmtNum(d.done) + '（' + d.pct + '%）'">
+                            <!-- 堆叠：上段待备份（浅），下段已备份（深），总高=叶子数。
+                                 用同一主色的透明度区分：已备份 0.8，待备份 0.5。 -->
+                            <i v-if="d.leaves > d.done"
+                               style="border-radius:3px 3px 0 0; background:var(--primary); opacity:.5;"
+                               :style="{height: bkDaySeg(d, 'pending') + '%'}"></i>
+                            <i style="border-radius:3px; background:var(--primary); opacity:.8;"
+                               :style="{height: bkDaySeg(d, 'done') + '%'}"></i>
+                        </div>
                     </div>
                     <div class="trend-axis">
-                        <span v-for="m in bk.months" :key="m.month"
-                              style="flex:1; text-align:center;">{{ m.label }}</span>
-                        <span v-if="!bk.months.length">暂无数据</span>
+                        <span>{{ bkDistRows.length ? bkDistRows[0].label : '' }}</span>
+                        <span>{{ bkDistRows.length ? bkDistRows[Math.floor(bkDistRows.length / 2)].label : '' }}</span>
+                        <span>{{ bkDistRows.length ? bkDistRows[bkDistRows.length - 1].label : '' }}</span>
+                        <span v-if="!bkDistRows.length">暂无数据</span>
                     </div>
                 </div>
             </div>
@@ -767,11 +817,11 @@
                 <div class="toolbar" style="margin-bottom:12px;">
                     <h6 style="margin:0;">叶子节点备份队列（按时间从旧到新）</h6>
                     <span style="margin-left:auto; display:flex; gap:6px; flex-wrap:wrap;">
-                        <select class="input input-sm" v-model="bkEnv" @change="loadBackupQueue()" style="width:auto;">
+                        <select class="input input-sm" v-model="bkEnv" @change="bkApplyFilter" style="width:auto;">
                             <option value="">全部来源</option>
                             <option v-for="s in bk.sources" :key="s.root_id" :value="s.root_id">{{ s.name }}</option>
                         </select>
-                        <select class="input input-sm" v-model="bkStatus" style="width:auto;">
+                        <select class="input input-sm" v-model="bkStatus" @change="bkApplyFilter" style="width:auto;">
                             <option value="">全部状态</option>
                             <option value="pending">待备份</option>
                             <option value="done">已备份</option>
@@ -780,13 +830,41 @@
                             <option value="backed_up">已清理</option>
                             <option value="pending_delete">待删除</option>
                         </select>
-                        <button class="btn btn-outline btn-sm" @click="bkOrder = (bkOrder === 'asc' ? 'desc' : 'asc')">
+                        <button class="btn btn-outline btn-sm" @click="bkToggleOrder">
                             {{ bkOrder === 'asc' ? '↑ 时间从旧到新' : '↓ 时间从新到旧' }}
                         </button>
                         <button class="btn btn-primary btn-sm" @click="bkArchiveSelected"
                                 :disabled="!bkChecked.length || bkArchiving">
                             {{ bkArchiving ? '入队中…' : ('备份选中节点' + (bkChecked.length ? ' (' + bkChecked.length + ')' : '')) }}
                         </button>
+                    </span>
+                </div>
+                <!-- 自动备份运行状态：让「开关已开但队列看着是空的」有解释 -->
+                <div v-if="bkPolicy.auto_submit || bkQueue.running || bkQueue.queue_len"
+                     style="display:flex; align-items:center; gap:10px; font-size:.78rem;
+                            padding:8px 10px; margin-bottom:10px; border-radius:6px;
+                            background:color-mix(in srgb, var(--primary) 7%, transparent);
+                            border:1px solid color-mix(in srgb, var(--primary) 22%, transparent);">
+                    <span class="dot" :class="(bkQueue.running || bkQueue.queue_len) ? 'on' : 'off'"></span>
+                    <!-- 正在处理与排队**同时展示**：之前用 v-else-if，一有任务在跑
+                         就永远不显示排队数，看起来像「排队数量不生效」。 -->
+                    <template v-if="bkQueue.running">
+                        <span style="color:var(--primary); font-weight:600;">正在备份</span>
+                        <span class="mono" style="word-break:break-all;">{{ bkQueue.running }}</span>
+                    </template>
+                    <span v-if="bkQueue.running && bkQueue.queue_len"
+                          style="color:var(--muted-foreground);">·</span>
+                    <template v-if="bkQueue.queue_len">
+                        <span style="color:var(--primary); font-weight:600;">排队中</span>
+                        <span>{{ bkQueue.queue_len }} 个等待执行</span>
+                    </template>
+                    <template v-if="!bkQueue.running && !bkQueue.queue_len && !bkClearingRunning && bkPolicy.auto_submit">
+                        <span style="color:var(--muted-foreground);">
+                            串行流水线运行中，等待下一条（早于 {{ bkPolicy.submit_min_age_days }} 天，按时间从远到近逐个处理）
+                        </span>
+                    </template>
+                    <span v-if="bkQueue.candidates != null" style="margin-left:auto; color:var(--muted-foreground);">
+                        剩余候选 {{ fmtNum(bkQueue.candidates) }}
                     </span>
                 </div>
                 <div class="dash-scroll">
@@ -812,7 +890,7 @@
                             </td>
                             <td class="mono" style="font-size:.78rem;">{{ bkTs(d) }}</td>
                             <td class="col-center">{{ d.file_count ? fmtNum(d.file_count) : '—' }}</td>
-                            <td class="col-center">—</td>
+                            <td class="col-center">{{ bkSize(d) }}</td>
                             <td>
                                 <a v-if="d.obs_path" class="mono" style="font-size:.74rem; color:var(--primary); cursor:pointer;"
                                    :title="d.obs_path" @click="bkShowObs(d)">
@@ -822,7 +900,16 @@
                             </td>
                             <td>
                                 <span :class="['badge', bkBadge(d.status)]">{{ bkStatusLabel(d.status) }}</span>
-                                <span v-if="bkQueueSet.has(d.dir_path) && bkQueue.running !== d.dir_path"
+                                <span v-if="bkClearingRunning === d.dir_path"
+                                      class="badge badge-warn" style="margin-left:4px;"
+                                      :title="'clear_worker 正在删除本地目录'">
+                                    <span class="dot" style="background:currentColor;display:inline-block;
+                                                             width:5px;height:5px;border-radius:50%;
+                                                             margin-right:4px;vertical-align:middle;"></span>正在清理
+                                </span>
+                                <span v-else-if="bkClearSet.has(d.dir_path)"
+                                      class="badge badge-history" style="margin-left:4px;">待清理</span>
+                                <span v-else-if="bkQueueSet.has(d.dir_path) && bkQueue.running !== d.dir_path"
                                       class="badge badge-warn" style="margin-left:4px;">排队中</span>
                             </td>
                             <td style="white-space:nowrap;">
@@ -916,11 +1003,9 @@
                         </label>
                     </div>
                     <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
-                        <span>每轮提交数量</span>
-                        <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
-                            <input type="number" class="input input-sm" v-model.number="bkPolicy.submit_batch"
-                                   @change="bkSavePolicy" min="1" style="width:70px;">
-                            <span style="font-size:.76rem; color:var(--muted-foreground);">个</span>
+                        <span>处理方式</span>
+                        <span style="margin-left:auto; font-size:.76rem; color:var(--muted-foreground);">
+                            串行：一次只处理一个叶子（从最远到最近），备份完/删完才推进下一个
                         </span>
                     </div>
                     <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
@@ -1020,6 +1105,22 @@
         <div class="panel">
             <div class="toolbar" style="margin-bottom:10px;">
                 <h6 style="margin:0;">最近备份操作</h6>
+                <span style="font-size:.78rem; color:var(--muted-foreground); margin-left:8px;">
+                    共 {{ fmtNum(bk.recent_total || 0) }} 条
+                </span>
+                <span style="margin-left:auto; display:flex; gap:6px; align-items:center;">
+                    <button class="btn btn-outline btn-sm" @click="bkGoRecent(1)"
+                            :disabled="bkRecentPage <= 1">首页</button>
+                    <button class="btn btn-outline btn-sm" @click="bkGoRecent(bkRecentPage - 1)"
+                            :disabled="bkRecentPage <= 1">上一页</button>
+                    <span style="font-size:.78rem; color:var(--muted-foreground);">
+                        {{ bkRecentPage }} / {{ bkRecentPages }}
+                    </span>
+                    <button class="btn btn-outline btn-sm" @click="bkGoRecent(bkRecentPage + 1)"
+                            :disabled="bkRecentPage >= bkRecentPages">下一页</button>
+                    <button class="btn btn-outline btn-sm" @click="bkGoRecent(bkRecentPages)"
+                            :disabled="bkRecentPage >= bkRecentPages">末页</button>
+                </span>
             </div>
             <table class="dir-table" v-if="bk.recent.length">
                 <thead>
@@ -1139,12 +1240,20 @@ new Vue({
         pollers: {},     // path -> 构建完成检测 intervalId（结束即 clear）
 
         // ===== 备份管理 Tab =====
-        bk: { totals: {}, months: [], sources: [], recent: [] },
+        // 初始值必须覆盖模板里访问到的每个字段：Vue 在首屏渲染时若遇到
+        // undefined（如 bk.trend.length），会抛 TypeError 并中断整个组件渲染，
+        // 表现为页面空白/打不开 —— 而不是只影响该区块。
+        bk: { totals: {}, days: [], weeks: [], months: [],
+              trend_daily: [], trend_daily_total: 0,
+              sources: [], recent: [], recent_total: 0, disk: null },
+        bkTrendDays: 30,     // 备份完成趋势的窗口（7/30/90 天）
+        bkGran: 'day',       // 分布图粒度：day | week | month
+        bkRecentPage: 1,
         bkDirs: [],          // /api/backup/dirs 当前页的目录明细
         bkConfig: { obs_base: '' },
         bkPolicy: { enabled: false, threshold: 70, interval: 120, auto_delete: true, retain_days: 7,
                     auto_submit: false, submit_batch: 20, submit_min_age_days: 7 },
-        bkQueue: { running: '', queued: [], queue_len: 0 },
+        bkQueue: { running: '', queued: [], queue_len: 0, auto_submit: false, candidates: null },
         bkEnv: '',
         bkStatus: '',
         bkOrder: 'asc',      // 时间从旧到新
@@ -1224,6 +1333,25 @@ new Vue({
         },
         bkQueueSet: function() {
             return new Set(this.bkQueue.queued || []);
+        },
+        // 正在清理 / 待清理（来自 clear_worker 的独立队列）
+        bkClearingRunning: function() {
+            return (this.bkQueue.clear && this.bkQueue.clear.running) || '';
+        },
+        bkClearSet: function() {
+            var c = this.bkQueue.clear || {};
+            // paths 含 running + queued；running 单独用 bkClearingRunning 优先显示
+            return new Set(c.paths || []);
+        },
+        // 分布图当前粒度的数据源（后端三种粒度都返回，前端切换不发请求）
+        bkDistRows: function() {
+            if (this.bkGran === 'week') return this.bk.weeks || [];
+            if (this.bkGran === 'month') return this.bk.months || [];
+            return this.bk.days || [];
+        },
+        bkRecentPages: function() {
+            var size = this.bk.recent_size || 20;
+            return Math.max(1, Math.ceil((this.bk.recent_total || 0) / size));
         },
     },
     methods: {
@@ -1693,9 +1821,15 @@ new Vue({
         },
         loadBackupOverview: function() {
             var self = this;
-            return this._bkFetch('/api/backup/overview').then(function(d) {
+            // 趋势窗口与日志分页都由这里带过去：否则切 7/30/90 天或翻页时
+            // 拿到的还是默认值，界面看起来「点了没反应」。
+            var q = '?trend_days=' + this.bkTrendDays
+                  + '&recent_page=' + this.bkRecentPage
+                  + '&recent_size=20';
+            return this._bkFetch('/api/backup/overview' + q).then(function(d) {
                 if (!d || !d.totals) return;
                 self.bk = d;
+                if (d.recent_page) self.bkRecentPage = d.recent_page;
                 if (d.auto) {
                     self.bkPolicy.enabled = !!d.auto.enabled;
                     self.bkPolicy.threshold = d.auto.threshold;
@@ -1735,25 +1869,60 @@ new Vue({
             this.bkPage = target;
             this.loadBackupQueue();
         },
+        // 趋势窗口切换（7/30/90 天）：重新拉一次 overview
+        bkSetTrendDays: function(days) {
+            this.bkTrendDays = days;
+            this.loadBackupOverview();
+        },
+        // 「最近备份操作」翻页
+        bkGoRecent: function(p) {
+            var target = Math.max(1, Math.min(Number(p) || 1, this.bkRecentPages));
+            if (target === this.bkRecentPage) return;
+            this.bkRecentPage = target;
+            this.loadBackupOverview();
+        },
+        // 筛选/排序变化后必须回到第 1 页再拉取：否则停在第 N 页时，
+        // 新条件下的结果可能不足 N 页，看起来就像「筛选没生效」。
+        bkApplyFilter: function() {
+            this.bkPage = 1;
+            this.bkChecked = [];
+            this.loadBackupQueue();
+        },
+        bkToggleOrder: function() {
+            this.bkOrder = (this.bkOrder === 'asc') ? 'desc' : 'asc';
+            this.bkApplyFilter();
+        },
         loadBackupConfig: function() {
             var self = this;
             return this._bkFetch('/api/backup/config').then(function(d) {
                 if (d && !d.detail) self.bkConfig = d;
             }).catch(function() {});
         },
-        bkMonthHeight: function(m) {
-            var max = (this.bk.months || []).reduce(function(a, x) {
+        // 按天分布的堆叠柱：柱总高 = 当天叶子数（相对所有天的最大值归一化），
+        // 深色段 = 已备份，浅色段 = 待备份。两段之和等于柱高。
+        bkDayHeight: function(d) {
+            var max = (this.bk.days || []).reduce(function(a, x) {
                 return Math.max(a, x.leaves || 0);
             }, 1);
-            return m.leaves ? Math.max(6, Math.round(m.leaves * 100 / max)) : 2;
+            return d.leaves ? Math.max(4, Math.round(d.leaves * 100 / max)) : 0;
+        },
+        bkDaySeg: function(d, which) {
+            // 返回该段占**整个柱区**的百分比（两段相加 = bkDayHeight）
+            var total = this.bkDayHeight(d);
+            var n = which === 'done' ? (d.done || 0) : Math.max(0, (d.leaves || 0) - (d.done || 0));
+            if (!d.leaves) return 0;
+            return Math.max(0, Math.round(total * n / d.leaves));
         },
         bkTrendHeight: function(t) {
-            // 按实际备份时间聚合的小时柱：高度取窗口内最大值归一化。
-            // 0 值也给最小高度，保证柱子在横轴上仍占位（能看出「这小时没备份」）。
-            var max = (this.bk.trend || []).reduce(function(a, x) {
+            // 按天聚合的备份完成量（trend_daily）：高度取窗口内最大值归一化。
+            // 必须读 trend_daily —— 后端已经把 key 从 trend 改名为 trend_daily，
+            // 读 this.bk.trend 会拿到 undefined，max 恒为 1，所有柱子都被算成
+            // 0 或 100%（这正是「趋势图只剩断断续续的虚线」的原因）。
+            var rows = this.bk.trend_daily || [];
+            var max = rows.reduce(function(a, x) {
                 return Math.max(a, x.leaves || 0);
             }, 1);
-            return t.leaves ? Math.max(6, Math.round(t.leaves * 100 / max)) : 2;
+            return t.leaves ? Math.max(6, Math.round(t.leaves * 100 / max)) : 0;
         },
         bkLeafLabel: function(d) {
             // 「来源/时间戳」两段：newapi 的 mtime_tag 可能是 天/小时 两层
@@ -1765,6 +1934,14 @@ new Vue({
             var m = (d.mtime_tag || '').match(/(\d{2})(\d{2})(\d{2})(\d{2})$/);
             if (!m) return d.mtime_tag || '—';
             return '20' + m[1] + '-' + m[2] + '-' + m[3] + ' ' + m[4] + ':00';
+        },
+        bkSize: function(d) {
+            // 数据量来自上传时 obsutil 输出的 `Succeed bytes:`。
+            // -1 / null 表示还没传过，本地不预先统计（NFS 上数文件太慢）。
+            var n = d && d.size_bytes;
+            if (n == null || n < 0) return '—';
+            if (n === 0) return '0 B';
+            return this.fmtBytes(n);
         },
         bkStatusLabel: function(s) {
             var m = {
@@ -1920,17 +2097,23 @@ new Vue({
         bkConfirmDelete: function(dirs) {
             var self = this;
             if (!dirs || !dirs.length) return;
-            if (!confirm('确认删除本地目录？(' + dirs.length + ' 个)\n这些目录已上传 OBS，删除后仅释放本地磁盘，不影响 OBS 备份。')) return;
+            if (!confirm('确认删除本地目录？(' + dirs.length + ' 个)\n这些目录已上传 OBS，删除后仅释放本地磁盘，不影响 OBS 备份。\n删除由 clear_worker 异步执行。')) return;
             this._bkFetch('/api/backup/confirm-delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ dirs: dirs }),
             }).then(function(d) {
-                if (d.skipped && d.skipped.length) {
-                    alert('已删除 ' + (d.deleted || []).length + ' 个，跳过 ' + d.skipped.length + ' 个');
+                // 后端现在只入队、不立即删除（避免 NFS 阻塞拖死服务），
+                // 所以返回的是 queued 而不是 deleted。
+                if (d.detail) { alert(d.detail); return; }
+                var n = (d.queued || []).length;
+                var sk = (d.skipped || []).length;
+                if (sk) {
+                    alert('已提交 ' + n + ' 个清理任务，跳过 ' + sk + ' 个（非待删/未上传/已在队列）');
                 }
                 self.loadBackupQueue();
                 self.loadBackupOverview();
+                self.bkStartPoll();
             }).catch(function(e) { alert('请求失败: ' + e); });
         },
         bkStartPoll: function() {

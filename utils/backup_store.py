@@ -83,6 +83,29 @@ def init_db(db_dir: str):
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_queue_active "
             "ON backup_queue(dir_path) WHERE state IN ('queued','running')"
         )
+        # backup_clear_queue —— 本地清理队列（与上传队列**完全分离**）
+        #
+        # 为什么要单独一条队列：上传和删除的失败模式完全不同。上传是网络/OBS
+        # 问题，失败可重试；删除是本地 NFS 问题，可能无限阻塞。混在一条队列里时，
+        # 一个卡住的删除会堵死整条上传流水线，也让「传了多少」和「删了多少」
+        # 无法分开统计。现在 backup_worker 只管上传，clear_worker 只管删除。
+        _conn.execute("""
+            CREATE TABLE IF NOT EXISTS backup_clear_queue (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                dir_path      TEXT NOT NULL,
+                local_path    TEXT NOT NULL,           -- 已解析的绝对路径（精准删除的依据）
+                state         TEXT NOT NULL DEFAULT 'queued',  -- queued|running|failed
+                attempts      INTEGER NOT NULL DEFAULT 0,
+                last_error    TEXT NOT NULL DEFAULT '',
+                enqueued_at   TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                started_at    TEXT,
+                finished_at   TEXT
+            )
+        """)
+        _conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_clear_queue_active "
+            "ON backup_clear_queue(dir_path) WHERE state IN ('queued','running')"
+        )
         for col, definition in [
             ("sync_pid", "INTEGER DEFAULT NULL"),
             ("port",     "TEXT NOT NULL DEFAULT ''"),
@@ -92,6 +115,10 @@ def init_db(db_dir: str):
             # 只有 uploaded_at 非空且 deleted_at 非空，才说明「确实传上去了才删的」。
             ("uploaded_at", "TEXT NOT NULL DEFAULT ''"),
             ("deleted_at",  "TEXT NOT NULL DEFAULT ''"),
+            # 上传时 obsutil 报告的真实字节数（`Succeed bytes:`）。
+            # 本地不预先统计：逐个 iterdir 数文件在 NFS 上代价过高。
+            # -1 表示尚未上传过、没有数据。
+            ("size_bytes",  "INTEGER NOT NULL DEFAULT -1"),
         ]:
             try:
                 _conn.execute(f"ALTER TABLE backup_dirs ADD COLUMN {col} {definition}")
@@ -195,6 +222,31 @@ def upsert_dir(dir_path: str, env_name: str, mtime_tag: str, file_count: int = 0
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (dir_path, env_name, mtime_tag, file_count, port,
                   int(has_local), int(has_obs), _now(), _now()))
+        _conn.commit()
+
+
+def set_upload_stats(dir_path: str, size_bytes=None, file_count=None):
+    """记录上传时 obsutil 报告的真实数据量与文件数。
+
+    数据量只有上传过程能拿到（obsutil 的 `Succeed bytes:`），本地不预先统计
+    —— 逐个 iterdir 数文件在 NFS 上代价过高（72 个叶子几十秒）。
+    只写非 None 的字段，避免把已有值覆盖成 0。
+    """
+    fields, params = [], []
+    if size_bytes is not None and int(size_bytes) >= 0:
+        fields.append("size_bytes = ?")
+        params.append(int(size_bytes))
+    if file_count is not None and int(file_count) > 0:
+        fields.append("file_count = ?")
+        params.append(int(file_count))
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    params.append(_now())
+    params.append(dir_path)
+    with _lock:
+        _conn.execute(
+            f"UPDATE backup_dirs SET {', '.join(fields)} WHERE dir_path = ?", params)
         _conn.commit()
 
 
@@ -431,6 +483,21 @@ def _is_legacy_event(message: str) -> bool:
     return any(h in m for h in _LEGACY_EVENT_HINTS)
 
 
+def daily_sync_counts() -> List[dict]:
+    """按**天**统计「备份完成」的叶子数，供概览页趋势图（近 N 天视图）。
+
+    与 hourly_sync_counts 同源（backup_dirs.sync_time），只是粒度不同。
+    返回 [{day: 'YYYY-MM-DD', leaves: n}, ...]，按时间升序。
+    """
+    with _lock:
+        rows = _conn.execute(
+            "SELECT substr(sync_time, 1, 10) AS d, COUNT(*) AS n FROM backup_dirs "
+            "WHERE sync_time IS NOT NULL AND sync_time != '' "
+            "GROUP BY d ORDER BY d"
+        ).fetchall()
+    return [{"day": r["d"], "leaves": int(r["n"])} for r in rows if r["d"]]
+
+
 def hourly_sync_counts() -> List[dict]:
     """按小时统计「备份完成」的叶子数，供概览页的趋势图。
 
@@ -447,16 +514,16 @@ def hourly_sync_counts() -> List[dict]:
     return [{"hour": r["h"], "leaves": int(r["n"])} for r in rows if r["h"]]
 
 
-def get_recent_logs(limit: int = 30, level: str = "", dir_prefix: str = "") -> List[dict]:
-    """「最近备份操作」：只返回**有意义**的操作事件。
+def _recent_logs_where(level: str, dir_prefix: str) -> tuple:
+    """「最近备份操作」的 WHERE 子句 + 参数，供列表与计数共用。
 
-    优先取带 event 的结构化行（新数据）；event 为空的历史行按关键字过滤掉
-    obsutil 噪音后仍可展示，因此不需要回填旧数据。
-
-    走 id 倒序（自增即时间序），比 ORDER BY created_at 稳定（同秒多条不抖动）。
-    返回的每条带 `event` 字段，前端据此选图标与文案。
+    直接在 SQL 里筛业务事件，不能「取最后 N 条再内存过滤」：一次普通上传会写
+    几十行 obsutil 原始输出（Task id / 进度条 / Metrics / Succeed bytes …），
+    600 行窗口里可能一条业务事件都没有，过滤后就是空列表 —— 表现为「最近备份
+    操作没有日志了」。
+      - 新数据：event 非空
+      - 老数据：无 event 标签，靠 LEGACY 关键字白名单命中
     """
-    sql = "SELECT id, dir_path, level, message, event, created_at FROM backup_logs"
     conds, params = [], []
     if level:
         conds.append("level = ?")
@@ -464,11 +531,42 @@ def get_recent_logs(limit: int = 30, level: str = "", dir_prefix: str = "") -> L
     if dir_prefix:
         conds.append("dir_path LIKE ?")
         params.append(dir_prefix + "%")
-    if conds:
-        sql += " WHERE " + " AND ".join(conds)
-    # 多取一批再在内存里过滤噪音，保证 limit 条是真正有用的那些。
-    sql += " ORDER BY id DESC LIMIT ?"
-    params.append(max(int(limit) * 20, 200))
+    ev_terms = list(_LEGACY_EVENT_HINTS)
+    ev_sql = "event != '' OR " + " OR ".join("message LIKE ?" for _ in ev_terms)
+    conds.append(f"({ev_sql})")
+    params.extend(f"%{t}%" for t in ev_terms)
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    return where, params
+
+
+def count_recent_logs(level: str = "", dir_prefix: str = "") -> int:
+    """符合「最近备份操作」过滤条件的总行数，供前端分页算总页。
+
+    与 get_recent_logs 共用同一 WHERE。注意这是 SQL 层的计数，不含老数据
+    二次噪音过滤（_is_noise）剔除的那几条，所以可能比逐页累加略多；分页足够用。
+    """
+    where, params = _recent_logs_where(level, dir_prefix)
+    with _lock:
+        row = _conn.execute(
+            "SELECT COUNT(*) AS n FROM backup_logs" + where, params
+        ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def get_recent_logs(limit: int = 30, level: str = "", dir_prefix: str = "",
+                    offset: int = 0) -> List[dict]:
+    """「最近备份操作」：只返回**有意义**的操作事件，支持分页。
+
+    优先取带 event 的结构化行（新数据）；event 为空的历史行按关键字过滤掉
+    obsutil 噪音后仍可展示，因此不需要回填旧数据。
+
+    走 id 倒序（自增即时间序），比 ORDER BY created_at 稳定（同秒多条不抖动）。
+    返回的每条带 `event` 字段，前端据此选图标与文案。
+    """
+    where, params = _recent_logs_where(level, dir_prefix)
+    sql = ("SELECT id, dir_path, level, message, event, created_at FROM backup_logs"
+           + where + " ORDER BY id DESC LIMIT ? OFFSET ?")
+    params = params + [int(limit), max(0, int(offset))]
     with _lock:
         rows = _conn.execute(sql, params).fetchall()
 
@@ -477,13 +575,10 @@ def get_recent_logs(limit: int = 30, level: str = "", dir_prefix: str = "") -> L
         row = dict(r)
         ev = row.get("event") or ""
         msg = row.get("message") or ""
-        # 新数据带 event 标签，直接认可；老数据没有标签，必须命中业务事件
-        # 白名单才算（只看 level 或只排除噪音都不够 —— obsutil 的
-        # `Metrics [...]`、进度条、`执行: ...` 都会被漏进来，实测 20 条里 14 条噪音）。
-        if ev or (_is_legacy_event(msg) and not _is_noise(msg)):
+        # 老数据没有 event 标签，还可能命中白名单里的噪音词（如「执行: ...」
+        # 含「同步」），再过一遍噪音过滤。
+        if ev or not _is_noise(msg):
             out.append(row)
-        if len(out) >= int(limit):
-            break
     return out
 
 
@@ -572,6 +667,111 @@ def enqueue_job(dir_path: str, job_type: str = "sync") -> bool:
             return False
 
 
+# ---------------------------------------------------------------------------
+# backup_clear_queue — 本地清理队列（只由 clear_worker 消费，与上传完全隔离）
+# ---------------------------------------------------------------------------
+
+def enqueue_clear(dir_path: str, local_path: str) -> bool:
+    """把「待删除本地目录」加入清理队列。重复入队返回 False。
+
+    local_path 是**入队时就解析好的绝对路径**，worker 只按它删，不再自己推导 ——
+    删除是不可逆操作，路径必须在能看见完整上下文的主进程里算准。
+    """
+    with _lock:
+        try:
+            _conn.execute(
+                "INSERT INTO backup_clear_queue (dir_path, local_path, state, enqueued_at) "
+                "VALUES (?, ?, 'queued', ?)",
+                (dir_path, local_path, _now()),
+            )
+            _conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def claim_next_clear() -> Optional[dict]:
+    """clear_worker 领取一个待删任务（原子领取，同 claim_next_job）。"""
+    with _lock:
+        try:
+            _conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            return None
+        try:
+            row = _conn.execute(
+                "SELECT * FROM backup_clear_queue WHERE state = 'queued' "
+                "ORDER BY id ASC LIMIT 1").fetchone()
+            if not row:
+                _conn.rollback()
+                return None
+            cur = _conn.execute(
+                "UPDATE backup_clear_queue SET state = 'running', started_at = ?, "
+                "attempts = attempts + 1 WHERE id = ? AND state = 'queued'",
+                (_now(), row["id"]))
+            if cur.rowcount == 0:
+                _conn.rollback()
+                return None
+            _conn.commit()
+        except Exception:
+            try:
+                _conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        job = dict(row)
+        job["state"] = "running"
+        job["attempts"] = int(job.get("attempts") or 0) + 1
+        return job
+
+
+def finish_clear(job_id: int, ok: bool, error: str = ""):
+    """结束一个清理任务。成功则移除队列行；失败保留为 failed 供排查。"""
+    with _lock:
+        if ok:
+            _conn.execute("DELETE FROM backup_clear_queue WHERE id = ?", (job_id,))
+        else:
+            _conn.execute(
+                "UPDATE backup_clear_queue SET state = 'failed', last_error = ?, "
+                "finished_at = ? WHERE id = ?", (error or "", _now(), job_id))
+        _conn.commit()
+
+
+def reset_clear_on_startup() -> int:
+    """把上次中断的 running 清理任务降回 queued（clear_worker 启动时调用）。"""
+    with _lock:
+        cur = _conn.execute(
+            "UPDATE backup_clear_queue SET state = 'queued', started_at = NULL "
+            "WHERE state = 'running'")
+        _conn.commit()
+        return cur.rowcount or 0
+
+
+def list_clear_queue() -> List[dict]:
+    with _lock:
+        rows = _conn.execute(
+            "SELECT * FROM backup_clear_queue WHERE state IN ('queued','running') "
+            "ORDER BY id ASC").fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_queue_stats() -> dict:
+    """清理队列概况。paths 供前端在队列表格里标出「正在清理」的行。"""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT dir_path, state FROM backup_clear_queue "
+            "WHERE state IN ('queued','running') ORDER BY id").fetchall()
+        failed = _conn.execute(
+            "SELECT COUNT(*) AS n FROM backup_clear_queue WHERE state='failed'").fetchone()["n"]
+    running = next((r["dir_path"] for r in rows if r["state"] == "running"), "")
+    return {
+        "queued": sum(1 for r in rows if r["state"] == "queued"),
+        "running": running,
+        "failed": int(failed),
+        # 前端用来判断某一行是否正在清理（含排队中）
+        "paths": [r["dir_path"] for r in rows],
+    }
+
+
 def claim_next_job() -> Optional[dict]:
     """领取下一个待处理任务：全局同时只允许一个 running。
 
@@ -638,11 +838,44 @@ def list_queue() -> List[dict]:
     return [dict(r) for r in rows]
 
 
-def reset_running_on_startup():
-    """进程启动时把上次中断的 running 降回 queued，供 dispatcher 重新领取。"""
+def reset_running_on_startup(owner: str = "web"):
+    """把上次中断的 running 降回 queued，供 worker 重新领取。
+
+    **只能由持有队列的进程调用**：web 进程启动时若无条件重置，会把正在被
+    worker 正常执行的任务（哪怕它跑了几十分钟的大叶子）打回 queued ——
+    结果是同一条任务被「排队中」显示、而 worker 仍在跑它，看起来像卡住。
+    所以 web 侧只在 worker 没在跑时调用（见 register_backup_routes）。
+    """
     with _lock:
-        _conn.execute(
-            "UPDATE backup_queue SET state = 'queued', started_at = NULL WHERE state = 'running'"
-        )
+        n = 0
+        try:
+            cur = _conn.execute(
+                "UPDATE backup_queue SET state = 'queued', started_at = NULL "
+                "WHERE state = 'running'")
+            n = cur.rowcount or 0
+        except sqlite3.Error:
+            n = 0
         _conn.commit()
+    return n
+
+
+def requeue_stale_running(max_age_sec: int = 7200) -> int:
+    """把「running 但已开始太久」的任务降回 queued（防进程被杀留下僵尸任务）。
+
+    与 reset_running_on_startup 的区别：按 started_at 判断年龄，不动正在正常
+    推进的任务。返回重排条数。
+    """
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(seconds=max_age_sec)).strftime("%Y-%m-%d %H:%M:%S")
+    with _lock:
+        try:
+            cur = _conn.execute(
+                "UPDATE backup_queue SET state = 'queued', started_at = NULL "
+                "WHERE state = 'running' AND (started_at IS NULL OR started_at < ?)",
+                (cutoff,))
+            n = cur.rowcount or 0
+        except sqlite3.Error:
+            n = 0
+        _conn.commit()
+    return n
 

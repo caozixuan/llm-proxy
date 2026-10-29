@@ -82,13 +82,27 @@ modes:
     public: true
 
   jiuwenswarm_dev:
-    label: "Jiuwenswarm 开发导出（快照分支聚合+权重+reasoning 回填）"
-    mode_label: "Jiuwenswarm 导出"
-    step: "Jiuwenswarm 聚合"
-    obs_sub: "session_analysis_jiuwenswarm"
-    local_dir: "logs_session_analysis_jiuwenswarm"
+    label: "Jiuwenswarm 开发导出（压缩分段 + 权重 + reasoning 回填）"
+    mode_label: "Jiuwenswarm 开发"
+    step: "Jiuwenswarm 分段"
+    obs_sub: "session_analysis_jiuwenswarm_dev"
+    local_dir: "logs_session_analysis_jiuwenswarm_dev"
     pipeline: "reformat"
-    processor: "utils.eval.reformat_jiuwenswarm:jiuwenswarm_export"
+    processor: "utils.eval.jiuwenswarm_segments:jiuwenswarm_segments_export"
+    profile: dev
+    formats: ["newapi"]
+    public: true
+
+  jiuwenswarm_xiaoyi:
+    label: "小艺导出（压缩分段 + 权重 + reasoning 回填）"
+    mode_label: "小艺导出"
+    step: "小艺分段"
+    obs_sub: "session_analysis_jiuwenswarm_xiaoyi"
+    local_dir: "logs_session_analysis_jiuwenswarm_xiaoyi"
+    pipeline: "reformat"
+    processor: "utils.eval.jiuwenswarm_segments:jiuwenswarm_segments_export"
+    profile: xiaoyi
+    formats: ["newapi"]
     public: true
 
   eval:
