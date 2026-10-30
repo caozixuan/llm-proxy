@@ -42,6 +42,7 @@ from utils.eval.segments import (
     has_substance,
     match_key,
     same,
+    signature,
     text as _text,
 )
 from utils.session_store import _fmt_ts
@@ -789,112 +790,357 @@ def _load_requests(
 class ReasonSource:
     sequence: int
     filename: str
-    user_id: Any
-    kind: str
+    source_length: int
+    source_digest: bytes
+    reasoning_hash: bytes
     position: int
-    key: bytes
-    reasoning: str
 
 
-def _source_index(
-    requests: list[Request],
-) -> dict[int, list[ReasonSource]]:
-    index = {}
+@dataclass(slots=True)
+class ReasoningIndex:
+    # Exact: (user, position, message key) -> length -> digest -> hash -> sources.
+    # Only identical context + reasoning replays are deduplicated.
+    exact: dict
+    loose: dict
+    texts: dict
+    system_whitespace: dict
+    requests_by_sequence: dict
+    normalized_prefixes: dict
+    first_seen: dict
+    tool_first_seen: dict
+    tool_generations: dict
 
-    for req in requests:
-        if req.kind in ("compaction", "auxiliary"):
-            continue
 
-        found = []
+def _call_ids(msg: dict) -> Optional[tuple]:
+    calls = msg.get("tool_calls")
+    if not isinstance(calls, list) or not calls:
+        return None
+    ids = []
+    for call in calls:
+        if not isinstance(call, dict):
+            return None
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            return None
+        ids.append(call_id)
+    return tuple(ids) if len(ids) == len(set(ids)) else None
 
-        for offset, msg in enumerate(req.response):
+
+def _reasoning_prefixes(history: list[dict], response: list[dict]) -> list[bytes]:
+    """Backfill-only fingerprints; collapse blank lines only in system text.
+
+    Keep nonblank line contents (including indentation), other message roles,
+    original messages and the segmentation fingerprints untouched.
+    """
+    def normalize(msg: dict) -> dict:
+        content = msg.get("content")
+        if msg.get("role") == "system" and isinstance(content, str):
+            return {
+                **msg,
+                "content": re.sub(r"(\r?\n)(?:[ \t]*\r?\n)+", r"\1", content),
+            }
+        return msg
+
+    return fingerprint(
+        [normalize(msg) for msg in history],
+        [normalize(msg) for msg in response],
+    )[3]
+
+
+def _source_index(requests: list[Request]) -> ReasoningIndex:
+    index = ReasoningIndex({}, {}, {}, {}, {}, {}, {}, {}, {})
+    seen_replays = set()
+    # Preserve all original requests, including reasoning-free histories.
+    for req in sorted(requests, key=lambda item: item.sequence):
+        index.requests_by_sequence[req.sequence] = req
+        uid = _json(req.user_id)
+        normalized = _reasoning_prefixes(req.history, req.response)
+        index.normalized_prefixes[req.sequence] = normalized
+        for pos, msg in enumerate(req.history):
+            if msg.get("role") != "assistant":
+                continue
             key = match_key(msg)
+            if key is None:
+                continue
+            index.first_seen.setdefault((uid, pos, normalized[pos]), req.sequence)
+            if _call_ids(msg):
+                index.tool_first_seen.setdefault((uid, key), req.sequence)
+
+        # Full reasoning-sensitive fingerprint prevents merging different branches.
+        context = (req.full_digest, _tools_key(req.tools), req.kind)
+        for offset, msg in enumerate(req.response):
+            if msg.get("role") != "assistant":
+                continue
+            key = match_key(msg)
+            if key is None:
+                continue
+            pos = len(req.history) + offset
+            ids = _call_ids(msg)
+            # Track repeated generations even when they have no reasoning or are
+            # isolated calls. Future generations are filtered at query time.
+            for call_id in ids or ():
+                index.tool_generations.setdefault((uid, call_id), {}).setdefault(
+                    (context, pos), (req.sequence, key)
+                )
+            if req.kind in ("compaction", "auxiliary"):
+                continue
             reasoning = msg.get("reasoning_content")
-
-            if (
-                key is not None
-                and isinstance(reasoning, str)
-                and reasoning
-            ):
-                found.append(ReasonSource(
-                    req.sequence,
-                    req.filename,
-                    req.user_id,
-                    req.kind,
-                    len(req.history) + offset,
-                    key,
-                    reasoning,
-                ))
-
-        if found:
-            index[req.sequence] = found
-
+            if not isinstance(reasoning, str) or not reasoning.strip():
+                continue
+            rh = hashlib.sha256(reasoning.encode("utf-8")).digest()
+            replay_key = (uid, context, pos, key, rh)
+            if replay_key in seen_replays:
+                continue
+            seen_replays.add(replay_key)
+            index.texts.setdefault(rh, reasoning)
+            item = ReasonSource(req.sequence, req.filename, req.length, req.digest, rh, pos)
+            index.exact.setdefault((uid, pos, key), {}).setdefault(
+                req.length, {}
+            ).setdefault(req.digest, {}).setdefault(rh, []).append(item)
+            index.system_whitespace.setdefault((uid, pos, key), {}).setdefault(
+                req.length, {}
+            ).setdefault(normalized[-1], {}).setdefault(rh, []).append(item)
+            index.loose.setdefault((uid, key), {}).setdefault(rh, []).append(item)
     return index
+
+
+def _reasoning_compatible(source: Request, target: Request, positions=None) -> bool:
+    """Compare immutable request evidence, never the messages being filled."""
+    for pos, value in source.reasoned.items():
+        target_pos = pos if positions is None else positions.get(pos)
+        if target_pos is None:
+            continue
+        other = target.reasoned.get(target_pos)
+        if value and other and value.strip() and other.strip() and value != other:
+            return False
+    return True
+
+
+def _is_alignment_reminder(msg: dict) -> bool:
+    """Ignore only a standalone user reminder with this confirmed fixed marker.
+
+    This affects fallback comparison only; exported messages are untouched.
+    """
+    if msg.get("role") != "user":
+        return False
+    value = _standalone_text(msg)
+    if value is None:
+        return False
+    value = value.strip().replace("\r\n", "\n")
+    prefix = (
+        "<system-reminder>\n"
+        "The following content does not represent the user's intent"
+    )
+    return (
+        value.startswith(prefix)
+        and value[len(prefix):len(prefix) + 1] in ("", " ", "\n", ".")
+        and value.endswith("</system-reminder>")
+        and value.count("<system-reminder>") == 1
+        and value.count("</system-reminder>") == 1
+    )
+
+
+def _tool_alignment(source: Request, target: Request) -> Optional[dict]:
+    """Align tool-ID fallback evidence, not a strict conversation prefix.
+
+    Preserve user/developer/assistant order and signatures. Ignore only system
+    and explicitly marked standalone dynamic reminders. Consecutive tool blocks
+    require identical unique call-ID sets; their result bodies may differ.
+    Return original positions so reasoning conflicts are checked after alignment.
+    """
+    def relevant(raw):
+        return [(pos, msg) for pos, msg in enumerate(raw)
+                if msg.get("role") != "system" and not _is_alignment_reminder(msg)]
+
+    def tool_block(items, start):
+        found = {}
+        end = start
+        while end < len(items) and items[end][1].get("role") == "tool":
+            pos, msg = items[end]
+            call_id = msg.get("tool_call_id")
+            if not isinstance(call_id, str) or not call_id or call_id in found:
+                return None, end
+            found[call_id] = pos
+            end += 1
+        return found, end
+
+    left = relevant(source.history + source.response)
+    right = relevant(target.history)
+    positions = {}
+    i = j = 0
+    while i < len(left):
+        if j >= len(right):
+            return None
+        source_pos, before = left[i]
+        target_pos, after = right[j]
+        if before.get("role") == "tool":
+            if after.get("role") != "tool":
+                return None
+            source_block, i = tool_block(left, i)
+            target_block, j = tool_block(right, j)
+            if (
+                source_block is None or target_block is None
+                or source_block.keys() != target_block.keys()
+            ):
+                return None
+            positions.update({source_block[key]: target_block[key]
+                              for key in source_block})
+        else:
+            if signature(before) != signature(after):
+                return None
+            positions[source_pos] = target_pos
+            i += 1
+            j += 1
+    return positions
 
 
 def _fill_reasoning(
     messages: list[dict],
-    sources: list[Request],
-    index: dict[int, list[ReasonSource]],
+    index: ReasoningIndex,
     selected: Request,
-) -> list[str]:
-    first_seen = [-1] * len(selected.history)
-    first_seen_count = 0
-
-    for req in sources:
-        end = min(len(req.history), len(selected.history))
-
-        for pos in range(first_seen_count, end):
-            first_seen[pos] = req.sequence
-
-        first_seen_count = max(first_seen_count, end)
-
-    anchors = {}
-
-    for req in sources:
-        if (
-            req.kind in ("compaction", "auxiliary")
-            or req.user_id != selected.user_id
-        ):
-            continue
-
-        if (
-            not req.length
-            or req.length > selected.length
-            or selected.prefixes[req.length - 1] != req.digest
-        ):
-            continue
-
-        for item in index.get(req.sequence, ()):
-            pos = item.position
-
-            if (
-                pos >= len(selected.history)
-                or item.sequence >= first_seen[pos]
-            ):
-                continue
-
-            if (
-                item.key == match_key(messages[pos])
-                and item.user_id == selected.user_id
-            ):
-                anchors.setdefault(pos, []).append(item)
-
+) -> tuple[list[str], dict]:
+    """Session-wide lookup, but uniqueness is judged only after identity, time
+    and branch checks. All evidence comes from original requests. Future sources
+    cannot veto a historical fill. Text displaced by compression is not inferred.
+    """
+    audit = {
+        "scope": "session",
+        "filled_count": 0,
+        "unresolved_count": 0,
+        "conflict_count": 0,
+        "compression_fallback_count": 0,
+        "tool_id_fallback": 0,
+        "no_source_count": 0,
+        # Per message with rejected evidence, even if another source succeeds.
+        # Multiple rejection reasons may apply to the same message.
+        "rejection_counts": dict.fromkeys((
+            "no_source", "source_too_late", "branch_conflict",
+            "ambiguous_identity", "reasoning_conflict",
+        ), 0),
+    }
     utilized = []
+    if selected.kind in ("compaction", "auxiliary"):
+        return utilized, audit
+    uid = _json(selected.user_id)
+    normalized = index.normalized_prefixes[selected.sequence]
+    counts = {}
+    for msg in messages:
+        if msg.get("role") == "assistant":
+            key = match_key(msg)
+            if key is not None:
+                counts[key] = counts.get(key, 0) + 1
+    # Pair checks are cached within an export rather than rescanning a context
+    # for each assistant message. Filled messages never enter these caches.
+    compatible = {}
+    alignments = {}
 
-    for pos, matches in anchors.items():
-        if messages[pos].get("reasoning_content"):
+    for pos, msg in enumerate(messages[:len(selected.history)]):
+        if msg.get("role") != "assistant" or msg.get("reasoning_content"):
             continue
-
-        values = {item.reasoning for item in matches}
-
-        if len(values) != 1:
+        key = match_key(msg)
+        if key is None:
             continue
+        reasons = set()
+        blocked = set()
+        eligible = {}
+        saw_source = False
 
-        messages[pos]["reasoning_content"] = next(iter(values))
-        utilized.extend(item.filename for item in matches)
+        def accept(item, first_seen, *, aligned=False):
+            nonlocal saw_source
+            # Ignore future evidence entirely, including in rejection audit.
+            if item.sequence >= selected.sequence:
+                return
+            saw_source = True
+            if item.sequence in blocked:
+                return
+            source = index.requests_by_sequence[item.sequence]
+            if source.user_id != selected.user_id:
+                return
+            if first_seen is None or item.sequence >= first_seen:
+                reasons.add("source_too_late")
+                return
+            cache_key = (item.sequence, aligned)
+            if cache_key not in compatible:
+                positions = alignments.get(item.sequence) if aligned else None
+                compatible[cache_key] = _reasoning_compatible(source, selected, positions)
+            if not compatible[cache_key]:
+                reasons.add("branch_conflict")
+                blocked.add(item.sequence)
+                return
+            eligible.setdefault(item.reasoning_hash, item)
 
-    return list(dict.fromkeys(utilized))
+        first_seen = index.first_seen.get((uid, pos, normalized[pos]))
+        # Both positional paths enforce the same original reasoning check.
+        for pool, prefixes in (
+            (index.exact, selected.prefixes),
+            (index.system_whitespace, normalized),
+        ):
+            for length, by_digest in pool.get((uid, pos, key), {}).items():
+                if not length or length > len(selected.history):
+                    continue
+                for items in by_digest.get(prefixes[length - 1], {}).values():
+                    for item in items:
+                        accept(item, first_seen)
+
+        fallback = False
+        if not eligible:
+            candidates = index.loose.get((uid, key), {})
+            prior = [item for items in candidates.values() for item in items
+                     if item.sequence < selected.sequence]
+            saw_source = saw_source or bool(prior)
+            ids = _call_ids(msg)
+            if prior and (ids is None or counts.get(key) != 1):
+                # No text-only position-free inference, including post_compaction.
+                reasons.add("ambiguous_identity")
+            elif prior:
+                reused = any(
+                    sum(seq < selected.sequence for seq, _ in
+                        index.tool_generations.get((uid, call_id), {}).values()) > 1
+                    for call_id in ids
+                )
+                if reused:
+                    reasons.add("ambiguous_identity")
+                else:
+                    tool_seen = index.tool_first_seen.get((uid, key))
+                    for item in prior:
+                        if item.sequence in blocked:
+                            continue
+                        source = index.requests_by_sequence[item.sequence]
+                        if item.sequence not in alignments:
+                            alignments[item.sequence] = _tool_alignment(source, selected)
+                        positions = alignments[item.sequence]
+                        if positions is None or positions.get(item.position) != pos:
+                            reasons.add("ambiguous_identity")
+                            continue
+                        accept(item, tool_seen, aligned=True)
+                    fallback = bool(eligible)
+        if len(eligible) > 1:
+            reasons.add("reasoning_conflict")
+            eligible.clear()
+        if not eligible:
+            if not saw_source:
+                reasons.add("no_source")
+            if not reasons:
+                reasons.add("ambiguous_identity")
+            audit["unresolved_count"] += 1
+            audit["no_source_count"] += int("no_source" in reasons)
+            audit["conflict_count"] += int(bool(
+                reasons & {"branch_conflict", "reasoning_conflict"}
+            ))
+            for reason in reasons:
+                audit["rejection_counts"][reason] += 1
+            continue
+        rh, item = next(iter(eligible.items()))
+        for reason in reasons:
+            audit["rejection_counts"][reason] += 1
+        msg["reasoning_content"] = index.texts[rh]
+        utilized.append(item.filename)
+        audit["filled_count"] += 1
+        audit["tool_id_fallback"] += int(fallback)
+        audit["compression_fallback_count"] += int(
+            fallback and selected.kind == "post_compaction"
+        )
+    return list(dict.fromkeys(utilized)), audit
 
 
 def _ending(messages: list[dict]) -> bool:
@@ -982,7 +1228,7 @@ def _one_session(
             errors = [f"{first}: no trace files"]
         return None, errors
 
-    source_index = _source_index(requests)
+    reasoning_index = _source_index(requests)
     result = _result_record(sess, src, log_dir, first)
 
     directory = out / branch / _safe_path_component(first)
@@ -990,12 +1236,11 @@ def _one_session(
 
     selected = None
     sources = []
-    backfill_sources = []
     original_type = "initial_query"
     known_reasoning = {}
 
     def emit(reason: str, *, preserve_chain: bool = False) -> None:
-        nonlocal selected, sources, backfill_sources, original_type, known_reasoning
+        nonlocal selected, sources, original_type, known_reasoning
 
         if selected is None:
             return
@@ -1003,11 +1248,8 @@ def _one_session(
         messages = [dict(m) for m in selected.history]
         messages.extend(dict(m) for m in selected.response)
 
-        reasoning_sources = _fill_reasoning(
-            messages,
-            backfill_sources,
-            source_index,
-            selected,
+        reasoning_sources, reasoning_audit = _fill_reasoning(
+            messages, reasoning_index, selected,
         )
 
         index = len(result["request_files"]) + 1
@@ -1034,6 +1276,7 @@ def _one_session(
             "tools": selected.tools,
             "meta_info": {
                 "unique_info": {
+                    "reasoning_backfill": reasoning_audit,
                     "branch": branch,
                     "user_id": selected.user_id,
                     "upstream_session": first,
@@ -1076,7 +1319,6 @@ def _one_session(
         sources = []
         original_type = "initial_query"
         if not preserve_chain:
-            backfill_sources = []
             known_reasoning = {}
 
     for req in requests:
@@ -1113,7 +1355,7 @@ def _one_session(
                 growing = not identical and grows(selected, req, known_reasoning)
                 if identical or growing:
                     if tools_changed:
-                        # Export boundary only: retain the verified reasoning chain.
+                        # Preserve continuity state; the session index is immutable.
                         emit("tools_changed", preserve_chain=True)
                         selected = req
                         sources = [req]
@@ -1122,14 +1364,12 @@ def _one_session(
                         sources.append(req)
                         if growing:
                             selected = req
-                    backfill_sources.append(req)
                     known_reasoning.update(req.reasoned)
                     continue
                 emit("history_changed")
 
         selected = req
         sources = [req]
-        backfill_sources = [req]
         original_type = req.kind
         known_reasoning = dict(req.reasoned)
 
