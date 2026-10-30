@@ -8,7 +8,7 @@
 
 一份实现通过 ``profile`` 区分不同业务的差异，避免复制整个文件：
 
-    dev      心跳请求判为 auxiliary（与历史行为一致）
+    dev      清理末尾临时上下文；心跳请求判为 auxiliary
     xiaoyi   心跳请求按普通请求处理
 
 历史上 ``temp/reformat_jiuwenswarm_dev.py`` 与 ``..._xiaoyi.py`` 是两个 1391 行的
@@ -77,6 +77,55 @@ def _arguments(value: Any, branch: str = DEFAULT_PROFILE) -> str:
             )
         return value
     return _json(value)
+
+
+def _request_tools(req: dict) -> List[dict]:
+    """Normalize function definitions to OpenAI Chat Completions tools."""
+    raw = req["tools"] if "tools" in req else req.get("functions")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("request tools must be a list")
+
+    result = []
+    by_name = {}
+    for tool in raw:
+        if not isinstance(tool, dict):
+            raise ValueError("invalid tool definition")
+        if tool.get("type") not in (None, "function"):
+            raise ValueError(
+                f"unsupported tool definition type: {tool.get('type')!r}"
+            )
+        fn = tool.get("function", tool)
+        if not isinstance(fn, dict):
+            raise ValueError("invalid tool function definition")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("tool definition missing name")
+        parameters = fn.get("parameters")
+        if parameters is None:
+            parameters = fn.get("input_schema")
+        if parameters is None:
+            parameters = {"type": "object", "properties": {}}
+        if not isinstance(parameters, dict):
+            raise ValueError(f"invalid parameters for tool {name!r}")
+        function = {"name": name, "parameters": parameters}
+        for key in ("description", "strict"):
+            if key in fn:
+                function[key] = fn[key]
+        normalized = {"type": "function", "function": function}
+        if name in by_name:
+            if by_name[name] != normalized:
+                raise ValueError(f"conflicting definitions for tool {name!r}")
+            continue
+        by_name[name] = normalized
+        result.append(normalized)
+    return result
+
+
+def _tools_key(tools: List[dict]) -> str:
+    """Compare definitions without depending on tool or object key order."""
+    return _json(sorted(tools, key=lambda item: item["function"]["name"]))
 
 
 def _tool_call(call: dict) -> dict:
@@ -300,6 +349,66 @@ def _messages(raw: list) -> List[dict]:
             raise ValueError("invalid message object")
         result.extend(_normalize(msg))
     return result
+
+
+_DEV_REMINDER_PREFIX = (
+    "<system-reminder>\n"
+    "The following context is automatically attached for this model call only."
+)
+
+
+def _standalone_text(msg: dict) -> Optional[str]:
+    """Only plain text or a single text block; never flatten mixed content."""
+    if msg.get("tool_calls"):
+        return None
+    raw = msg.get("content")
+    if isinstance(raw, str):
+        return raw
+    if (
+        isinstance(raw, list)
+        and len(raw) == 1
+        and isinstance(raw[0], dict)
+        and raw[0].get("type") in ("text", "input_text", "output_text")
+        and isinstance(raw[0].get("text"), str)
+    ):
+        return raw[0]["text"]
+    return None
+
+
+def _clean_dev_history(history: List[dict], raw: list) -> List[dict]:
+    """Remove only the explicitly marked, standalone trailing call reminder."""
+    if not raw or not history or raw[-1].get("role") != "user":
+        return history
+    value = _standalone_text(raw[-1])
+    if value is None:
+        return history
+    value = value.strip().replace("\r\n", "\n")
+    if (
+        value.startswith(_DEV_REMINDER_PREFIX)
+        and value.endswith("</system-reminder>")
+        and value.count("<system-reminder>") == 1
+        and value.count("</system-reminder>") == 1
+        and history[-1].get("role") == "user"
+    ):
+        return history[:-1]
+    return history
+
+
+def _wrapped_source(history: List[dict]) -> Any:
+    """Read source only from the first user's explicit JSON message envelope."""
+    for msg in history:
+        if msg.get("role") != "user":
+            continue
+        value = _standalone_text(msg)
+        prefix = "你收到一条消息："
+        if value is None or not value.strip().startswith(prefix):
+            return None
+        try:
+            envelope = json.loads(value.strip()[len(prefix):].strip())
+        except (ValueError, TypeError):
+            return None
+        return envelope.get("source") if isinstance(envelope, dict) else None
+    return None
 
 
 def _response(value: Any) -> List[dict]:
@@ -552,7 +661,10 @@ def _load_requests(
                 raise ValueError("missing or damaged file")
 
             req = _envelope(obj)
+            tools = _request_tools(req)
             history = _messages(req["messages"])
+            if branch == "dev":
+                history = _clean_dev_history(history, req["messages"])
 
             system = req.get("system", obj.get("system"))
 
@@ -589,14 +701,15 @@ def _load_requests(
                     errors.append(f"{fn}: {exc}")
                     response = []
 
+            source = obj.get("source", req.get("source", trace.get("source")))
+            if source is None:
+                source = _wrapped_source(history)
             kind = classify_kind(
                 req,
                 obj,
                 history,
-                obj.get(
-                    "source",
-                    req.get("source", trace.get("source")),
-                ),
+                source,
+                heartbeat_auxiliary=PROFILES[branch]["heartbeat_auxiliary"],
             )
 
             (
@@ -620,6 +733,7 @@ def _load_requests(
                 full_digest,
                 prefixes,
                 reasoned,
+                tools=tools,
             ))
 
         except Exception as exc:
@@ -876,11 +990,12 @@ def _one_session(
 
     selected = None
     sources = []
+    backfill_sources = []
     original_type = "initial_query"
     known_reasoning = {}
 
-    def emit(reason: str) -> None:
-        nonlocal selected, sources, original_type, known_reasoning
+    def emit(reason: str, *, preserve_chain: bool = False) -> None:
+        nonlocal selected, sources, backfill_sources, original_type, known_reasoning
 
         if selected is None:
             return
@@ -890,7 +1005,7 @@ def _one_session(
 
         reasoning_sources = _fill_reasoning(
             messages,
-            sources,
+            backfill_sources,
             source_index,
             selected,
         )
@@ -916,6 +1031,7 @@ def _one_session(
         payload = {
             "id": record_id,
             "messages": messages,
+            "tools": selected.tools,
             "meta_info": {
                 "unique_info": {
                     "branch": branch,
@@ -959,57 +1075,61 @@ def _one_session(
         selected = None
         sources = []
         original_type = "initial_query"
-        known_reasoning = {}
+        if not preserve_chain:
+            backfill_sources = []
+            known_reasoning = {}
 
     for req in requests:
-        if req.kind in ("compaction", "auxiliary"):
+        isolated = req.kind in ("compaction", "auxiliary")
+        tools_changed = (
+            selected is not None
+            and _tools_key(selected.tools) != _tools_key(req.tools)
+        )
+
+        if isolated:
             if (
                 selected is not None
                 and selected.kind == req.kind
                 and same(selected, req)
                 and selected.user_id == req.user_id
+                and not tools_changed
             ):
                 sources.append(req)
                 continue
-
             emit(
                 "before_compaction"
                 if req.kind == "compaction"
                 else "before_auxiliary"
             )
-
-            selected = req
-            sources = [req]
-            original_type = req.kind
-            known_reasoning = dict(req.reasoned)
-            continue
-
-        if selected is None:
-            selected = req
-            sources = [req]
-            original_type = req.kind
-            known_reasoning = dict(req.reasoned)
-            continue
-
-        if selected.kind == "compaction":
-            emit("compaction_request")
-        elif selected.kind == "auxiliary":
-            emit("auxiliary_request")
-        elif selected.user_id != req.user_id:
-            emit("user_id_changed")
-        elif same(selected, req):
-            sources.append(req)
-            continue
-        elif grows(selected, req, known_reasoning):
-            sources.append(req)
-            selected = req
-            known_reasoning.update(req.reasoned)
-            continue
-        else:
-            emit("history_changed")
+        elif selected is not None:
+            if selected.kind == "compaction":
+                emit("compaction_request")
+            elif selected.kind == "auxiliary":
+                emit("auxiliary_request")
+            elif selected.user_id != req.user_id:
+                emit("user_id_changed")
+            else:
+                identical = same(selected, req)
+                growing = not identical and grows(selected, req, known_reasoning)
+                if identical or growing:
+                    if tools_changed:
+                        # Export boundary only: retain the verified reasoning chain.
+                        emit("tools_changed", preserve_chain=True)
+                        selected = req
+                        sources = [req]
+                        original_type = req.kind
+                    else:
+                        sources.append(req)
+                        if growing:
+                            selected = req
+                    backfill_sources.append(req)
+                    known_reasoning.update(req.reasoned)
+                    continue
+                emit("history_changed")
 
         selected = req
         sources = [req]
+        backfill_sources = [req]
         original_type = req.kind
         known_reasoning = dict(req.reasoned)
 
@@ -1045,7 +1165,7 @@ def jiuwenswarm_segments_export(
 ) -> dict:
     """Compatible signature and top-level return structure.
 
-    profile: 业务线参数，决定 ``PROFILES`` 里的行为开关（目前只有心跳判定）。
+    profile: 业务线参数，决定心跳判定及 dev 末尾临时上下文清理。
              非法值直接抛 ValueError —— 配置写错时宁可失败，也不要静默用默认值
              产出一份语义不对的数据。
     """

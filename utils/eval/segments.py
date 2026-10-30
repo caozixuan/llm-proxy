@@ -225,6 +225,7 @@ class Request:
     prefixes: List[bytes] = field(default_factory=list)
     reasoned: Dict[int, str] = field(default_factory=dict)
     sequence: int = -1
+    tools: List[dict] = field(default_factory=list)
 
 
 def fingerprint(
