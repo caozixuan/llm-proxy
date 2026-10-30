@@ -42,6 +42,7 @@ from utils.backup_store import (
     reset_running_on_startup,
     set_deleted,
     set_upload_stats,
+    set_upload_seconds,
     set_uploaded,
     update_sync_pid,
     update_sync_status,
@@ -62,6 +63,11 @@ logger = logging.getLogger(__name__)
 
 _sync_lock = threading.Lock()
 _syncing_dirs: set = set()
+
+# 上传进度行的采样间隔（秒）。obsutil 每几个对象就打一行进度条，实测占全部
+# 日志的 99.5%，每行都是一次 INSERT+commit。按时间采样后既保留「还在跑」
+# 的可观测性，又不至于把 159 万行垃圾写进 library。
+PROGRESS_LOG_INTERVAL = 30.0
 _live_sync_procs: dict = {}
 
 # 手动上传串行队列：单 dispatcher 线程逐个消费 DB 里的 backup_queue
@@ -659,11 +665,14 @@ def _verify_upload_sentinels(real_dir: Path, obs_dst: str) -> tuple:
 
 
 def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int, upload_script: str,
-                      resolver=None, auto_delete: bool = False, retain_days: int = 7):
+                      resolver=None, auto_delete: bool = False, retain_days: int = 7,
+                      upload_jobs: int = 0):
     """在后台线程中同步单个目录到 OBS，直接上传整个文件夹，流式输出日志。
 
     resolver: 可选 dir_path -> 真实磁盘 Path 的解析器（供 new-api 等非 logs_all 根）。
     auto_delete/retain_days: 校验通过后是否自动删除本地（见 _maybe_auto_delete）。
+    upload_jobs: obsutil 的并发数（`-j`）。0 表示不指定，用 obs_upload.sh 的默认值。
+        实测备份的瓶颈是**文件数**（每对象一次 RPC），提高并发能显著提升吞吐。
     """
     import subprocess as sp
     from utils.obs_utils import DEFAULT_UPLOAD_SCRIPT
@@ -712,36 +721,64 @@ def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int
         append_log(dir_path, f"开始同步: {dir_path} -> {obs_dst}")
 
         cmd = [script, logs_dir, obs_dst]
+        # 第三个实参才是 obsutil 的 -j 并发数（obs_upload.sh 里 `JOBS="${3:-8}"`）。
+        # 之前只传两个参数，配置项 upload_jobs 从来没有真正生效过 ——
+        # 不管页面上怎么改，实际永远是脚本默认的 8。
+        if upload_jobs and int(upload_jobs) > 0:
+            cmd.append(str(int(upload_jobs)))
         append_log(dir_path, f"执行: {' '.join(cmd)}")
+        _t_up_start = time.monotonic()
         proc = sp.Popen(cmd, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
         task_id = ""
         output_dir = ""
         uploaded_bytes = None
         succeeded_count = None
+        # 进度行节流：obsutil 每上传几个对象就打一行进度条，实测占全部日志的
+        # 99.5%（单叶 9.5 万行、全库 159 万行），每行都是一次 INSERT+commit。
+        # 这些行对事后排查毫无价值 —— 「日志在更新」本身就说明还在跑。
+        # 这里按时间采样：每 PROGRESS_LOG_INTERVAL 秒留一行，其余丢弃。
+        _last_progress_ts = 0.0
+        _skipped_progress = 0
         for line in proc.stdout:
             line = line.rstrip()
-            if line:
-                append_log(dir_path, line)
-                # obsutil 开始时打印 Task id / OutputDir，捕获用于定位失败报告
-                if not task_id and line.startswith("Task id:"):
-                    task_id = line.split(":", 1)[1].strip()
-                elif not output_dir and line.startswith("OutputDir:"):
-                    output_dir = line.split(":", 1)[1].strip()
-                # 上传结束时的统计行：「Succeed bytes:      962.01MB」
-                # 「Succeed count:      2827      Failed count:       0」
-                # 这是唯一能拿到真实数据量的地方（本地不预先统计）。
-                elif line.startswith("Succeed bytes:"):
-                    from utils.obs_utils import _parse_size_bytes
-                    tok = line.split(":", 1)[1].strip().split()[0] if line.split(":", 1)[1].strip() else ""
-                    parsed = _parse_size_bytes(tok)
-                    if parsed is not None:
-                        uploaded_bytes = parsed
-                elif line.startswith("Succeed count:"):
-                    try:
-                        succeeded_count = int(line.split(":", 1)[1].split()[0])
-                    except (IndexError, ValueError):
-                        pass
-        proc.wait(timeout=600)
+            if not line:
+                continue
+            # 进度条：`[____] ?% tps:0.00 ?/s 391.19K/? 4`，或含 tps: 的行
+            if line.startswith("[_") or "tps:" in line:
+                _now_m = time.monotonic()
+                if _now_m - _last_progress_ts >= PROGRESS_LOG_INTERVAL:
+                    msg = line if not _skipped_progress else \
+                        f"{line}（省略 {_skipped_progress} 行进度输出）"
+                    append_log(dir_path, msg)
+                    _last_progress_ts = _now_m
+                    _skipped_progress = 0
+                else:
+                    _skipped_progress += 1
+                continue
+            append_log(dir_path, line)
+            # obsutil 开始时打印 Task id / OutputDir，捕获用于定位失败报告
+            if not task_id and line.startswith("Task id:"):
+                task_id = line.split(":", 1)[1].strip()
+            elif not output_dir and line.startswith("OutputDir:"):
+                output_dir = line.split(":", 1)[1].strip()
+            # 上传结束时的统计行：「Succeed bytes:      962.01MB」
+            # 「Succeed count:      2827      Failed count:       0」
+            # 这是唯一能拿到真实数据量的地方（本地不预先统计）。
+            elif line.startswith("Succeed bytes:"):
+                from utils.obs_utils import _parse_size_bytes
+                tok = line.split(":", 1)[1].strip().split()[0] if line.split(":", 1)[1].strip() else ""
+                parsed = _parse_size_bytes(tok)
+                if parsed is not None:
+                    uploaded_bytes = parsed
+            elif line.startswith("Succeed count:"):
+                try:
+                    succeeded_count = int(line.split(":", 1)[1].split()[0])
+                except (IndexError, ValueError):
+                    pass
+        # 循环到 EOF 就代表进程已经退出，这里 wait() 只是回收退出码，
+        # 不需要（也没法）给超时 —— 之前写的 timeout=600 永远不会触发。
+        proc.wait()
+        _up_sec = int(time.monotonic() - _t_up_start)
 
         if proc.returncode == 0:
             # 先落数据量与文件数：即使后面校验失败，这两个值也是真实的观测结果，
@@ -751,6 +788,10 @@ def _run_sync_for_dir(dir_path: str, logs_all: Path, obs_base: str, workers: int
                                  file_count=succeeded_count)
             except Exception:  # noqa: BLE001
                 logger.exception("set_upload_stats failed for %s", dir_path)
+            try:
+                set_upload_seconds(dir_path, _up_sec)
+            except Exception:  # noqa: BLE001
+                logger.exception("set_upload_seconds failed for %s", dir_path)
             # 退出码之外再核一次哨兵对象：obsutil 的 -u 增量语义下，退出码 0 只
             # 代表「本次没有失败的任务」，不保证目标前缀里真的落了数据（前缀写错、
             # 对象被跳过都会是 0）。删除本地是不可逆操作，删之前必须确认内容在
@@ -897,7 +938,8 @@ def _queue_dispatch_loop():
                     res = _run_sync_for_dir(dir_path, logs_all, obs_base, workers,
                                             upload_script, resolver=resolver,
                                             auto_delete=acfg["auto_delete"],
-                                            retain_days=acfg["retain_days"])
+                                            retain_days=acfg["retain_days"],
+                                            upload_jobs=acfg["upload_jobs"])
                     if res == "interrupted":
                         _requeue_after_finish = dir_path
         except Exception:
@@ -1096,6 +1138,10 @@ def _auto_cfg() -> dict:
         "interval": max(30, int(cfg.get("auto_backup_check_interval", 120) or 120)),
         "stop_percent": float(cfg.get("auto_backup_stop_percent", 0) or 0),
         "workers": int(cfg.get("workers", 4) or 4),
+        # obsutil 的 -j 并发数（备份专用）。实测备份瓶颈是**文件数**而非体积
+        # （每对象一次 RPC，约 160 文件/秒），提高并发能直接提升吞吐。
+        # 0 表示不传参，用 obs_upload.sh 里的默认值。
+        "upload_jobs": max(0, int(cfg.get("backup_upload_jobs", 0) or 0)),
         "upload_script": cfg.get("upload_script", "") or "",
         "obs_base": cfg.get("obs_base", "") or load_obs_base(),
         # 校验通过后是否自动删本地（默认开）。关掉时退回 pending_delete 人工闸门。
@@ -1163,7 +1209,8 @@ def _run_auto_backup_round(logs_all: Path, active_env: str, active_path: str,
             _run_sync_for_dir(dir_path, logs_all, cfg["obs_base"], cfg["workers"],
                               cfg["upload_script"], resolver=resolver,
                               auto_delete=cfg["auto_delete"],
-                              retain_days=cfg["retain_days"])
+                              retain_days=cfg["retain_days"],
+                              upload_jobs=cfg["upload_jobs"])
         except Exception as e:  # noqa: BLE001
             logger.exception("auto backup upload failed: %s", dir_path)
             append_log(dir_path, f"自动备份上传异常: {e}", level="error")
@@ -1817,6 +1864,12 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                         0, int(body["submit_min_age_days"]))
                 except (TypeError, ValueError):
                     return JSONResponse({"detail": "自动提交最小天数必须是整数"}, status_code=400)
+            # obsutil 并发数（备份专用）。0 = 用 obs_upload.sh 的默认值。
+            if "upload_jobs" in body:
+                try:
+                    existing["backup_upload_jobs"] = max(0, min(64, int(body["upload_jobs"])))
+                except (TypeError, ValueError):
+                    return JSONResponse({"detail": "并发数必须是整数"}, status_code=400)
 
             with open(cfg_path, "w", encoding="utf-8") as f:
                 yaml.dump(existing, f, default_flow_style=False, allow_unicode=True)
@@ -1832,6 +1885,7 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                 "retain_days": cfg["retain_days"],
                 "auto_submit": cfg["auto_submit"],
                 "submit_batch": cfg["submit_batch"],
+                "upload_jobs": cfg["upload_jobs"],
             })
         except Exception as e:
             return JSONResponse({"detail": str(e)}, status_code=500)
@@ -2541,6 +2595,31 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
         # 不再用「已上传但未删除目录的 du 之和」（那需要递归统计，代价高且不准）。
         active_path = _auto_active_path()
         disk = _disk_usage(Path(active_path))
+
+        # 上传吞吐与累计量：实测速率几乎只跟**文件数**有关（每个对象一次 RPC），
+        # 与数据体积关系不大，所以 files_per_sec 是主口径，mb_per_sec 仅作参考。
+        try:
+            from utils.backup_store import upload_speed_stats
+            speed = upload_speed_stats()
+        except Exception:  # noqa: BLE001
+            logger.exception("upload_speed_stats failed")
+            speed = {"samples": 0, "files_per_sec": None, "mb_per_sec": None,
+                     "pending_leaves": 0, "pending_files": 0, "eta_seconds": None}
+        # 累计已上传量（所有成功上传过、且有体积记录的叶子之和）
+        try:
+            from utils.backup_store import _conn as _bs_conn, _lock as _bs_lock
+            with _bs_lock:
+                _agg = _bs_conn.execute(
+                    "SELECT COUNT(*) AS n, SUM(size_bytes) AS b, SUM(file_count) AS f "
+                    "FROM backup_dirs WHERE size_bytes > 0").fetchone()
+            uploaded_total = {
+                "leaves": int(_agg["n"] or 0),
+                "bytes": int(_agg["b"] or 0),
+                "files": int(_agg["f"] or 0),
+            }
+        except Exception:  # noqa: BLE001
+            uploaded_total = {"leaves": 0, "bytes": 0, "files": 0}
+
         return JSONResponse({
             "totals": {
                 "leaves": total_leaves,
@@ -2573,11 +2652,15 @@ def register_backup_routes(app: FastAPI, logs_dir: str, port: str = "") -> None:
                 "auto_submit": cfg["auto_submit"],
                 "submit_batch": cfg["submit_batch"],
                 "submit_min_age_days": cfg["submit_min_age_days"],
+                "upload_jobs": cfg["upload_jobs"],
             },
             "disk": {
                 "path": active_path,
                 **disk,
             },
+            # 吞吐估算（概览首行用）与累计上传量
+            "speed": speed,
+            "uploaded_total": uploaded_total,
         })
 
     @app.post("/api/backup/archive")

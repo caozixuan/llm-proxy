@@ -973,13 +973,12 @@ def _run_task_inner(record_id, _env_dir, _env_key_name, obs_prefix, now_tag, mod
     slot = rec.get("key_slot", "all")
 
     # 本地落盘根 + OBS 子前缀 + 落盘子目录名，全部来自 settings/export_modes.yaml。
-    # temp_path 留空时回退到 env_dir.parent.parent（项目根），与旧行为一致。
+    # 落盘根优先级：EXPORT_CACHE_DIR(.env) > yaml 的 temp_path > env_dir.parent.parent。
+    # 导出产物动辄数十 GB，项目根很容易被写满，故允许用环境变量指到独立缓存盘。
     _mcfg = get_export_modes().get(mode)
     if _mcfg is None:
         raise RuntimeError(f"未知导出模式 '{mode}'（未在 settings/export_modes.yaml 中注册）")
-    _temp_root = get_export_modes().temp_path
-    if not str(_temp_root).strip() or str(_temp_root) == ".":
-        _temp_root = _env_dir.parent.parent
+    _temp_root = get_export_modes().resolved_temp_path(_env_dir.parent.parent)
     local_base = (_temp_root / _mcfg.local_dir / _env_key_name / slot / f"ex-{now_tag}").resolve()
     obs_sub = _mcfg.obs_sub
 

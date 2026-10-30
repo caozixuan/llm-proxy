@@ -84,7 +84,7 @@ Session 导出/质检模块提供 Web 界面，用于将 LLM 代理日志从本�
 > |---|---|
 > | `label` / `mode_label` / `step` | Modal 下拉长名 / 列表徽章短名 / 进度日志里的步骤名 |
 > | `obs_sub` | OBS 子前缀，**对外契约**（下游消费方按此路径取数，不可随意改） |
-> | `local_dir` | 本地落盘目录名（`{temp_path}/{local_dir}/{env_key}/{slot}/ex-{tag}/`） |
+> | `local_dir` | 本地落盘目录名（`{落盘根}/{local_dir}/{env_key}/{slot}/ex-{tag}/`） |
 > | `pipeline` | `copy`（原始三元组复制）/ `reformat`（合并落盘）/ `eval`（合并 + 质检报告） |
 > | `processor` | `"模块路径:函数名"`，web 与 CLI 都用 `importlib` 解析 |
 > | `analyze` | 三态：`true` / `false` / 缺省。缺省表示该 processor 不接受 `analyze` 形参 |
@@ -92,7 +92,14 @@ Session 导出/质检模块提供 Web 界面，用于将 LLM 代理日志从本�
 > | `max_mtimes` | 可选，限制单次只能选几个 mtime 目录（如 `1`） |
 > | `public` | 是否出现在公开 `/export/submit` 的 mode 白名单 |
 >
-> 顶层 `temp_path` 是唯一的落盘根（留空或 `"."` 回退 `env_dir.parent.parent` = 项目根）。
+> **本地落盘根**按以下优先级解析（`utils/export_modes.py` 的 `resolved_temp_path()`）：
+> 1. 环境变量 `EXPORT_CACHE_DIR`（`.env`）—— 权威来源，用于指到独立的大容量缓存盘
+> 2. 顶层 `temp_path`（本 YAML）
+> 3. `env_dir.parent.parent`（项目根）
+>
+> 推荐配 `EXPORT_CACHE_DIR`：导出产物动辄数十 GB（实测项目根下各 `logs_session_analysis*`
+> 合计已近 200G），落在代码盘上容易写满。未配置时行为与旧版完全一致。
+> `temp_path` 留空或 `"."` 即跳过第 2 步。
 > 配置按 mtime+size 缓存，改完 YAML 无需重启即生效；YAML 缺失/损坏时回退到
 > `utils/export_modes.py` 里的内置 `_DEFAULT_MODES` 表并记 warning，导出不会整体瘫痪。
 

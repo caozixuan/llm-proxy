@@ -119,6 +119,11 @@ def init_db(db_dir: str):
             # 本地不预先统计：逐个 iterdir 数文件在 NFS 上代价过高。
             # -1 表示尚未上传过、没有数据。
             ("size_bytes",  "INTEGER NOT NULL DEFAULT -1"),
+            # 本次上传实际耗时（秒）。用于估算吞吐：实测上传速率几乎完全
+            # 由**文件数**决定（每对象一次 RPC），与数据体积关系不大 ——
+            # 小文件叶子 1.6 MB/s，大文件叶子 30 MB/s，但都是 ~160 files/s。
+            # -1 表示没有记录（历史数据 / 未上传）。
+            ("upload_seconds", "INTEGER NOT NULL DEFAULT -1"),
         ]:
             try:
                 _conn.execute(f"ALTER TABLE backup_dirs ADD COLUMN {col} {definition}")
@@ -248,6 +253,93 @@ def set_upload_stats(dir_path: str, size_bytes=None, file_count=None):
         _conn.execute(
             f"UPDATE backup_dirs SET {', '.join(fields)} WHERE dir_path = ?", params)
         _conn.commit()
+
+
+def set_upload_seconds(dir_path: str, seconds) -> None:
+    """记录本次上传耗时（秒），供概览估算吞吐。"""
+    try:
+        sec = int(seconds)
+    except (TypeError, ValueError):
+        return
+    if sec < 0:
+        return
+    with _lock:
+        _conn.execute(
+            "UPDATE backup_dirs SET upload_seconds = ?, updated_at = ? WHERE dir_path = ?",
+            (sec, _now(), dir_path))
+        _conn.commit()
+
+
+def upload_speed_stats(limit: int = 50) -> dict:
+    """从最近完成的上传统计实际吞吐，估算剩余工作量还要多久。
+
+    只统计「有 size_bytes + upload_seconds + file_count」的行。
+    返回的 files_per_sec 是**主口径**：实测每个对象大约固定开销（RPC 往返），
+    所以速率几乎只跟文件数相关，跟体积关系不大。
+
+    **用中位数而不是「总量/总时长」**：一次被中断后重跑一晚上的叶子
+    （如 1,645,928 文件跑了 12,698 秒 = 129 f/s）会把加权平均整体拉低，
+    而正常叶子稳定在 160~186 f/s。中位数对这类离群值不敏感。
+    """
+    with _lock:
+        rows = _conn.execute(
+            "SELECT size_bytes, file_count, upload_seconds FROM backup_dirs "
+            "WHERE upload_seconds > 0 AND size_bytes > 0 AND file_count > 0 "
+            "ORDER BY updated_at DESC LIMIT ?", (max(1, int(limit)),)).fetchall()
+        # 待备份规模。注意 file_count 只有上传过的叶子才有（本地不预统计），
+        # 所以 pending 里能算 ETA 的只是子集，覆盖率要一并返回，前端才好标「估算中」。
+        pending = _conn.execute(
+            "SELECT COUNT(*) AS n, SUM(file_count) AS files "
+            "FROM backup_dirs WHERE status = 'pending'").fetchone()
+        pending_known = _conn.execute(
+            "SELECT COUNT(*) AS n, SUM(file_count) AS files "
+            "FROM backup_dirs WHERE status = 'pending' AND file_count > 0").fetchone()
+    p_n = int(pending["n"] or 0)
+    p_known_n = int(pending_known["n"] or 0)
+    p_known_f = int(pending_known["files"] or 0)
+    # 关键：file_count 只有在叶子被上传过之后才知道，本地不预统计。
+    # 待备份叶子绝大多数从未上传过 → 没有 file_count → 直接拿已知文件数算
+    # ETA 会严重偏低（实测只覆盖 8%，得出 68 小时，而真实规模约 30 天）。
+    # 用「已知叶子的**中位**文件数 × 待备份叶子总数」外推。
+    with _lock:
+        _fc = [r["file_count"] for r in _conn.execute(
+            "SELECT file_count FROM backup_dirs "
+            "WHERE status = 'pending' AND file_count > 0").fetchall()]
+    def _median(vals):
+        vals = sorted(vals)
+        n = len(vals)
+        if not n:
+            return None
+        mid = n // 2
+        return vals[mid] if n % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+    med_files = _median(_fc)
+    p_est_f = int(med_files * p_n) if med_files else p_known_f
+
+    if not rows:
+        return {"samples": 0, "files_per_sec": None, "mb_per_sec": None,
+                "pending_leaves": p_n, "pending_files": p_known_f,
+                "pending_files_estimated": p_est_f,
+                "pending_known_leaves": p_known_n,
+                "median_files_per_leaf": int(med_files) if med_files else None,
+                "coverage_pct": round(p_known_n * 100.0 / p_n, 1) if p_n else 0,
+                "eta_seconds": None}
+
+    fps = _median([r["file_count"] / r["upload_seconds"] for r in rows])
+    mbps = _median([r["size_bytes"] / r["upload_seconds"] / 1024 / 1024 for r in rows])
+    # ETA 用外推出的文件总数（覆盖全部 pending），不是只算已知的那一小部分。
+    eta = (p_est_f / fps) if (fps and p_est_f) else None
+    return {
+        "samples": len(rows),
+        "files_per_sec": round(fps, 1) if fps else None,
+        "mb_per_sec": round(mbps, 1) if mbps else None,
+        "pending_leaves": p_n,
+        "pending_files": p_known_f,
+        "pending_files_estimated": p_est_f,
+        "pending_known_leaves": p_known_n,
+        "median_files_per_leaf": int(med_files) if med_files else None,
+        "coverage_pct": round(p_known_n * 100.0 / p_n, 1) if p_n else 0,
+        "eta_seconds": int(eta) if eta else None,
+    }
 
 
 def update_sync_status(dir_path: str, status: str, obs_path: str = "", error_msg: str = ""):

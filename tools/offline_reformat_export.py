@@ -398,10 +398,8 @@ def _run_one_export(*, api_key, mtime_dirs, env_dir_p, env_key_name,
         update_status(record_id, "running")
 
         # local_base / obs_dst 规则完全对齐 _run_task_inner，且与 Web 同读一份配置：
-        # temp_path 留空时回退 env_dir_p.parent.parent（项目根）。
-        _temp_root = get_export_modes().temp_path
-        if not str(_temp_root).strip() or str(_temp_root) == ".":
-            _temp_root = env_dir_p.parent.parent
+        # 落盘根优先级 EXPORT_CACHE_DIR(.env) > yaml 的 temp_path > env_dir.parent.parent。
+        _temp_root = get_export_modes().resolved_temp_path(env_dir_p.parent.parent)
         local_base = (_temp_root / _mcfg.local_dir /
                       env_key_name / slot / f"ex-{now_tag}").resolve()
         obs_sub = _mcfg.obs_sub

@@ -695,6 +695,37 @@
                 <div class="kpi-label">发现叶子节点</div>
                 <div class="kpi-value">{{ fmtNum(bk.totals.leaves) }}</div>
                 <div class="kpi-hint">log_dir.db 已登记叶子</div>
+                <div class="kpi-hint" style="margin-top:4px;">
+                    <template v-if="bk.speed && bk.speed.files_per_sec">
+                        <span style="color:var(--primary); font-weight:600;">
+                            {{ fmtNum(Math.round(bk.speed.files_per_sec)) }} 文件/秒
+                        </span>
+                        <span style="color:var(--muted-foreground);">
+                            · 约 {{ bk.speed.mb_per_sec || 0 }} MB/s
+                        </span>
+                    </template>
+                    <span v-else style="color:var(--muted-foreground);">上传速率估算中</span>
+                </div>
+                <div class="kpi-hint" style="margin-top:2px;">
+                    <template v-if="bk.uploaded_total && bk.uploaded_total.leaves">
+                        累计上传 {{ fmtBytes(bk.uploaded_total.bytes) }}
+                        <span style="color:var(--muted-foreground);">
+                            （{{ fmtNum(bk.uploaded_total.leaves) }} 个叶子 ·
+                            {{ fmtNum(bk.uploaded_total.files) }} 文件）
+                        </span>
+                    </template>
+                    <span v-else style="color:var(--muted-foreground);">尚无上传记录</span>
+                </div>
+                <div class="kpi-hint" style="margin-top:2px;" v-if="bk.speed && bk.speed.eta_seconds">
+                    <span style="color:var(--muted-foreground);">
+                        预计还需 {{ fmtEta(bk.speed.eta_seconds) }}
+                    </span>
+                    <span v-if="bk.speed.coverage_pct < 95"
+                          style="color:var(--muted-foreground);"
+                          :title="'仅 ' + bk.speed.pending_known_leaves + '/' + bk.speed.pending_leaves + ' 个待备份叶子有文件数记录，实际时间会更长'">
+                        （覆盖 {{ bk.speed.coverage_pct }}% 待备份叶子，偏乐观）
+                    </span>
+                </div>
             </div>
             <div class="kpi">
                 <div class="kpi-label">待备份节点</div>
@@ -1009,6 +1040,16 @@
                         </span>
                     </div>
                     <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
+                        <span>上传并发数</span>
+                        <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
+                            <input type="number" class="input input-sm" v-model.number="bkPolicy.upload_jobs"
+                                   @change="bkSavePolicy" min="0" max="64" style="width:70px;">
+                            <span style="font-size:.76rem; color:var(--muted-foreground);">
+                                obsutil -j；0=用默认 8。瓶颈是文件数，调大通常更快
+                            </span>
+                        </span>
+                    </div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:.84rem; margin-bottom:12px;">
                         <span>只自动提交早于</span>
                         <span style="margin-left:auto; display:flex; align-items:center; gap:6px;">
                             <input type="number" class="input input-sm" v-model.number="bkPolicy.submit_min_age_days"
@@ -1245,14 +1286,16 @@ new Vue({
         // 表现为页面空白/打不开 —— 而不是只影响该区块。
         bk: { totals: {}, days: [], weeks: [], months: [],
               trend_daily: [], trend_daily_total: 0,
-              sources: [], recent: [], recent_total: 0, disk: null },
+              sources: [], recent: [], recent_total: 0, disk: null,
+              speed: null, uploaded_total: null },
         bkTrendDays: 30,     // 备份完成趋势的窗口（7/30/90 天）
         bkGran: 'day',       // 分布图粒度：day | week | month
         bkRecentPage: 1,
         bkDirs: [],          // /api/backup/dirs 当前页的目录明细
         bkConfig: { obs_base: '' },
         bkPolicy: { enabled: false, threshold: 70, interval: 120, auto_delete: true, retain_days: 7,
-                    auto_submit: false, submit_batch: 20, submit_min_age_days: 7 },
+                    auto_submit: false, submit_batch: 20, submit_min_age_days: 7,
+                    upload_jobs: 0 },
         bkQueue: { running: '', queued: [], queue_len: 0, auto_submit: false, candidates: null },
         bkEnv: '',
         bkStatus: '',
@@ -1839,6 +1882,9 @@ new Vue({
                     if (d.auto.submit_min_age_days != null) {
                         self.bkPolicy.submit_min_age_days = d.auto.submit_min_age_days;
                     }
+                    if (d.auto.upload_jobs != null) {
+                        self.bkPolicy.upload_jobs = d.auto.upload_jobs;
+                    }
                 }
             }).catch(function() {});
         },
@@ -2041,6 +2087,7 @@ new Vue({
                     auto_submit: !!this.bkPolicy.auto_submit,
                     submit_batch: Number(this.bkPolicy.submit_batch) || 20,
                     submit_min_age_days: Number(this.bkPolicy.submit_min_age_days) || 0,
+                    upload_jobs: Number(this.bkPolicy.upload_jobs) || 0,
                 }),
             }).then(function(r) {
                 if (r && r.detail) alert(r.detail);

@@ -23,12 +23,16 @@ OBS 子前缀、公开可见性等）。网页端（utils/export_routes.py）与
 
 import importlib
 import logging
+import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import yaml
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "settings" / "export_modes.yaml"
+
+# 本地导出落盘根目录的环境变量名（写在 .env）。见 resolved_temp_path()。
+EXPORT_CACHE_DIR_ENV = "EXPORT_CACHE_DIR"
 
 # 回退默认表：任何一项与 settings/export_modes.yaml 不一致时以 YAML 为准，
 # 这里只保证「YAML 丢了也能跑」。
@@ -184,6 +188,25 @@ class ExportModesConfig:
         self.temp_path = Path(temp_path)
         self.modes: Dict[str, ModeConfig] = modes
 
+    def resolved_temp_path(self, fallback: Optional[Path] = None) -> Path:
+        """本地落盘根目录的最终取值，优先级：
+
+            1. 环境变量 EXPORT_CACHE_DIR（.env）—— 权威来源，指向大容量缓存盘
+            2. settings/export_modes.yaml 的 temp_path
+            3. 调用方给的 fallback（通常是 env_dir.parent.parent = 项目根）
+
+        之所以让环境变量优先：导出产物动辄数十 GB，默认落在项目根会把代码盘写满
+        （实测项目根各 logs_session_analysis* 合计已近 200G），而部署机器上通常有
+        独立的缓存盘。改 .env 即可迁移，不必改 yaml；未配置时行为与以前完全一致。
+        """
+        env = (os.getenv(EXPORT_CACHE_DIR_ENV) or "").strip()
+        if env:
+            return Path(env).expanduser()
+        raw = str(self.temp_path_raw or "").strip()
+        if raw and raw != ".":
+            return Path(raw)
+        return Path(fallback) if fallback is not None else Path(raw or ".")
+
     def get(self, mode_id: str) -> Optional[ModeConfig]:
         return self.modes.get(mode_id)
 
@@ -327,8 +350,9 @@ def public_mode_ids() -> Tuple[str, ...]:
     return get_config().public_ids()
 
 
-def temp_path() -> Path:
-    return get_config().temp_path
+def temp_path(fallback: Optional[Path] = None) -> Path:
+    """本地落盘根。优先 EXPORT_CACHE_DIR 环境变量，其次 yaml 的 temp_path。"""
+    return get_config().resolved_temp_path(fallback)
 
 
 def local_dir_for(mode_id: str, fallback: Optional[str] = None) -> str:

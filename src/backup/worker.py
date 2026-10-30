@@ -135,6 +135,7 @@ def run_once() -> bool:
                 resolver=lambda dp: backup_routes.resolve_real_backup_dir(dp, svc_dir),
                 auto_delete=cfg["auto_delete"],
                 retain_days=cfg["retain_days"],
+                upload_jobs=cfg["upload_jobs"],
             )
             # 被停机信号打断（obsutil 退出码为负）：不算失败，重新排队等下次跑
             requeue = (res == "interrupted")
